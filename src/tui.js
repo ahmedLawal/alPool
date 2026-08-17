@@ -473,7 +473,7 @@ export class TUI {
       // back to the dashboard was indistinguishable from "nothing happened".
       if (!this.checkNow) { this._addLog('Update check unavailable on this worker'); return; }
       if (this.updateBusy) return;                       // already running
-      this.updateBusy = 'Checking npm…';
+      this.updateBusy = 'Checking for updates…';
       this.render();
       Promise.resolve(this.checkNow())
         .catch(() => {})
@@ -531,9 +531,10 @@ export class TUI {
     const out = [];
     out.push(` ${bold('Updates')}`);
     if (!v) {
-      out.push(` ${dim('Running')} ${running}   ${dim('· checking npm for a newer version…')}`);
+      out.push(` ${dim('Running')} ${running}   ${dim('· checking for updates…')}`);
     } else if (v.hasUpdate && v.latest) {
-      out.push(` ${dim('Running')} ${running}   ${yellow(`v${v.latest} is available`)}`);
+      const available = v.source === 'git' ? v.latest : `v${v.latest}`;
+      out.push(` ${dim('Running')} ${running}   ${yellow(`${available} is available`)}`);
       out.push(auto
         ? ` ${dim('It installs itself automatically. Press')} ${bold('c')} ${dim('to get it right now.')}`
         : ` ${dim('Automatic updates are off. Press')} ${bold('c')} ${dim('to install it now, or')} ${bold('t')} ${dim('to turn automatic on.')}`);
@@ -1452,15 +1453,19 @@ export class TUI {
         : 'finishing up…';
       lines.push(` ${cyan(SPINNER[this.frame])} ${yellow('Restarting')}  ${dim(detail)}`);
     }
-    // Update reminder: a prominent, actionable banner when a newer npm version is
-    // published — nothing when on latest or the check hasn't resolved (no permanent
+    // Update reminder: a prominent, actionable banner when a newer release/revision is
+    // available — nothing when on latest or the check hasn't resolved (no permanent
     // blank line). The persistent banner IS the reminder; a long-lived session's
     // periodic re-check keeps it current (index.js updateTimer refreshes versionInfo).
     if (v?.hasUpdate && v?.latest) {
       // No more "run npm i -g, then press r" — that manual dance is what the Updates menu
       // kills. Auto-update ON: it applies itself; either way 'u' pulls + reloads in place.
       const how = this._autoUpdateOn() ? 'applying automatically · or press u now' : 'press u to update now';
-      lines.push('  ' + yellow(`↑ Update available: v${v.current} → v${v.latest}`) + dim(`  ·  ${how}`));
+      const from = v.source === 'git'
+        ? `main@${String(v.currentRevision || '').slice(0, 7) || 'unknown'}`
+        : `v${v.current}`;
+      const to = v.source === 'git' ? v.latest : `v${v.latest}`;
+      lines.push('  ' + yellow(`↑ Update available: ${from} → ${to}`) + dim(`  ·  ${how}`));
     }
     // Routing header: name the mode + show the one-line description the operator
     // picked when cycling. Under `preferred`, show the manual-preference line (still
@@ -1836,6 +1841,9 @@ export class TUI {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);
       note = `  ${dim('console-only')}`;
+    } else if (!this.am.quotaProbeIntervalMs || this.am.quotaProbeIntervalMs <= 0) {
+      sesCell = emptyBar('quota off', bw);
+      wkCell = emptyBar('quota off', bw);
     } else {
       sesCell = emptyBar('probing', bw);
       wkCell = emptyBar('probing', bw);

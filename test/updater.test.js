@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { compareVersions, checkForUpdate, maybeCheckForUpdate, __resetUpdaterState, markApplied } from '../src/updater.js';
+import {
+  compareVersions, checkForUpdate, checkGitForUpdate, selfUpdateFromGit,
+  maybeCheckForUpdate, __resetUpdaterState, markApplied,
+} from '../src/updater.js';
 
 test('compareVersions orders semver correctly', () => {
   assert.equal(compareVersions('1.0.1', '1.0.0'), 1);
@@ -33,6 +36,71 @@ test('checkForUpdate is failure-safe (returns null on network error)', async () 
   } finally {
     globalThis.fetch = orig;
   }
+});
+
+test('checkGitForUpdate compares the linked checkout HEAD with a remote branch', async () => {
+  const calls = [];
+  const execFile = async (cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    return { stdout: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/main\n' };
+  };
+  const r = await checkGitForUpdate('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', {
+    remote: 'origin', ref: 'main', cwd: '/repo', execFile,
+  });
+  assert.equal(r.hasUpdate, true);
+  assert.equal(r.currentRevision, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(r.latestRevision, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  assert.equal(r.latest, 'main@bbbbbbb');
+  assert.deepEqual(calls[0].args, ['ls-remote', '--exit-code', 'origin', 'refs/heads/main']);
+  assert.equal(calls[0].options.cwd, '/repo');
+});
+
+test('selfUpdateFromGit refuses dirty or wrong-branch checkouts and otherwise fast-forwards', async () => {
+  const dirty = await selfUpdateFromGit({
+    cwd: '/repo',
+    execFile: async (_cmd, args) => ({ stdout: args[0] === 'status' ? ' M src/a.js\n' : '' }),
+  });
+  assert.equal(dirty.ok, false);
+  assert.match(dirty.error, /uncommitted changes/);
+
+  const calls = [];
+  const clean = await selfUpdateFromGit({
+    remote: 'origin', ref: 'main', cwd: '/repo',
+    execFile: async (_cmd, args) => {
+      calls.push(args);
+      if (args[0] === 'status') return { stdout: '' };
+      if (args[0] === 'branch') return { stdout: 'main\n' };
+      return { stdout: 'Already up to date.\n', stderr: '' };
+    },
+  });
+  assert.equal(clean.ok, true);
+  assert.deepEqual(calls.at(-1), ['pull', '--ff-only', 'origin', 'main']);
+});
+
+test('maybeCheckForUpdate updates and applies a linked git checkout even when package version is unchanged', async () => {
+  __resetUpdaterState();
+  let diskRevision = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  let info;
+  const latestRevision = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const deps = {
+    getCurrentVersion: async () => '1.5.86',
+    getCurrentRevision: async () => diskRevision,
+    checkGitForUpdate: async currentRevision => ({
+      source: 'git', current: 'main@' + currentRevision.slice(0, 7), latest: 'main@bbbbbbb',
+      currentRevision, latestRevision, hasUpdate: currentRevision !== latestRevision,
+    }),
+    selfUpdateFromGit: async () => { diskRevision = latestRevision; return { ok: true }; },
+  };
+  const r = await maybeCheckForUpdate({
+    updateCheck: true, autoUpdate: true, autoApply: true,
+    updateSource: { type: 'git', remote: 'origin', ref: 'main' },
+  }, () => {}, value => { info = value; }, deps);
+  assert.equal(r.hasUpdate, true);
+  assert.equal(r.applicable, true);
+  assert.equal(r.installedVersion, latestRevision, 'revision identity drives reload even without a semver bump');
+  assert.equal(info.current, '1.5.86');
+  assert.equal(info.latest, 'main@bbbbbbb');
+  assert.equal(info.source, 'git');
 });
 
 test('maybeCheckForUpdate always reports version info (feeds the header indicator)', async () => {
@@ -225,7 +293,6 @@ test('the update check cadence is 30 minutes, env-tunable, floored at 60s', () =
   const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
   const m = /const updateIntervalMs = Math\.max\(60_000, Number\(process\.env\.MAXPOOL_UPDATE_CHECK_INTERVAL_MS\) \|\| ([^)]+)\);/.exec(src);
   assert.ok(m, 'the interval expression is where the test expects it');
-  // eslint-disable-next-line no-eval
   assert.equal(eval(m[1].replace(/_/g, '')), 30 * 60 * 1000, 'default is 30 minutes');
   assert.match(m[0], /Math\.max\(60_000/, 'still floored at 60s so a bad env value cannot hammer npm');
 });

@@ -18,6 +18,13 @@
 
 ## Current focus
 
+Ahmed's personal fork is adding checkout-aware self-updates and repairing legacy
+GLM quota visibility. The intended chain is upstream `2solarmax/maxpool` → tested
+sync into `ahmedLawal/maxpool` → a globally linked personal checkout pulls its
+own `origin/main` → seamless reload. Legacy configs carrying the old generated
+`quotaProbeSeconds: 0` value migrate to active quota monitoring; an explicit
+`quotaProbeEnabled: false` remains the opt-out.
+
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
 routing modes. Current version: **v1.5.83** (installed as a global symlink to
@@ -48,6 +55,27 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-08-17 · #9 — Personal-fork updates use a tested upstream sync plus checkout pulls
+
+**Context:** npm auto-update always installs `maxpool@latest`, which would replace
+Ahmed's personal quota-display changes with the upstream package. A separate npm
+package would require new publishing credentials and release infrastructure. The
+runtime symptom behind GLM rows stuck on "probing" was also concrete: Ahmed's
+config still carries `quotaProbeSeconds: 0`, the original generated default, so
+the otherwise-working z.ai monitor endpoint never runs.
+**Decision:** Add a scheduled/manual GitHub workflow that merges upstream `main`,
+runs tests and lint, and pushes only on success. Add a `git` update source that
+checks a configured remote/ref and pulls it with `--ff-only` for linked checkout
+installs; this personal fork defaults to that Git source, while upstream retains
+its npm behavior. Treat a legacy zero probe
+interval without `quotaProbeEnabled` as the old generated default and migrate it
+to 60 seconds; `quotaProbeEnabled: false` is the unambiguous opt-out. Render
+`quota off` when monitoring is intentionally disabled.
+**Consequences:** The personal fork receives upstream work without borrowing the
+upstream npm publishing identity, local modifications block rather than being
+overwritten, and GLM 5-hour/weekly bars populate automatically for legacy users.
+The personal checkout must be globally linked (`npm link`) for git-source updates.
 
 ### 2026-08-10 · #8 — Five named routing modes replace crossProviderFallbackPolicy
 

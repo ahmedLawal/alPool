@@ -689,7 +689,9 @@ async function serverWorkerCommand() {
   // or out-of-band-used account. MAXPOOL_DISABLE_QUOTA_PROBE=1 forces it off — used
   // by spawned integration tests so a startup probe can't race their refresh/rotation
   // assertions (mirrors MAXPOOL_DISABLE_SLEEP_GUARD).
-  const probeSeconds = process.env.MAXPOOL_DISABLE_QUOTA_PROBE === '1' ? 0 : (config.quotaProbeSeconds || 0);
+  const probeSeconds = process.env.MAXPOOL_DISABLE_QUOTA_PROBE === '1' || config.quotaProbeEnabled === false
+    ? 0
+    : (config.quotaProbeSeconds || 0);
   const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000 });
   // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
   // background probe has gone stale (> 3× interval since last success).

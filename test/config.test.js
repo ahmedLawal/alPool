@@ -14,12 +14,14 @@ test('default config uses automatic routing', () => {
     mode: 'automatic',
     preferredAccount: null,
   });
+  assert.deepEqual(config.updateSource, { type: 'git', remote: 'origin', ref: 'main' });
 });
 
 test('quota prober is enabled by default', () => {
   // Off-by-default left maxpool blind to idle / out-of-band-used accounts, which
   // the scorer then preferred and drove to exhaustion. Probing must be on.
   assert.equal(createDefaultConfig().quotaProbeSeconds, 60);
+  assert.equal(createDefaultConfig().quotaProbeEnabled, true);
 });
 
 test('loadConfig backfills absent keys from current defaults (existing installs get new defaults)', async () => {
@@ -38,14 +40,27 @@ test('loadConfig backfills absent keys from current defaults (existing installs 
   });
 });
 
-test('loadConfig never overrides an explicitly-set key with a default', async () => {
+test('loadConfig migrates the legacy generated zero probe interval to active monitoring', async () => {
   await withTempConfig(async (dir, path) => {
     await writeFile(path, JSON.stringify({
       proxy: { port: 3456, host: '127.0.0.1', apiKey: 'mp-x' },
-      accounts: [], quotaProbeSeconds: 0, // user deliberately disabled probing
+      accounts: [], quotaProbeSeconds: 0,
     }));
     const cfg = await loadConfig();
-    assert.equal(cfg.quotaProbeSeconds, 0, 'an explicit 0 must be respected, not clobbered by the default');
+    assert.equal(cfg.quotaProbeEnabled, true);
+    assert.equal(cfg.quotaProbeSeconds, 60, 'the old generated 0 must not strand quota rows on probing forever');
+  });
+});
+
+test('loadConfig preserves the explicit quota-probe opt-out', async () => {
+  await withTempConfig(async (dir, path) => {
+    await writeFile(path, JSON.stringify({
+      proxy: { port: 3456, host: '127.0.0.1', apiKey: 'mp-x' },
+      accounts: [], quotaProbeEnabled: false, quotaProbeSeconds: 0,
+    }));
+    const cfg = await loadConfig();
+    assert.equal(cfg.quotaProbeEnabled, false);
+    assert.equal(cfg.quotaProbeSeconds, 0, 'the unambiguous boolean opt-out must win');
   });
 });
 

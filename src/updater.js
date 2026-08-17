@@ -7,12 +7,22 @@ import { dirname, join } from 'node:path';
 const execFileAsync = promisify(execFile);
 const PACKAGE = 'maxpool';
 const DEFAULT_REGISTRY = 'https://registry.npmjs.org';
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+function gitSource(config = {}) {
+  const source = config?.updateSource;
+  if (source?.type !== 'git') return null;
+  return {
+    type: 'git',
+    remote: String(source.remote || 'origin'),
+    ref: String(source.ref || 'main'),
+  };
+}
 
 /** Read the running maxpool version from its own package.json. Null on failure. */
 export async function getCurrentVersion() {
   try {
-    const here = dirname(fileURLToPath(import.meta.url));
-    const pkg = JSON.parse(await readFile(join(here, '..', 'package.json'), 'utf-8'));
+    const pkg = JSON.parse(await readFile(join(PACKAGE_ROOT, 'package.json'), 'utf-8'));
     return pkg.version || null;
   } catch {
     return null;
@@ -68,11 +78,75 @@ export async function selfUpdate({ timeoutMs = 120_000 } = {}) {
   }
 }
 
+/** Read the commit currently checked out by a globally-linked development install. */
+export async function getCurrentRevision({ cwd = PACKAGE_ROOT, execFile: run = execFileAsync } = {}) {
+  try {
+    const { stdout } = await run('git', ['rev-parse', 'HEAD'], { cwd, timeout: 10_000 });
+    const revision = String(stdout || '').trim();
+    return /^[0-9a-f]{40}$/i.test(revision) ? revision : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Compare a linked checkout with a remote branch without changing local refs. */
+export async function checkGitForUpdate(currentRevision, {
+  remote = 'origin', ref = 'main', cwd = PACKAGE_ROOT, timeoutMs = 10_000,
+  execFile: run = execFileAsync,
+} = {}) {
+  if (!/^[A-Za-z0-9._/-]+$/.test(remote) || !/^[A-Za-z0-9._/-]+$/.test(ref)) return null;
+  try {
+    const { stdout } = await run(
+      'git', ['ls-remote', '--exit-code', remote, `refs/heads/${ref}`],
+      { cwd, timeout: timeoutMs },
+    );
+    const latestRevision = String(stdout || '').trim().split(/\s+/)[0];
+    if (!/^[0-9a-f]{40}$/i.test(latestRevision)) return null;
+    return {
+      source: 'git',
+      current: currentRevision ? `${ref}@${currentRevision.slice(0, 7)}` : `${ref}@unknown`,
+      latest: `${ref}@${latestRevision.slice(0, 7)}`,
+      currentRevision,
+      latestRevision,
+      hasUpdate: !currentRevision || currentRevision !== latestRevision,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Fast-forward a clean linked checkout. Never overwrites local work or merges. */
+export async function selfUpdateFromGit({
+  remote = 'origin', ref = 'main', cwd = PACKAGE_ROOT, timeoutMs = 120_000,
+  execFile: run = execFileAsync,
+} = {}) {
+  if (!/^[A-Za-z0-9._/-]+$/.test(remote) || !/^[A-Za-z0-9._/-]+$/.test(ref)) {
+    return { ok: false, error: 'invalid git update source' };
+  }
+  try {
+    const status = await run('git', ['status', '--porcelain'], { cwd, timeout: 10_000 });
+    if (String(status.stdout || '').trim()) {
+      return { ok: false, error: 'linked checkout has uncommitted changes' };
+    }
+    const branch = await run('git', ['branch', '--show-current'], { cwd, timeout: 10_000 });
+    if (String(branch.stdout || '').trim() !== ref) {
+      return { ok: false, error: `linked checkout must be on ${ref}` };
+    }
+    const { stdout, stderr } = await run(
+      'git', ['pull', '--ff-only', remote, ref], { cwd, timeout: timeoutMs },
+    );
+    return { ok: true, output: (stdout || stderr || '').trim() };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 // The version of the CODE currently EXECUTING, captured ONCE before any self-install.
 // getCurrentVersion() reads package.json FROM DISK, which `npm i -g` rewrites — so
 // after a background self-install the disk version != the running version. Every
 // "am I behind?" and loop-guard decision keys on THIS fixed value, not the disk read.
 let _bootVersion;
+let _bootRevision;
 // The newest version this process has already ATTEMPTED to auto-apply. The loop guard:
 // a version that installs fine but fails to BOOT rolls back to the old worker, which is
 // still running _bootVersion with its timer armed — without this it would re-detect the
@@ -83,13 +157,21 @@ let _bootVersion;
 let _lastAttemptedTarget = null;
 
 /** Test-only: reset the module's version-tracking state between cases. */
-export function __resetUpdaterState() { _bootVersion = undefined; _lastAttemptedTarget = null; }
+export function __resetUpdaterState() {
+  _bootVersion = undefined;
+  _bootRevision = undefined;
+  _lastAttemptedTarget = null;
+}
 
 /** Mark a version as ATTEMPTED-to-apply. The caller calls this at the moment it triggers
  *  the reload — BEFORE the reload — so a rolled-back target is quarantined (advance-only).
  *  Kept as the caller's action (not a side effect of maybeCheckForUpdate) so a caller that
  *  ignores `applicable` can never strand a version or poison the quarantine floor. */
 export function markApplied(version) {
+  if (/^[0-9a-f]{40}$/i.test(String(version || ''))) {
+    _lastAttemptedTarget = version;
+    return;
+  }
   if (version && (!_lastAttemptedTarget || compareVersions(version, _lastAttemptedTarget) > 0)) {
     _lastAttemptedTarget = version;
   }
@@ -122,6 +204,56 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
   const _self = deps.selfUpdate || selfUpdate;
   const announce = deps.announce !== false;
 
+  const source = gitSource(config);
+  if (source) {
+    const _getRevision = deps.getCurrentRevision || getCurrentRevision;
+    const _checkGit = deps.checkGitForUpdate || checkGitForUpdate;
+    const _selfGit = deps.selfUpdateFromGit || selfUpdateFromGit;
+    if (_bootVersion === undefined) _bootVersion = await _get();
+    if (_bootRevision === undefined) _bootRevision = await _getRevision();
+    const result = config?.updateCheck === false ? null : await _checkGit(_bootRevision, source);
+    const hasUpdate = Boolean(result?.hasUpdate);
+
+    if (onVersionInfo) {
+      try {
+        onVersionInfo({
+          current: _bootVersion, latest: result?.latest ?? null, hasUpdate,
+          checkedAt: Date.now(), source: 'git', currentRevision: _bootRevision,
+          latestRevision: result?.latestRevision ?? null,
+        });
+      } catch { /* indicator is best-effort */ }
+    }
+
+    if (!hasUpdate) return { hasUpdate: false, applicable: false };
+    if (announce) notify(`Update available: ${result.current} → ${result.latest}`);
+    if (!config?.autoUpdate) {
+      if (announce) notify('Press u to update, or turn automatic updates on.');
+      return { hasUpdate: true, applicable: false };
+    }
+
+    let onDisk = await _getRevision();
+    if (onDisk !== result.latestRevision) {
+      notify(`Auto-updating to ${result.latest}…`);
+      const updated = await _selfGit(source);
+      if (!updated.ok) {
+        notify(`Auto-update failed: ${updated.error}`);
+        return { hasUpdate: true, applicable: false };
+      }
+      onDisk = await _getRevision();
+    }
+
+    const advanced = Boolean(onDisk) && onDisk !== _bootRevision;
+    const applicable = advanced
+      && onDisk === result.latestRevision
+      && _lastAttemptedTarget !== onDisk;
+    if (advanced && !applicable && announce) {
+      notify(`Update ${result.latest} already attempted — staying on the running revision.`);
+    } else if (advanced && !config?.autoApply && announce) {
+      notify(`Updated to ${result.latest}. Restart maxpool to apply.`);
+    }
+    return { hasUpdate: true, installedVersion: onDisk, applicable };
+  }
+
   if (_bootVersion === undefined) _bootVersion = await _get();
   const current = _bootVersion;
   const result = config?.updateCheck === false ? null : await _check(current);
@@ -129,7 +261,7 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
 
   if (onVersionInfo) {
     try {
-      onVersionInfo({ current, latest: result?.latest ?? null, hasUpdate, checkedAt: Date.now() });
+      onVersionInfo({ current, latest: result?.latest ?? null, hasUpdate, checkedAt: Date.now(), source: 'npm' });
     } catch { /* indicator is best-effort; never break startup */ }
   }
 

@@ -58,6 +58,23 @@ maxpool server
 maxpool run
 ```
 
+### Personal fork install
+
+This fork can update from its own `main` branch without replacing personal changes
+with the upstream npm package:
+
+```bash
+git clone https://github.com/ahmedLawal/maxpool.git
+cd maxpool
+npm link
+```
+
+Keep `updateSource` set to `git`, with `remote: "origin"` and `ref: "main"`.
+Automatic updates require a clean checkout on `main`; local changes or divergence
+stop the update safely. A scheduled workflow merges `2solarmax/maxpool/main` into
+the fork only after the merged result passes tests and lint. In Maxpool, open
+**Updates** and press `t` once to enable the full automatic pull-and-reload flow.
+
 ## Recommended setup
 
 The cleanest way to use maxpool day-to-day: **keep your normal `claude` login untouched, and add a separate alias that routes through the pool.** Then plain `claude` still uses your default single account, and `ccmax` (call it whatever you like) spreads work across all your accounts.
@@ -259,7 +276,10 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
   },
   "upstream": "https://api.anthropic.com",
   "updateCheck": true,
+  "updateSource": { "type": "git", "remote": "origin", "ref": "main" },
   "autoUpdate": false,
+  "quotaProbeEnabled": true,
+  "quotaProbeSeconds": 60,
   "switchThreshold": 0.90,
   "scheduler": {
     "mode": "adaptive-least-loaded",
@@ -311,8 +331,11 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.apiKey` | API key clients use for status/admin requests |
 | `upstream` | Upstream API base URL |
-| `updateCheck` | Check npm for a newer maxpool on startup and notify; defaults to `true` |
+| `updateCheck` | Check the configured update source on startup and notify; defaults to `true` |
+| `updateSource` | Personal-fork update source. `{"type":"git","remote":"origin","ref":"main"}` fast-forwards a globally linked checkout |
 | `autoUpdate` | Install new versions automatically (applied on next restart, never interrupting sessions); defaults to `false` |
+| `quotaProbeEnabled` | Poll zero-spend quota endpoints so 5-hour and weekly bars stay current; defaults to `true` |
+| `quotaProbeSeconds` | Quota polling interval; defaults to `60`. Use `quotaProbeEnabled:false` to opt out |
 | `switchThreshold` | Quota utilization (0–1) at which an account is avoided (5h *and* weekly); default `0.90`. Raise toward `0.97` to use more before rotating |
 | `scheduler.weeklySoftThreshold` / `weeklyReserveThreshold` / `weeklyCriticalThreshold` / `weeklyExhaustedThreshold` | Weekly (7d) quota tiers (0–1) controlling how aggressively an account is de-prioritised as its weekly usage climbs |
 | `scheduler.safetyMaxActivePerAccount` | Emergency circuit breaker, not a normal capacity cap |
@@ -381,7 +404,13 @@ maxpool stops routing to an account at `switchThreshold` (default 90%) of its 5-
 No. The bars show how *full* an account is toward its limit, so an empty bar means lots of headroom (good). Actual activity is in the `15m`/`1h` request-count columns.
 
 **Will updates apply automatically?**
-Set `"autoUpdate": true` in your config and maxpool installs new versions itself (applied on the next restart; running sessions are never interrupted). Otherwise `npm i -g maxpool` updates it.
+Set `"autoUpdate": true` in your config and maxpool installs new versions itself (applied through a seamless reload; running sessions are not interrupted). This personal fork fast-forwards its globally linked checkout from `updateSource`.
+
+**Why does a GLM account show `probing`?**
+GLM quota comes from Z.ai's zero-spend monitor endpoint. This fork automatically
+migrates the old generated `quotaProbeSeconds: 0` setting to a 60-second interval.
+If monitoring is explicitly disabled with `quotaProbeEnabled:false`, the TUI says
+`quota off` instead of claiming it is probing.
 
 **Where do my tokens go?**
 They're stored locally in your config (file mode `0600`) and sent only to Anthropic — or, in the optional `all` profile, to GLM/Kimi if you supply those. Nothing else leaves your machine. Zero third-party dependencies.

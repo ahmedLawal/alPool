@@ -283,10 +283,19 @@ test('a Kimi account shows an honest console-only label, never a fake bar', () =
 
 test('a z.ai account whose probe has not landed yet shows "probing", not a fake bar', () => {
   const am = providerAM();
+  am.quotaProbeIntervalMs = 60_000;
   am.accounts[1].quota.providerQuotaSource = 'zai'; // known source, no reading yet
   const tui = new TUI({ accountManager: am });
   const line = strip(tui._renderAcct(1, 11, true));
   assert.match(line, /probing/);
+});
+
+test('a z.ai account says quota off when monitoring is disabled', () => {
+  const am = providerAM();
+  am.quotaProbeIntervalMs = 0;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(1, 11, true));
+  assert.match(line, /quota off/);
+  assert.doesNotMatch(line, /probing/, 'must not claim work is happening when the prober is disabled');
 });
 
 // ── the reported UX bug: the top header must ALIGN to the columns it names ─────
