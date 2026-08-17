@@ -135,6 +135,8 @@ never add IP/fingerprint spoofing or MITM — PRs adding them are rejected.
   (cache-first via `~/.claude/.credentials-cache`, gcloud fallback sequential).
 - `src/event-log.js`, `src/sleep-guard.js`, `src/updater.js` — logging,
   keep-awake, self-update.
+- `scripts/sync-upstream.sh` + `scripts/install-local-sync.sh` — local, tested
+  upstream synchronization and its six-hour macOS LaunchAgent installer.
 - Config knobs: `proxy` (host/port/apiKey), `upstream`, `switchThreshold`,
   `scheduler.*` thresholds, `retry.*`. See `config.example.json`.
 
@@ -146,6 +148,8 @@ never add IP/fingerprint spoofing or MITM — PRs adding them are rejected.
 - `README.md` — user-facing overview + the account-risk notice.
 - `.github/workflows/` — `ci.yml` (tests/lint), `publish.yml` (OIDC publish +
   GitHub Release).
+- `scripts/sync-upstream.sh` — personal-fork upstream sync; this is deliberately
+  local, not a scheduled GitHub workflow.
 
 > This repo is OUTSIDE the mokka-workspace; it does not inherit those skills or
 > rules. Everything Claude needs here is committed in this repo. Task tracking

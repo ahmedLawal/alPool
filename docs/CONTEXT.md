@@ -23,7 +23,8 @@ repository is `ahmedLawal/alPool`, and the globally linked checkout pulls its ow
 `origin/main`. Compatibility-sensitive identifiers remain unchanged: alPool uses
 the existing `~/.config/maxpool.json`, `MAXPOOL_*` environment variables,
 `x-maxpool-*` headers, and `/maxpool/status` endpoint, so no account or integration
-migration is required. Upstream remains `2solarmax/maxpool`.
+migration is required. Upstream remains `2solarmax/maxpool`; synchronization runs
+locally through a six-hour macOS LaunchAgent and a transactional Bash script.
 
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
@@ -55,6 +56,22 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-08-17 · #11 — Upstream synchronization runs locally, not in GitHub Actions
+
+**Context:** Decision #9 used a scheduled GitHub workflow to merge and validate
+upstream. Ahmed prefers the synchronization authority to remain on his Mac and
+explicitly requested a local Bash-like job instead.
+**Decision:** Supersede the hosted-sync portion of #9. Install a per-user macOS
+LaunchAgent that runs `scripts/sync-upstream.sh` at login and every six hours. The
+script fetches both remotes, merges in a disposable detached worktree, runs the
+full test suite and lint, and pushes `origin/main` only after validation succeeds.
+The existing alPool updater remains responsible for fast-forwarding the clean live
+checkout and seamlessly reloading it.
+**Consequences:** GitHub CI no longer decides when upstream is imported. A failed
+merge, test, lint, authentication, or non-fast-forward push leaves personal `main`
+unchanged. The LaunchAgent requires this Mac to be awake and logged in; a missed
+interval is recovered by `RunAtLoad` or the next six-hour run.
 
 ### 2026-08-17 · #10 — Personal fork is branded alPool without migrating credentials
 

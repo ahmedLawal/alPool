@@ -49,13 +49,20 @@ git clone https://github.com/ahmedLawal/alPool.git
 cd alPool
 npm install
 npm link
+./scripts/install-local-sync.sh
 alpool
 ```
 
 Keep `updateSource` set to `git`, with `remote: "origin"` and `ref: "main"`.
 Automatic updates require a clean checkout on `main`; local changes or divergence
-stop the update safely. A scheduled workflow merges `2solarmax/maxpool/main` into
-the fork only after the merged result passes tests and lint. In alPool, open
+stop the update safely. A local macOS LaunchAgent runs at login and every six hours:
+it invokes `scripts/sync-upstream.sh`, merges `2solarmax/maxpool/main` in a temporary
+worktree, and pushes the fork only after the merged result passes tests and lint.
+The live checkout is never modified by the sync job. Its log is at
+`~/Library/Logs/alPool/upstream-sync.log`.
+
+Run `npm run sync:upstream` for an immediate manual sync, or rerun
+`npm run sync:install` to reinstall the LaunchAgent. In alPool, open
 **Updates** and press `t` once to enable the full automatic pull-and-reload flow.
 
 ## Recommended setup
