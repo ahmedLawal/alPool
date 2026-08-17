@@ -60,7 +60,7 @@ the fork only after the merged result passes tests and lint. In alPool, open
 
 ## Recommended setup
 
-The cleanest way to use alpool day-to-day: **keep your normal `claude` login untouched, and add a separate alias that routes through the pool.** Then plain `claude` still uses your default single account, and `ccmax` (call it whatever you like) spreads work across all your accounts.
+The cleanest way to use alPool day-to-day: **keep your normal `claude` login untouched, and add a separate alias that routes through the pool.** Then plain `claude` still uses your default single account, and `ccal` spreads work across all your accounts.
 
 1. **Install and add your accounts** (see [Adding Accounts](#adding-accounts)):
    ```bash
@@ -77,7 +77,7 @@ The cleanest way to use alpool day-to-day: **keep your normal `claude` login unt
    ```bash
    # Run Claude Code through the alpool proxy.
    # Your plain `claude` stays on its own separate login.
-   ccmax() {
+   ccal() {
      local url
      url="$(alpool env | sed -n 's/^export ANTHROPIC_BASE_URL=//p')"
      ( unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
@@ -89,16 +89,16 @@ The cleanest way to use alpool day-to-day: **keep your normal `claude` login unt
    Reload with `source ~/.zshrc` (or just open a new terminal).
 4. **Use it:**
    ```bash
-   ccmax            # Claude Code, load-balanced across all your accounts
+   ccal             # Claude Code, load-balanced across all your accounts
    claude           # unchanged — still your normal single-account login
    ```
 
 Why this approach:
 
-- **Your normal `claude` stays separate.** alpool keeps its own account tokens in its config; your everyday Claude Code login (in the OS keychain) is never touched. Use `ccmax` when you want the pool, `claude` when you don't.
+- **Your normal `claude` stays separate.** alPool keeps its own account tokens in its config; your everyday Claude Code login (in the OS keychain) is never touched. Use `ccal` when you want the pool, `claude` when you don't.
 - **Session affinity.** The `x-maxpool-session` header pins each terminal to one account (with automatic failover), so a single task doesn't bounce between accounts mid-stream.
 - **No key needed locally.** The proxy listens on `127.0.0.1` and accepts local clients without an API key, so the alias stays short.
-- **Composes with your other aliases.** If you already use aliases for other providers (GLM, Kimi, …), `ccmax` slots right in alongside them.
+- **Composes with your other aliases.** If you already use aliases for other providers (GLM, Kimi, …), `ccal` slots right in alongside them.
 
 > Prefer zero config? `alpool run` launches Claude Code through the proxy for you — the alias above is the same idea, just composable with your own setup. Most people end up making an alias.
 
@@ -377,7 +377,7 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 ## FAQ
 
 **Does this touch my normal Claude Code login?**
-No. alpool stores its own account tokens in its config file. Your everyday `claude` login lives in the OS keychain and is never modified. Run `ccmax` for the pool, `claude` for your normal login.
+No. alPool stores its own account tokens in its config file. Your everyday `claude` login lives in the OS keychain and is never modified. Run `ccal` for the pool, `claude` for your normal login.
 
 **How do I add another account?**
 `alpool login` (browser — adds any account), or in the TUI press `a` then `l`. To add the account you're currently logged into Claude Code with, use `alpool import` (or `a` then `i`).
