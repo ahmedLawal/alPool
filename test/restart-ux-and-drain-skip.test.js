@@ -7,7 +7,7 @@ import { RestartController } from '../src/restart-controller.js';
 const { strip } = __tuiTest;
 
 // Reported 2026-08-10: "I click restart, then yes, and NOTHING happens" — while ~30
-// sessions were 503-ing with "Maxpool is restarting". The restart pauses admission and
+// sessions were 503-ing with "alPool is restarting". The restart pauses admission and
 // drains for up to 10s; with long requests always in flight the user sits in that
 // window every time, sees no progress, and every session shows a retry.
 
@@ -74,7 +74,7 @@ test('an idle restart does NOT emit progress ticks (nothing to wait for)', () =>
 });
 
 // ── drain design: seamless skips the pre-drain; cold path still drains ─────────
-// Reported 2026-08-10: "503 Maxpool is restarting — attempt 5/10" across ~30 sessions.
+// Reported 2026-08-10: "503 alPool is restarting — attempt 5/10" across ~30 sessions.
 // Root cause: the 10s pre-drain NEVER completed naturally (30-60s requests never
 // finish in 10s), so every restart was 10s of guaranteed 503s. But the seamless
 // baton path (releaseBatonAndDrain, 60s+) already drains in-flight requests AFTER

@@ -1,4 +1,4 @@
-# Maxpool — living context & decision log
+# alPool — living context & decision log
 
 > **This is the project memory.** Read it before non-trivial work; append to it as
 > soon as a decision is made or a change ships. It travels with the repo, so any
@@ -18,12 +18,12 @@
 
 ## Current focus
 
-Ahmed's personal fork is adding checkout-aware self-updates and repairing legacy
-GLM quota visibility. The intended chain is upstream `2solarmax/maxpool` → tested
-sync into `ahmedLawal/maxpool` → a globally linked personal checkout pulls its
-own `origin/main` → seamless reload. Legacy configs carrying the old generated
-`quotaProbeSeconds: 0` value migrate to active quota monitoring; an explicit
-`quotaProbeEnabled: false` remains the opt-out.
+Ahmed's personal fork is branded alPool. The executable is `alpool`, the personal
+repository is `ahmedLawal/alPool`, and the globally linked checkout pulls its own
+`origin/main`. Compatibility-sensitive identifiers remain unchanged: alPool uses
+the existing `~/.config/maxpool.json`, `MAXPOOL_*` environment variables,
+`x-maxpool-*` headers, and `/maxpool/status` endpoint, so no account or integration
+migration is required. Upstream remains `2solarmax/maxpool`.
 
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
@@ -55,6 +55,19 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-08-17 · #10 — Personal fork is branded alPool without migrating credentials
+
+**Context:** Installing the personal fork under the upstream `maxpool` command made
+it unclear whether a terminal was running Ahmed's fork or the former global tool.
+Renaming config, environment variables, or routing headers at the same time would
+strand accounts and break existing Claude aliases.
+**Decision:** Rename the product and logs to `alPool`, expose only the `alpool` CLI,
+and rename the personal repository/checkout. Preserve `~/.config/maxpool.json`,
+`MAXPOOL_*`, `x-maxpool-*`, and `/maxpool/status` as compatibility interfaces.
+**Consequences:** `npm uninstall -g maxpool` can remove the former executable and
+`npm link` installs the unambiguous `alpool` command. Existing credentials and
+client integrations continue to work unchanged.
 
 ### 2026-08-17 · #9 — Personal-fork updates use a tested upstream sync plus checkout pulls
 
@@ -106,7 +119,7 @@ sequentially only for names the cache lacks. Measured: 5/5 resolve in 17.5s
 (4 from cache instantly, 1 gcloud miss) vs 2/5 before.
 **Consequences:** No new attack surface (an attacker who can read the cache
 already has everything). Cache staleness bounded: a rotated key 401s → provider
-shows error → degrades gracefully. Maxpool restart picks up refreshed cache.
+shows error → degrades gracefully. alPool restart picks up refreshed cache.
 
 ### 2026-08-10 · #6 — Seamless restart skips the pre-drain
 
@@ -125,7 +138,7 @@ reads "finishing in-flight requests first" instead of "Retry immediately".
 
 ### 2026-08-07 · #5 — Multi-provider support (GLM/Kimi)
 
-**Context:** Maxpool was Anthropic-only. Max wanted to add GLM (z.ai) and Kimi
+**Context:** alPool was Anthropic-only. Max wanted to add GLM (z.ai) and Kimi
 (Moonshot) accounts to the pool so Claude Code sessions could spread across three
 providers.
 **Decision:** Provider accounts carry an API key (not OAuth). Keys stored in
@@ -139,7 +152,7 @@ registry: `mokka-workspace/knowledge/technical/maxpool-api-key-registry.md`.
 
 ### 2026-07-23 · #4 — Project-context harness is committed in-repo
 
-**Context:** Maxpool lives outside the mokka-workspace, so it inherits none of
+**Context:** alPool lives outside the mokka-workspace, so it inherits none of
 that workspace's skills/rules/memory. Goal: a fresh Claude Code session should
 pick up full project context + keep an evolving memory.
 **Decision:** Ship the harness as committed files in *this* repo — `CLAUDE.md`
@@ -184,7 +197,7 @@ set to "require 2FA and disallow tokens"; OIDC publish unaffected.
 
 ### 2026-07-23 · #1 — Release-record posture: forward-only + in-repo, log-not-announce
 
-**Context:** Maxpool is a ToS gray-area tool; the public GitHub Release page is
+**Context:** alPool is a ToS gray-area tool; the public GitHub Release page is
 the first npm-linked, search-indexed "what this does" surface, and commit
 subjects can describe quota/rate mechanics.
 **Decision:** Keep the rich record **in-repo** (`CHANGELOG.md`); go **forward-only**

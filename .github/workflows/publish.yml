@@ -25,6 +25,9 @@ on:
 
 jobs:
   publish:
+    # Personal forks, including ahmedLawal/alPool, must never attempt to publish
+    # under the upstream package's trusted-publishing identity.
+    if: github.repository == '2solarmax/maxpool'
     runs-on: ubuntu-latest
     permissions:
       contents: write   # write: create the GitHub Release below (read alone can't)

@@ -170,7 +170,7 @@ test('U1 the running version is shown in the header', () => {
   am.versionInfo = { current: '1.5.39', latest: '1.5.39', hasUpdate: false, checkedAt: Date.now() };
   const tui = tuiFor(am);
   const { text } = captureRender(tui);
-  assert.ok(text.includes('Maxpool v1.5.39'), 'header shows the running version');
+  assert.ok(text.includes('alPool v1.5.39'), 'header shows the running version');
 });
 
 // ── B: the Updates menu (fix the quit→relaunch→restart dance) ─────────────────────

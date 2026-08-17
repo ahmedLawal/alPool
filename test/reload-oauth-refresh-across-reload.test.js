@@ -163,7 +163,7 @@ test('in-flight OAuth refresh across a reload rotates the single-use token EXACT
   let out = ''; child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(() => /Maxpool Proxy|Listening on/.test(out), 20000);
+    await waitFor(() => /alPool Proxy|Listening on/.test(out), 20000);
 
     // Fire a request — its routing triggers ensureTokenFresh (token is expired),
     // which POSTs to the held stub. Don't await (it blocks on the held refresh).

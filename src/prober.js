@@ -44,9 +44,9 @@ export class Prober {
       this.probeAll().catch(() => {});
       this.timer = setInterval(() => this.probeAll().catch(() => {}), intervalMs);
       this.timer.unref?.();
-      this.log(`[Maxpool] Quota probe enabled (every ${Math.round(intervalMs / 1000)}s)`);
+      this.log(`[alPool] Quota probe enabled (every ${Math.round(intervalMs / 1000)}s)`);
     } else if (wasOn) {
-      this.log('[Maxpool] Quota probe disabled');
+      this.log('[alPool] Quota probe disabled');
     }
   }
 

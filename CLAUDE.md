@@ -1,10 +1,15 @@
-# Maxpool — project instructions for Claude Code
+# alPool — project instructions for Claude Code
 
-Maxpool is a multi-account, multi-provider proxy for Claude Code. It sits between
+alPool is Ahmed's personal fork of `2solarmax/maxpool`. It is exposed locally as
+the `alpool` command and updates from `ahmedLawal/alPool`; it is not published to
+npm. Compatibility identifiers intentionally retain the former name:
+`~/.config/maxpool.json`, `MAXPOOL_*`, `x-maxpool-*`, and `/maxpool/status`.
+
+alPool is a multi-account, multi-provider proxy for Claude Code. It sits between
 Claude Code and the Anthropic API (and GLM/Kimi) and spreads requests across all
 accounts you own — Anthropic OAuth (subscription), GLM (z.ai), and Kimi
 (Moonshot) — using adaptive, rate-aware load balancing. Node.js, zero runtime
-dependencies, published to npm as `maxpool`.
+dependencies, installed from the personal checkout with `npm link`.
 
 ## Providers (multi-provider since v1.5.64)
 
@@ -66,6 +71,9 @@ lines) — it loads in full every session.
 ## Hard invariants — do not break these
 
 **Release pipeline** (details: `scripts/release.sh`, `.github/workflows/publish.yml`):
+- **Personal-fork override:** do not run the upstream npm release flow for alPool.
+  The publish job is repository-guarded to `2solarmax/maxpool`; alPool ships by
+  merging tested commits to its `main` branch and is consumed through `npm link`.
 - Ship with `npm run release` (patch) / `scripts/release.sh minor|major|X.Y.Z`.
   It runs tests → lint → `npm version` (commit + `vX.Y.Z` tag) → push → GitHub
   Actions publishes to npm. **Never `npm publish` by hand.**

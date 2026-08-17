@@ -283,7 +283,7 @@ export class TUI {
     try {
       process.stdin.setRawMode(true);
     } catch (err) {
-      process.stderr.write(`[Maxpool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
+      process.stderr.write(`[alPool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
       return false;
     }
 
@@ -349,7 +349,7 @@ export class TUI {
   }
 
   _addLog(msg) {
-    msg = msg.replace(/^\[Maxpool\]\s*/, '');
+    msg = msg.replace(/^\[alPool\]\s*/, '');
     // Persist too — in TUI mode console is re-pointed here, bypassing the console
     // mirror, so this is where TUI-mode lines reach the on-disk event log.
     appendEventLog(msg);
@@ -419,13 +419,13 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') {
       this._confirm(
-        'Stop Maxpool?',
+        'Stop alPool?',
         'New requests will stop; active requests will drain before the server exits.',
         () => { this.stop(); this.onQuit?.(); },
       );
     } else if (k === 'r') {
       this._confirm(
-        'Restart Maxpool?',
+        'Restart alPool?',
         // Say what actually happens to the user's sessions. The old text ("pause new
         // requests, drain active work") was accurate but hid the consequence: with
         // several long requests in flight, NEW requests get a 503 for up to the drain
@@ -644,7 +644,7 @@ export class TUI {
         const key = await this._resolveCredential(input);
         if (!key) return;
         this.mode = 'accounts';
-        this._confirm('Add this API key?', 'Store it in Maxpool config as a new Anthropic API account.',
+        this._confirm('Add this API key?', 'Store it in alPool config as a new Anthropic API account.',
           () => this._doAddKey(key));
       };
       return;
@@ -694,7 +694,7 @@ export class TUI {
     buf.push(dim('     A) Paste it — stored in your config (0600). No cloud setup.'));
     buf.push(dim('     B) Type a GCP Secret Manager name — the key never touches disk.'));
     buf.push(dim('        Store it:  ') + 'gcloud secrets create MY_KEY --data-file=-');
-    buf.push(dim('        Maxpool reads it as YOU:  ') + 'gcloud auth application-default login');
+    buf.push(dim('        alPool reads it as YOU:  ') + 'gcloud auth application-default login');
     buf.push(dim('        Delete the secret and the account stops working everywhere.'));
   }
 
@@ -924,7 +924,7 @@ export class TUI {
           : '';
         this._confirm(
           `Delete "${account.name}"?`,
-          `Permanently remove it from Maxpool config. Deletion is blocked while it has active requests.${secret}`,
+          `Permanently remove it from alPool config. Deletion is blocked while it has active requests.${secret}`,
           () => this._doDelete(this.selIdx),
         );
       } else if (this.selAction === 'rename') {
@@ -1095,8 +1095,8 @@ export class TUI {
       // a false "Added new account".
       const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
       process.stdout.write(updated
-        ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
-        : `\nAdded new account "${name}". Returning to maxpool…\n`);
+        ? `\nRe-authenticated "${name}". Returning to alPool…\n`
+        : `\nAdded new account "${name}". Returning to alPool…\n`);
     } catch (e) {
       process.stdout.write(`\nLogin failed: ${e.message}\n`);
     } finally {
@@ -1202,7 +1202,7 @@ export class TUI {
       // token; a later "REJECTED sent fp=<other>" then means an upstream revocation,
       // not a lost persist. console.log (not _addLog) so it's VISIBLE during the
       // stopped-TUI login flow, mirroring the sibling "Persisted rotated token" line.
-      console.log(`[Maxpool] Re-authenticated "${name}" — fresh token persisted (fp=${tokenFingerprint(creds.refreshToken)})`);
+      console.log(`[alPool] Re-authenticated "${name}" — fresh token persisted (fp=${tokenFingerprint(creds.refreshToken)})`);
       return { updated: true, name };
     } else {
       this.config.accounts.push(entry);
@@ -1433,7 +1433,7 @@ export class TUI {
     const auto = this._autoUpdateOn()
       ? green('· auto-update on')
       : dim('· auto-update off');
-    const left = bold(' Maxpool') + verStr + ' ' + auto;
+    const left = bold(' alPool') + verStr + ' ' + auto;
     const port = this.config.proxy?.port || 3456;
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);

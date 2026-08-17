@@ -249,7 +249,7 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
     if (advanced && !applicable && announce) {
       notify(`Update ${result.latest} already attempted — staying on the running revision.`);
     } else if (advanced && !config?.autoApply && announce) {
-      notify(`Updated to ${result.latest}. Restart maxpool to apply.`);
+      notify(`Updated to ${result.latest}. Restart alPool to apply.`);
     }
     return { hasUpdate: true, installedVersion: onDisk, applicable };
   }
@@ -300,7 +300,7 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
   if (advanced && !applicable) {
     if (announce) notify(`Update ${installed} already attempted — staying on ${current}; will retry only a newer release.`);
   } else if (advanced && !config?.autoApply) {
-    if (announce) notify(`Updated to ${installed}. Restart maxpool to apply (sessions are not interrupted).`);
+    if (announce) notify(`Updated to ${installed}. Restart alPool to apply (sessions are not interrupted).`);
   }
   return { hasUpdate: true, installedVersion: installed, applicable };
 }

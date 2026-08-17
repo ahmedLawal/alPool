@@ -1,11 +1,11 @@
 {
-  "name": "maxpool",
+  "name": "alpool",
   "version": "1.5.86",
-  "description": "Multi-account Claude Code proxy with adaptive, rate-aware load balancing across Claude accounts",
+  "description": "alPool multi-account Claude Code proxy with adaptive, rate-aware load balancing",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "maxpool": "src/index.js"
+    "alpool": "src/index.js"
   },
   "files": [
     "src/",
@@ -31,11 +31,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/2solarmax/maxpool.git"
+    "url": "git+https://github.com/ahmedLawal/alPool.git"
   },
-  "homepage": "https://github.com/2solarmax/maxpool#readme",
+  "homepage": "https://github.com/ahmedLawal/alPool#readme",
   "bugs": {
-    "url": "https://github.com/2solarmax/maxpool/issues"
+    "url": "https://github.com/ahmedLawal/alPool/issues"
   },
   "engines": {
     "node": ">=20.3.0"

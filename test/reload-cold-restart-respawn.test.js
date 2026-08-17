@@ -55,7 +55,7 @@ async function waitFor(pred, timeoutMs = 20000, stepMs = 100) {
   throw new Error('waitFor predicate never became true');
 }
 
-const countBoots = out => (out.match(/Maxpool Proxy/g) || []).length;
+const countBoots = out => (out.match(/alPool Proxy/g) || []).length;
 
 // Fire a request through the proxy; resolve the status code, or reject on timeout.
 function proxyRequest(port, timeoutMs = 8000) {
@@ -104,7 +104,7 @@ test('interactive cold restart brings the server back (exit-75 respawn re-listen
   child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(() => /Maxpool Proxy/.test(out), 20000);
+    await waitFor(() => /alPool Proxy/.test(out), 20000);
     const firstBoots = countBoots(out);
 
     // The worker is primary once a proxied request succeeds (→ closeMasterAccept

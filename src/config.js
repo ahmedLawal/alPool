@@ -116,7 +116,7 @@ export function createDefaultConfig() {
       providerCrossFallback: true,
       // Per-provider Claude→provider control (TUI routing: g = GLM, k = Kimi). Same values
       // as the policy above; unset inherits it. Default 'never' — a Claude session that
-      // finishes on a provider comes back with thinking blocks Anthropic rejects (Maxpool
+      // finishes on a provider comes back with thinking blocks Anthropic rejects (alPool
       // repairs that automatically, but a provider server-tool call is unrepairable).
       // Left EMPTY: an unset provider inherits the policy above, so off-by-default holds
       // without shadowing it. The TUI writes an entry here only when you steer one

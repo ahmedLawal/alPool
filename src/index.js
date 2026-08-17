@@ -260,10 +260,10 @@ async function supervisorCommand() {
   // wedge the port and drop the service). Log and let the supervision loop or
   // the reload's own error handling recover.
   process.on('uncaughtException', err => {
-    console.error(`[Maxpool] Supervisor uncaughtException (continuing): ${err?.stack || err}`);
+    console.error(`[alPool] Supervisor uncaughtException (continuing): ${err?.stack || err}`);
   });
   process.on('unhandledRejection', reason => {
-    console.error(`[Maxpool] Supervisor unhandledRejection (continuing): ${reason}`);
+    console.error(`[alPool] Supervisor unhandledRejection (continuing): ${reason}`);
   });
 
   // After SIGKILLing a worker that may have owned the TUI, the worker had no
@@ -360,7 +360,7 @@ async function supervisorCommand() {
         // on this user's loaded Mac (the update never landed). See RELOAD_READY_MS.
         readyTimeoutMs: RELOAD_READY_MS,
         takeoverTimeoutMs: RELOAD_READY_MS,
-        log: msg => console.log(`[Maxpool] ${msg}`),
+        log: msg => console.log(`[alPool] ${msg}`),
       });
 
       if (outcome === RELOAD_SWAPPED) {
@@ -398,7 +398,7 @@ async function supervisorCommand() {
       activeWorker = null;
       endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
     } catch (err) {
-      console.error(`[Maxpool] Reload error: ${err.message}; falling back to abrupt restart`);
+      console.error(`[alPool] Reload error: ${err.message}; falling back to abrupt restart`);
       try { newWorker?.child.kill('SIGKILL'); } catch { /* ignore */ }
       try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
       restoreTerminalFromSupervisor();
@@ -451,7 +451,7 @@ async function supervisorCommand() {
       if (ranFor < CRASH_WINDOW_MS && (result.code ?? 1) !== 0) {
         crashCount++;
         const backoff = Math.min(MAX_BACKOFF_MS, 250 * 2 ** (crashCount - 1));
-        console.error(`[Maxpool] Worker exited (code ${result.code}, signal ${result.signal}) after ${ranFor}ms — crash #${crashCount}. Backing off ${backoff}ms before respawn.`);
+        console.error(`[alPool] Worker exited (code ${result.code}, signal ${result.signal}) after ${ranFor}ms — crash #${crashCount}. Backing off ${backoff}ms before respawn.`);
         await delay(backoff);
         continue;
       }
@@ -485,7 +485,7 @@ function reapOldWorker(worker, onExited = () => {}) {
   };
   const timer = setTimeout(() => {
     if (reaped) return;
-    console.error(`[Maxpool] Old worker outlived ${Math.ceil(cap / 1000)}s reload-drain cap; SIGKILL.`);
+    console.error(`[alPool] Old worker outlived ${Math.ceil(cap / 1000)}s reload-drain cap; SIGKILL.`);
     try { worker.child.kill('SIGKILL'); } catch { /* ignore */ }
     finish();
   }, cap);
@@ -558,8 +558,8 @@ async function serverWorkerCommand() {
   if (config.accounts.length === 0 && !(Array.isArray(config.providers) && config.providers.length > 0)) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
-    console.error('  maxpool login            OAuth login via browser');
-    console.error('  maxpool login --api      Add an API key');
+    console.error('  alpool login             OAuth login via browser');
+    console.error('  alpool login --api       Add an API key');
     console.error('  (or add a GLM/Kimi provider from the TUI: press p → a)');
     process.exit(1);
   }
@@ -581,7 +581,7 @@ async function serverWorkerCommand() {
   const sleepGuard = new SleepGuard({
     enabled: config.preventSleep !== false && process.platform === 'darwin' && process.env.MAXPOOL_DISABLE_SLEEP_GUARD !== '1',
     getWorkPending: () => accountManager.getGlobalInFlight() > 0 || accountManager.queueState.waiting.length > 0,
-    log: msg => console.log(`[Maxpool] ${msg}`),
+    log: msg => console.log(`[alPool] ${msg}`),
   });
   accountManager.setRoutingMode(
     config.routing?.mode,
@@ -637,13 +637,13 @@ async function serverWorkerCommand() {
       accountManager.loadConfigProviders(entries);
       const ok = entries.filter(e => e.token).length;
       const fail = entries.length - ok;
-      console.log(`[Maxpool] Config providers: ${ok} active${fail ? `, ${fail} unresolved` : ''}`);
+      console.log(`[alPool] Config providers: ${ok} active${fail ? `, ${fail} unresolved` : ''}`);
       for (const p of config.providers) {
         const a = accountManager.accounts.find(a => a.name === p.name);
         if (a && p.secretName) a.secretName = p.secretName;
       }
     } catch (err) {
-      console.error(`[Maxpool] Config provider resolution failed: ${err.message}`);
+      console.error(`[alPool] Config provider resolution failed: ${err.message}`);
     }
   }
 
@@ -767,11 +767,11 @@ async function serverWorkerCommand() {
       // with a later "REJECTED sent fp=" line to tell a lost-rotation double-spend
       // (no matching Persisted line) from an upstream revocation (fp matches).
       if (!skipped) {
-        console.log(`[Maxpool] Persisted rotated token for "${account.name}" (fp=${tokenFingerprint(newTokens.refreshToken)})`);
+        console.log(`[alPool] Persisted rotated token for "${account.name}" (fp=${tokenFingerprint(newTokens.refreshToken)})`);
       }
     } catch (err) {
       if (err?.code === 'STALE_GENERATION') return; // another writer advanced; benign
-      console.error(`[Maxpool] Failed to save refreshed token for "${account.name}" (fp=${tokenFingerprint(newTokens?.refreshToken)}): ${err?.message || err}`);
+      console.error(`[alPool] Failed to save refreshed token for "${account.name}" (fp=${tokenFingerprint(newTokens?.refreshToken)}): ${err?.message || err}`);
     }
   };
   accountManager.onTokenRefresh(persistTokenRefresh);
@@ -824,7 +824,7 @@ async function serverWorkerCommand() {
   };
   process.on('exit', restoreTerminal);
   process.on('uncaughtException', err => {
-    console.error(`[Maxpool] Worker uncaughtException: ${err?.stack || err}`);
+    console.error(`[alPool] Worker uncaughtException: ${err?.stack || err}`);
     restoreTerminal();
     // A reload worker must NEVER exit(1) (escapes the supervisor exit-75 loop).
     // Stay alive so the supervisor's baton timeouts roll us back cleanly. Also
@@ -837,7 +837,7 @@ async function serverWorkerCommand() {
   process.stdout.on('error', () => {});
   process.stderr.on('error', () => {});
   process.on('unhandledRejection', reason => {
-    console.error(`[Maxpool] Worker unhandledRejection: ${reason}`);
+    console.error(`[alPool] Worker unhandledRejection: ${reason}`);
   });
   // Quit drains in-flight requests, then force-exits. Kept short so a single
   // 'q' / Ctrl-C / SIGTERM actually quits under a continuous request flood
@@ -903,7 +903,7 @@ async function serverWorkerCommand() {
     if (syncTimer) clearInterval(syncTimer);
     if (updateTimer) clearInterval(updateTimer);
     if (tui?.running) { tui.stop(); }
-    console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
+    console.log('\n[alPool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
     // Best-effort: flush quota + settle in-flight refreshes/prober before exit so
     // the respawned worker doesn't boot from a half-written state. Bounded so the
@@ -951,7 +951,7 @@ async function serverWorkerCommand() {
           reloadWatchdog = null;
           if (draining) return; // MSG_RELEASE already arrived → a real reload, not a rollback
           if (restartController?.cancelRestart()) {
-            console.log('[Maxpool] Reload rolled back (new worker never took over).');
+            console.log('[alPool] Reload rolled back (new worker never took over).');
           }
           // FALL BACK TO A COLD RESTART — but ONLY when a newer build is actually on disk
           // waiting to be picked up. Resuming the old worker is what made "press u → c"
@@ -968,12 +968,12 @@ async function serverWorkerCommand() {
           const swapWasSlowNotBroken = lastRollbackReason === 'timeout';
           if (reloadIsForUpdate && swapWasSlowNotBroken && !coldFallbackUsed) {
             coldFallbackUsed = true;
-            console.log('[Maxpool] Applying the update with a full restart instead — one moment.');
+            console.log('[alPool] Applying the update with a full restart instead — one moment.');
             restartWorkerNow();
           } else if (reloadIsForUpdate && !swapWasSlowNotBroken) {
-            console.log('[Maxpool] The new version failed to start — resumed serving on the current version. Update NOT applied.');
+            console.log('[alPool] The new version failed to start — resumed serving on the current version. Update NOT applied.');
           } else {
-            console.log('[Maxpool] Rollback complete — resumed serving on the current version.');
+            console.log('[alPool] Rollback complete — resumed serving on the current version.');
           }
         }, RELOAD_ROLLBACK_SELFHEAL_MS);
         reloadWatchdog.unref?.();
@@ -1015,7 +1015,7 @@ async function serverWorkerCommand() {
     // to keep alive for).
     const cleanExitCode = options.terminalClose ? 0 : 1;
     if (draining) {
-      console.error(`\n[Maxpool] Force exiting with ${restartController.activeRequests.size} active request(s) still open.`);
+      console.error(`\n[alPool] Force exiting with ${restartController.activeRequests.size} active request(s) still open.`);
       process.exit(cleanExitCode);
     }
 
@@ -1033,8 +1033,8 @@ async function serverWorkerCommand() {
       await flushStateWrites();
     })().catch(() => {});
 
-    console.log(`\n[Maxpool] Draining shutdown (${reason}).`);
-    console.log(`[Maxpool] Stopped accepting new requests; waiting up to ${Math.ceil(drainTimeoutMs / 1000)}s for ${restartController.activeRequests.size} active request(s), then forcing exit. Press Ctrl-C again to force now.`);
+    console.log(`\n[alPool] Draining shutdown (${reason}).`);
+    console.log(`[alPool] Stopped accepting new requests; waiting up to ${Math.ceil(drainTimeoutMs / 1000)}s for ${restartController.activeRequests.size} active request(s), then forcing exit. Press Ctrl-C again to force now.`);
 
     let done = false;
     let reportTimer = null;
@@ -1045,30 +1045,30 @@ async function serverWorkerCommand() {
       if (reportTimer) clearInterval(reportTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (options.restart && code === 0) {
-        console.log('[Maxpool] Restarting server...');
+        console.log('[alPool] Restarting server...');
         process.exit(SERVER_RESTART_EXIT_CODE);
       }
       process.exit(code);
     };
 
     reportTimer = setInterval(() => {
-      console.log(`[Maxpool] Still draining ${restartController.activeRequests.size} active request(s)...`);
+      console.log(`[alPool] Still draining ${restartController.activeRequests.size} active request(s)...`);
     }, 5000);
     reportTimer.unref();
 
     timeoutTimer = setTimeout(() => {
-      console.error(`[Maxpool] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${restartController.activeRequests.size} active request(s) still open.`);
+      console.error(`[alPool] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${restartController.activeRequests.size} active request(s) still open.`);
       finish(cleanExitCode);
     }, drainTimeoutMs);
     timeoutTimer.unref();
 
     server.close(err => {
       if (err) {
-        console.error(`[Maxpool] Shutdown error: ${err.message}`);
+        console.error(`[alPool] Shutdown error: ${err.message}`);
         finish(cleanExitCode);
         return;
       }
-      console.log('[Maxpool] Shutdown complete.');
+      console.log('[alPool] Shutdown complete.');
       finish(0);
     });
     server.closeIdleConnections?.();
@@ -1148,7 +1148,7 @@ async function serverWorkerCommand() {
       const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
       if (added && tui) tui._addLog(`Auto-loaded ${added} account(s) from config`);
     } catch (err) {
-      console.error(`[Maxpool] Account auto-sync failed: ${err.message}`);
+      console.error(`[alPool] Account auto-sync failed: ${err.message}`);
     } finally {
       syncInFlight = false;
     }
@@ -1162,7 +1162,7 @@ async function serverWorkerCommand() {
   // would permanently disable all future update detection. It only refreshes
   // versionInfo (the persistent TUI banner is the reminder, so no repeated log spam);
   // autoUpdate progress lines still surface. unref so it never blocks a clean exit.
-  const notifyUpdate = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
+  const notifyUpdate = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[alPool] ${msg}`));
   // Fully-automatic apply (opt-in autoApply): mark the version attempted, THEN seamlessly
   // reload into the freshly-installed code (sessions survive). Marking here — at the
   // moment we act — is what makes the quarantine truthful: a boot-broken release is
@@ -1275,7 +1275,7 @@ async function serverWorkerCommand() {
         const diskConfig = await loadConfig();
         if (diskConfig) await syncAccountsFromDisk(diskConfig, config, accountManager);
       } catch (err) {
-        console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
+        console.error(`[alPool] Token re-sync at takeover failed: ${err.message}`);
       }
     }
 
@@ -1291,13 +1291,13 @@ async function serverWorkerCommand() {
     // Reload-storm guard: only a cold (non-reload) lease holder probes npm.
     // A reload-spawned/takeover worker must NEVER re-probe (1x not 2x traffic).
     if (!viaTakeover && !isReloadWorker) {
-      if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') console.log('[Maxpool] UPDATE_CHECK_FIRED');
+      if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') console.log('[alPool] UPDATE_CHECK_FIRED');
       // Cold-start-behind: download AND (autoApply) self-apply via the SAME latched helper
       // as the periodic path — so the version is applied, not marked-attempted-then-stranded,
       // and it can't race the periodic timer's install.
       runUpdateCheck({ announce: true, apply: applyUpdateIfReady });
     } else if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') {
-      console.log('[Maxpool] UPDATE_CHECK_SKIPPED (reload)');
+      console.log('[alPool] UPDATE_CHECK_SKIPPED (reload)');
     }
   };
 
@@ -1306,7 +1306,7 @@ async function serverWorkerCommand() {
     // Supervised: NEVER listen(port) directly — the supervisor owns the socket.
     // Wait for the baton over IPC. A cold worker gets MSG_LISTEN; a reload worker
     // boots headless (already done above) and waits for MSG_PROBE_READY/TAKEOVER.
-    server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
+    server.on('error', err => console.error(`[alPool] Server error: ${err.message}`));
 
     const listenOnHandle = handle => new Promise((resolve, reject) => {
       server.once('error', reject);
@@ -1376,7 +1376,7 @@ async function serverWorkerCommand() {
       const drainPoll = setInterval(waitForDrain, 200);
       drainPoll.unref?.();
       const hardCap = setTimeout(() => {
-        console.error(`[Maxpool] Released worker reload-drain cap reached with ${restartController.activeRequests.size} active; exiting.`);
+        console.error(`[alPool] Released worker reload-drain cap reached with ${restartController.activeRequests.size} active; exiting.`);
         process.exit(0);
       }, RELOAD_DRAIN_MS);
       hardCap.unref?.();
@@ -1393,7 +1393,7 @@ async function serverWorkerCommand() {
           // Defense-in-depth for the stale-handle hang: if the supervisor ever hands
           // a cold worker a dead/absent socket, fail LOUD and exit-75 so it respawns —
           // never sit alive-but-not-primary (the blank-screen `r`-restart hang).
-          console.error('[Maxpool] Cold worker received MSG_LISTEN with no socket handle — exiting for respawn.');
+          console.error('[alPool] Cold worker received MSG_LISTEN with no socket handle — exiting for respawn.');
           process.exit(SERVER_RESTART_EXIT_CODE);
         } else if (msg?.type === MSG_PROBE_READY) {
           // Headless reload worker: we've booted the new code and restored quota
@@ -1443,7 +1443,7 @@ async function serverWorkerCommand() {
           await releaseBatonAndDrain();
         }
       } catch (err) {
-        console.error(`[Maxpool] Worker message error: ${err.message}`);
+        console.error(`[alPool] Worker message error: ${err.message}`);
         // A COLD worker that failed to listen / become primary has no baton to roll
         // back to — it would strand blank. Exit-75 so the supervisor respawns it
         // (closes the silent-non-primary hang class). A RELOAD worker mid-baton must
@@ -1459,8 +1459,8 @@ async function serverWorkerCommand() {
     server.once('error', onListenError);
     server.listen(port, host, () => {
       server.removeListener('error', onListenError);
-      server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
-      becomePrimary({ viaTakeover: false }).catch(err => console.error(`[Maxpool] ${err.message}`));
+      server.on('error', err => console.error(`[alPool] Server error: ${err.message}`));
+      becomePrimary({ viaTakeover: false }).catch(err => console.error(`[alPool] ${err.message}`));
     });
   }
 
@@ -1477,7 +1477,7 @@ function logPlainServerStart({ host, port, accounts, threshold, config }) {
   const sep = '='.repeat(60);
   console.log('');
   console.log(sep);
-  console.log('  Maxpool Proxy');
+  console.log('  alPool Proxy');
   console.log(sep);
   console.log(`  Listen:     ${host}:${port}`);
   console.log(`  Accounts:   ${accounts.length}`);
@@ -1489,8 +1489,8 @@ function logPlainServerStart({ host, port, accounts, threshold, config }) {
     console.log(`  [${i + 1}] ${a.name} (${a.type})`);
   });
   console.log('');
-  console.log('  Run Claude through proxy:  maxpool run');
-  console.log('  Show env vars:             maxpool env');
+  console.log('  Run Claude through proxy:  alpool run');
+  console.log('  Show env vars:             alpool env');
   console.log(sep);
   console.log('');
 }
@@ -1570,7 +1570,7 @@ async function loginOAuthCommand() {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');
-    console.error('  maxpool login --api   Add an API key instead');
+    console.error('  alpool login --api   Add an API key instead');
     process.exit(1);
   }
 
@@ -1680,7 +1680,7 @@ async function statusCommand() {
     }
   } catch {
     console.error(`Cannot connect to proxy at ${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
-    console.error('Is the server running? Start with: maxpool server');
+    console.error('Is the server running? Start with: alpool server');
     process.exit(1);
   }
 }
@@ -1693,7 +1693,7 @@ async function accountsCommand() {
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
-    console.log('Add one with: maxpool login (browser) or maxpool login --api');
+    console.log('Add one with: alpool login (browser) or alpool login --api');
     return;
   }
 
@@ -1784,8 +1784,8 @@ async function apiCommand() {
   const path = args[1];
 
   if (!path) {
-    console.error('Usage: maxpool api <path> [--account NAME] [--method POST] [--data JSON]');
-    console.error('Example: maxpool api /api/oauth/claude_cli/roles');
+    console.error('Usage: alpool api <path> [--account NAME] [--method POST] [--data JSON]');
+    console.error('Example: alpool api /api/oauth/claude_cli/roles');
     process.exit(1);
   }
 
@@ -1844,7 +1844,7 @@ async function removeCommand() {
   const name = args[1];
 
   if (!name) {
-    console.error('Usage: maxpool remove <account-name>');
+    console.error('Usage: alpool remove <account-name>');
     process.exit(1);
   }
 
@@ -1872,7 +1872,7 @@ async function renameCommand() {
   const newName = args[2];
 
   if (!target || !newName) {
-    console.error('Usage: maxpool rename <account-name|number> <new-name>');
+    console.error('Usage: alpool rename <account-name|number> <new-name>');
     process.exit(1);
   }
 
@@ -1892,15 +1892,15 @@ async function renameCommand() {
   if (config.routing?.preferredAccount === old) config.routing.preferredAccount = newName;
   await saveConfig(config);
   console.log(`Renamed "${old}" → "${newName}"`);
-  console.log('Restart maxpool to apply this to a running proxy (or rename live from the TUI: a → n).');
+  console.log('Restart alPool to apply this to a running proxy (or rename live from the TUI: a → n).');
 }
 
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
-  console.log(`Maxpool - Multi-account Claude proxy
+  console.log(`alPool - Multi-account Claude proxy
 
-Usage: maxpool [command] [options]
+Usage: alpool [command] [options]
 
 Commands:
   server              Start the proxy server (default)
@@ -1918,7 +1918,7 @@ Commands:
 Options:
   --name NAME         Set account name (login)
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
-  --with-key          Include proxy API key in maxpool env output
+  --with-key          Include proxy API key in alpool env output
 
 Env:
   MAXPOOL_TUI_COLD_RESTART=1   Reload (r) via a full cold restart instead of the
@@ -2009,7 +2009,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       memConfig.accounts.push(diskAcct);
       accountManager.addAccount(diskAcct);
       added++;
-      console.log(`[Maxpool] Picked up new account "${diskAcct.name}" from config`);
+      console.log(`[alPool] Picked up new account "${diskAcct.name}" from config`);
       continue;
     }
 
@@ -2033,7 +2033,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     const enabled = diskAcct.enabled !== false;
     if (mgr.enabled !== enabled) {
       accountManager.setAccountEnabled(mgr.index, enabled);
-      console.log(`[Maxpool] ${enabled ? 'Enabled' : 'Disabled'} account "${mgr.name}" from config`);
+      console.log(`[alPool] ${enabled ? 'Enabled' : 'Disabled'} account "${mgr.name}" from config`);
     }
     memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
 
@@ -2046,16 +2046,16 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[Maxpool] Refreshed credentials for "${mgr.name}"`);
+        console.log(`[alPool] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[Maxpool] Updated API key for "${mgr.name}"`);
+      console.log(`[alPool] Updated API key for "${mgr.name}"`);
     } else if (freshCred.authToken && mgr.credential !== freshCred.authToken) {
       mgr.credential = freshCred.authToken;
       if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[Maxpool] Updated provider token for "${mgr.name}"`);
+      console.log(`[alPool] Updated provider token for "${mgr.name}"`);
     }
   }
   memConfig.routing = {
@@ -2093,10 +2093,10 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         }
         memConfig.providers = diskConfig.providers;
         const ok = entries.filter(e => e.token).length;
-        console.log(`[Maxpool] Config providers re-synced from disk: ${ok} active`);
+        console.log(`[alPool] Config providers re-synced from disk: ${ok} active`);
         added += Math.max(0, entries.length - JSON.parse(before).length);
       } catch (err) {
-        console.error(`[Maxpool] Provider re-sync failed: ${err.message}`);
+        console.error(`[alPool] Provider re-sync failed: ${err.message}`);
       }
     }
   }
@@ -2113,15 +2113,15 @@ function argValue(flag) {
 
 function handleServerListenError(err, host, port) {
   if (err.code === 'EADDRINUSE') {
-    console.error(`[Maxpool] ${host}:${port} is already in use.`);
-    console.error('Another Maxpool proxy may already be running.');
-    console.error('Check the existing server with: maxpool status');
+    console.error(`[alPool] ${host}:${port} is already in use.`);
+    console.error('Another alPool proxy may already be running.');
+    console.error('Check the existing server with: alpool status');
     console.error(`Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`);
   } else if (err.code === 'EACCES') {
-    console.error(`[Maxpool] Permission denied while listening on ${host}:${port}.`);
-    console.error('Choose a non-privileged port in the Maxpool config.');
+    console.error(`[alPool] Permission denied while listening on ${host}:${port}.`);
+    console.error('Choose a non-privileged port in the alPool config.');
   } else {
-    console.error(`[Maxpool] Failed to listen on ${host}:${port}: ${err.message}`);
+    console.error(`[alPool] Failed to listen on ${host}:${port}: ${err.message}`);
   }
   process.exit(1);
 }

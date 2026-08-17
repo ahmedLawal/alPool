@@ -52,7 +52,7 @@ async function waitFor(pred, timeoutMs = 20000, stepMs = 100) {
   throw new Error('waitFor predicate never became true');
 }
 // Each worker boot (initial + every restart) prints the startup banner.
-const countBoots = out => (out.match(/Maxpool Proxy/g) || []).length;
+const countBoots = out => (out.match(/alPool Proxy/g) || []).length;
 
 test('restart with an in-flight request completes bounded and the server comes back', async () => {
   const port = await getFreePort();
@@ -87,7 +87,7 @@ test('restart with an in-flight request completes bounded and the server comes b
   child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(() => /Maxpool Proxy/.test(out), 20000);
+    await waitFor(() => /alPool Proxy/.test(out), 20000);
     const firstBoots = countBoots(out);
 
     // 1) Put a request IN FLIGHT — the stub upstream holds it open forever.
