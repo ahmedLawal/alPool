@@ -177,7 +177,7 @@ const DEFAULT_SCHEDULER = {
   // 'never' | 'when-exhausted' | 'always'. Undefined ⇒ inherit crossProviderFallbackPolicy,
   // so an existing config upgrades to byte-identical behavior. Default 'never': letting a
   // Claude session finish on a provider contaminates its transcript (BOTH providers emit
-  // thinking blocks Anthropic rejects — measured 2026-07-25), and while Maxpool now repairs
+  // thinking blocks Anthropic rejects — measured 2026-07-25), and while alPool now repairs
   // that automatically, a provider server-tool call is NOT repairable.
   // Ships EMPTY on purpose: an unset provider INHERITS crossProviderFallbackPolicy (whose
   // default is already 'never'), so off-by-default holds without a per-provider entry
@@ -740,7 +740,7 @@ export class AccountManager {
         account.lastErrorAt = null;
         account.provisionalRateLimitFingerprint = null;
       }
-      console.log(`[Maxpool] Account "${account.name}" rate limit expired, marking active`);
+      console.log(`[alPool] Account "${account.name}" rate limit expired, marking active`);
     }
 
     if (account.cooldownUntil) {
@@ -803,7 +803,7 @@ export class AccountManager {
     this.upstreamThrottle.failedProbes = 0;   // fresh breaker → fresh probe budget
     this.upstreamThrottle.count++;
     this.upstreamThrottle.lastAt = Date.now();
-    console.log(`[Maxpool] Anthropic upstream temporarily limiting requests for ${retryAfter}s; pausing Claude routes`);
+    console.log(`[alPool] Anthropic upstream temporarily limiting requests for ${retryAfter}s; pausing Claude routes`);
   }
 
   clearUpstreamThrottle(reason = 'recovered') {
@@ -814,7 +814,7 @@ export class AccountManager {
     this.upstreamThrottle.failedProbes = 0;
     this.queueState.rampUntil = Date.now() + 5000;
     this.queueState.lastAdmissionAt = Date.now();
-    console.log(`[Maxpool] Anthropic upstream throttle cleared (${reason})`);
+    console.log(`[alPool] Anthropic upstream throttle cleared (${reason})`);
   }
 
   confirmUpstreamProbe(lease) {
@@ -852,7 +852,7 @@ export class AccountManager {
     this.upstreamThrottle.reason = reason;
     this.upstreamThrottle.probeInFlight = false;
     this.upstreamThrottle.lastAt = Date.now();
-    console.log(`[Maxpool] Anthropic recovery probe failed (${this.upstreamThrottle.failedProbes}/${MAX_FAILED_PROBES}); retrying in ${retryAfter}s (${reason})`);
+    console.log(`[alPool] Anthropic recovery probe failed (${this.upstreamThrottle.failedProbes}/${MAX_FAILED_PROBES}); retrying in ${retryAfter}s (${reason})`);
   }
 
   noteAmbiguousRateLimit(accountIndex, fingerprint, _retryAfterSeconds) {
@@ -901,7 +901,7 @@ export class AccountManager {
     const throttle = this.upstreamThrottle;
     if (!throttle.until || Date.now() < throttle.until || throttle.probeInFlight) return false;
     throttle.probeInFlight = true;
-    console.log('[Maxpool] Anthropic upstream throttle window expired; sending one recovery probe');
+    console.log('[alPool] Anthropic upstream throttle window expired; sending one recovery probe');
     return true;
   }
 
@@ -1060,14 +1060,14 @@ export class AccountManager {
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
-      console.log(`[Maxpool] Account "${account.name}" session quota reset`);
+      console.log(`[alPool] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
       changed = true;
       session = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
-      console.log(`[Maxpool] Account "${account.name}" weekly quota reset`);
+      console.log(`[alPool] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -1079,7 +1079,7 @@ export class AccountManager {
     if (q.scopedWeekly && typeof q.scopedWeekly === 'object') {
       for (const [fam, e] of Object.entries(q.scopedWeekly)) {
         if (e && e.resetAt && now >= e.resetAt) {
-          console.log(`[Maxpool] Account "${account.name}" ${fam} weekly sub-limit reset`);
+          console.log(`[alPool] Account "${account.name}" ${fam} weekly sub-limit reset`);
           delete q.scopedWeekly[fam];
           changed = true;
         }
@@ -1183,7 +1183,7 @@ export class AccountManager {
 
     if (best) {
       this.currentIndex = best.index;
-      console.log(`[Maxpool] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
+      console.log(`[alPool] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
     }
   }
 
@@ -1745,7 +1745,7 @@ export class AccountManager {
         // it so we re-evaluate once that quota is learned (see updateQuota).
         best.probing = best.quota.unified7dReset == null;
         if (switched) {
-          console.log(`[Maxpool] Switched to account "${best.name}"`);
+          console.log(`[alPool] Switched to account "${best.name}"`);
         }
         return best;
       }
@@ -1773,7 +1773,7 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
-      console.log(`[Maxpool] Account "${soonestAccount.name}" reset, switching to it`);
+      console.log(`[alPool] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
     }
 
@@ -1996,7 +1996,7 @@ export class AccountManager {
   setProviderRoutingMode(mode) {
     if (!['balance', 'prefer-claude', 'prefer-zai', 'prefer-kimi', 'sticky'].includes(mode)) return false;
     this.scheduler.routingMode = mode;
-    console.log(`[Maxpool] Routing mode set to "${mode}"`);
+    console.log(`[alPool] Routing mode set to "${mode}"`);
     return true;
   }
 
@@ -2006,7 +2006,7 @@ export class AccountManager {
     this.scheduler.crossProviderFallbackPolicy = policy;
     // Map to the new mode so the binding/priority logic agrees.
     this.scheduler.routingMode = policy === 'always' ? 'balance' : policy === 'when-exhausted' ? 'prefer-claude' : 'sticky';
-    console.log(`[Maxpool] Cross-provider fallback policy set to "${policy}" (routing mode: ${this.scheduler.routingMode})`);
+    console.log(`[alPool] Cross-provider fallback policy set to "${policy}" (routing mode: ${this.scheduler.routingMode})`);
     return true;
   }
 
@@ -2257,7 +2257,7 @@ export class AccountManager {
     if (!sessionKey) return;
     const existing = this.sessionPolicies.get(sessionKey) || {};
     if (!existing.anthropicIncompatible) {
-      console.log(`[Maxpool] Session "${sessionKey}" is Anthropic-incompatible (${homeProvider || 'provider'} transcript) — pinned to GLM/Kimi`);
+      console.log(`[alPool] Session "${sessionKey}" is Anthropic-incompatible (${homeProvider || 'provider'} transcript) — pinned to GLM/Kimi`);
     }
     this.sessionPolicies.set(sessionKey, {
       ...existing,
@@ -2274,7 +2274,7 @@ export class AccountManager {
     if (!sessionKey) return;
     const existing = this.sessionPolicies.get(sessionKey) || {};
     if (!existing.largeContext) {
-      console.log(`[Maxpool] Session "${sessionKey}" exceeds provider context limits — pinned to Claude (GLM/Kimi benched for this session)`);
+      console.log(`[alPool] Session "${sessionKey}" exceeds provider context limits — pinned to Claude (GLM/Kimi benched for this session)`);
     }
     this.sessionPolicies.set(sessionKey, { ...existing, largeContext: true });
   }
@@ -2288,7 +2288,7 @@ export class AccountManager {
     if (!sessionKey) return;
     const existing = this.sessionPolicies.get(sessionKey) || {};
     if (!existing.thinkingContaminated) {
-      console.log(`[Maxpool] Session "${sessionKey}" carries provider-authored thinking — stripping it up front from now on`);
+      console.log(`[alPool] Session "${sessionKey}" carries provider-authored thinking — stripping it up front from now on`);
     }
     this.sessionPolicies.set(sessionKey, { ...existing, thinkingContaminated: true });
   }
@@ -2302,7 +2302,7 @@ export class AccountManager {
     const existing = this.sessionPolicies.get(sessionKey);
     if (!existing?.anthropicIncompatible) return;
     this.sessionPolicies.set(sessionKey, { ...existing, anthropicIncompatible: false });
-    console.log(`[Maxpool] Session "${sessionKey}" repaired — Claude routes re-enabled`);
+    console.log(`[alPool] Session "${sessionKey}" repaired — Claude routes re-enabled`);
   }
 
   /** Remember the effort level a MODEL actually accepted for this session, so later turns
@@ -2763,13 +2763,13 @@ export class AccountManager {
     // Three strikes, not one: a single 401 can be a transient edge/token-rotation race.
     if (status === 401 && n >= 3 && !account.refreshDead) {
       account.refreshDead = true;
-      console.error(`[Maxpool] "${account.name}" credentials rejected ${n}x (HTTP 401) — marking it needs re-login. `
+      console.error(`[alPool] "${account.name}" credentials rejected ${n}x (HTTP 401) — marking it needs re-login. `
         + 'Re-authenticate via the TUI (a → l). Probing stops until then.');
     }
     // Once, at a threshold that cannot be a blip, then every 100th so it stays visible
     // without walling the log.
     if (n === PROBE_FAILURE_ALERT_AT || (n > PROBE_FAILURE_ALERT_AT && n % 100 === 0)) {
-      console.error(`[Maxpool] Quota probe has failed ${n}x in a row for "${account.name}"`
+      console.error(`[alPool] Quota probe has failed ${n}x in a row for "${account.name}"`
         + `${status ? ` (HTTP ${status})` : ''}: ${q.lastProbeError}. `
         + 'Weekly quota can only be learned from upstream 429 headers until this recovers, '
         + 'so an account that has not hit a 429 will show a blank weekly.');
@@ -2862,7 +2862,7 @@ export class AccountManager {
     if (account.probing && account.quota.unified7dReset != null) {
       account.probing = false;
       account.requalify = true;
-      console.log(`[Maxpool] Learned weekly quota for "${account.name}", re-evaluating selection`);
+      console.log(`[alPool] Learned weekly quota for "${account.name}", re-evaluating selection`);
     }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
@@ -2944,7 +2944,7 @@ export class AccountManager {
       const logKey = `${reason}:${pct}`;
       if (account.lastQuotaLogKey !== logKey) {
         account.lastQuotaLogKey = logKey;
-        console.log(`[Maxpool] Account "${account.name}" at ${pct}% usage — limiting new placement (${reason})`);
+        console.log(`[alPool] Account "${account.name}" at ${pct}% usage — limiting new placement (${reason})`);
       }
     }
   }
@@ -2987,7 +2987,7 @@ export class AccountManager {
       };
       account.lastStatus = options.status || 429;
       account.lastErrorAt = Date.now();
-      console.log(`[Maxpool] Account "${account.name}" ${options.modelScope} weekly limit hit — scoped bench ${retryAfter}s (account stays active for other models)`);
+      console.log(`[alPool] Account "${account.name}" ${options.modelScope} weekly limit hit — scoped bench ${retryAfter}s (account stays active for other models)`);
       return;
     }
 
@@ -3001,7 +3001,7 @@ export class AccountManager {
       account.failedRequests++;
       account.consecutiveFailures++;
     }
-    console.log(`[Maxpool] Account "${account.name}" rate limited for ${retryAfter}s`);
+    console.log(`[alPool] Account "${account.name}" rate limited for ${retryAfter}s`);
   }
 
   markAuthFailed(accountIndex, status = 403, reason = 'auth_failed') {
@@ -3015,7 +3015,7 @@ export class AccountManager {
     account.lastStatus = status;
     account.lastError = reason;
     account.lastErrorAt = Date.now();
-    console.log(`[Maxpool] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
+    console.log(`[alPool] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
   }
 
   markTransientFailure(accountIndex, reason = 'transient_error', { network = false } = {}) {
@@ -3036,7 +3036,7 @@ export class AccountManager {
       account.lastError = reason;
       account.lastErrorAt = Date.now();
       account.cooldownUntil = Date.now() + this.scheduler.networkCooldownMs;
-      console.log(`[Maxpool] Account "${account.name}" cooling down for ${Math.ceil(this.scheduler.networkCooldownMs / 1000)}s after ${reason} (network — short fixed, auto-recovers)`);
+      console.log(`[alPool] Account "${account.name}" cooling down for ${Math.ceil(this.scheduler.networkCooldownMs / 1000)}s after ${reason} (network — short fixed, auto-recovers)`);
       return;
     }
 
@@ -3050,7 +3050,7 @@ export class AccountManager {
     account.lastError = reason;
     account.lastErrorAt = Date.now();
     account.cooldownUntil = Date.now() + cooldown;
-    console.log(`[Maxpool] Account "${account.name}" cooling down for ${Math.ceil(cooldown / 1000)}s after ${reason}`);
+    console.log(`[alPool] Account "${account.name}" cooling down for ${Math.ceil(cooldown / 1000)}s after ${reason}`);
   }
 
   markProvisionalUpstreamFailure(accountIndex, status, fingerprint, retryAfterSeconds = 10) {
@@ -3065,7 +3065,7 @@ export class AccountManager {
     account.lastError = 'upstream_throttled';
     account.lastErrorAt = Date.now();
     account.provisionalUpstreamFingerprint = fingerprint;
-    console.log(`[Maxpool] Account "${account.name}" returned HTTP ${status}; trying another Claude account and retrying this one in ${retryAfter}s`);
+    console.log(`[alPool] Account "${account.name}" returned HTTP ${status}; trying another Claude account and retrying this one in ${retryAfter}s`);
   }
 
   clearProvisionalUpstreamFailures(fingerprint, accountIndexes) {
@@ -3147,7 +3147,7 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
-      console.log(`[Maxpool] Refreshing token for account "${account.name}"...`);
+      console.log(`[alPool] Refreshing token for account "${account.name}"...`);
       // Record the token we're rotating FROM so the persistence layer's
       // generation guard can detect another writer having already advanced it.
       account._refreshedFrom = account.refreshToken;
@@ -3158,7 +3158,7 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account.status = 'active';
         account.cooldownUntil = null;
-        console.log(`[Maxpool] Token refreshed for account "${account.name}" (rotated ${tokenFingerprint(account._refreshedFrom)} → ${tokenFingerprint(newTokens.refreshToken)})`);
+        console.log(`[alPool] Token refreshed for account "${account.name}" (rotated ${tokenFingerprint(account._refreshedFrom)} → ${tokenFingerprint(newTokens.refreshToken)})`);
         // Persist-before-serve: the rotated single-use refresh token must be
         // DURABLE on disk before we return true (before this request serves on the
         // new access token). A non-graceful kill (SIGKILL/crash/OOM/terminal-close)
@@ -3174,11 +3174,11 @@ export class AccountManager {
         try {
           await this._onTokenRefresh?.(accountIndex, newTokens);
         } catch (persistErr) {
-          console.error(`[Maxpool] Token persist raised unexpectedly for "${account.name}": ${persistErr?.message || persistErr}`);
+          console.error(`[alPool] Token persist raised unexpectedly for "${account.name}": ${persistErr?.message || persistErr}`);
         }
         return true;
       } catch (err) {
-        console.error(`[Maxpool] Token refresh failed for "${account.name}": ${err.message}`);
+        console.error(`[alPool] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token
         if (!account.expiresAt || Date.now() >= account.expiresAt) {
@@ -3199,7 +3199,7 @@ export class AccountManager {
             // from the persistent event log next time this recurs. (fp= is safe from
             // the log's secret-redactor; refresh_token= would be redacted.)
             const rejFp = tokenFingerprint(account._refreshedFrom);
-            console.error(`[Maxpool] Token refresh REJECTED for "${account.name}" (invalid_grant) — the refresh token maxpool sent (fp=${rejFp}) was not accepted. Diagnose from the event log: an earlier "rotated → ${rejFp}" that WAS "Persisted" ⇒ upstream revocation; NO persisted line for ${rejFp} ⇒ the rotation was lost across a restart (double-spend); the SAME source fp in two "rotated" lines in one window ⇒ two writers double-spent it. Re-login via the TUI ('l' key).`);
+            console.error(`[alPool] Token refresh REJECTED for "${account.name}" (invalid_grant) — the refresh token alPool sent (fp=${rejFp}) was not accepted. Diagnose from the event log: an earlier "rotated → ${rejFp}" that WAS "Persisted" ⇒ upstream revocation; NO persisted line for ${rejFp} ⇒ the rotation was lost across a restart (double-spend); the SAME source fp in two "rotated" lines in one window ⇒ two writers double-spent it. Re-login via the TUI ('l' key).`);
           }
           return false;
         }
@@ -3243,7 +3243,7 @@ export class AccountManager {
     account.expiresAt = expiresAt;
     account.refreshDead = false;  // fresh tokens from re-auth revive a dead-refresh account
     if (account.status === 'error') account.status = 'active';
-    console.log(`[Maxpool] Updated tokens for account "${account.name}"`);
+    console.log(`[alPool] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,
@@ -3566,6 +3566,7 @@ export class AccountManager {
       routing: {
         mode: this.routingMode,
         preferredAccount: this.preferredAccountName,
+        providerMode: this.scheduler.routingMode,
         crossProviderFallbackPolicy: this._crossProviderFallbackPolicy(),
       },
       accounts: this.accounts.map(a => ({

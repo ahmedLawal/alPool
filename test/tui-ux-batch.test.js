@@ -146,6 +146,17 @@ test('U1 with auto-update ON the banner says it applies automatically', () => {
   assert.ok(text.includes('auto-update on'), 'header shows the on state');
 });
 
+test('U1 a git-source update renders a revision label without a fake version prefix', () => {
+  const am = mgr();
+  am.versionInfo = {
+    current: '1.5.86', latest: 'main@bbbbbbb', hasUpdate: true,
+    source: 'git', currentRevision: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  };
+  const { text } = captureRender(tuiFor(am));
+  assert.ok(text.includes('main@aaaaaaa → main@bbbbbbb'));
+  assert.ok(!text.includes('vmain@'), 'git revisions are not semantic versions');
+});
+
 test('U1 no banner (and no blank line) when on the latest version', () => {
   const am = mgr();
   am.versionInfo = { current: '1.5.39', latest: '1.5.39', hasUpdate: false, checkedAt: Date.now() };
@@ -159,7 +170,7 @@ test('U1 the running version is shown in the header', () => {
   am.versionInfo = { current: '1.5.39', latest: '1.5.39', hasUpdate: false, checkedAt: Date.now() };
   const tui = tuiFor(am);
   const { text } = captureRender(tui);
-  assert.ok(text.includes('Maxpool v1.5.39'), 'header shows the running version');
+  assert.ok(text.includes('alPool v1.5.39'), 'header shows the running version');
 });
 
 // ── B: the Updates menu (fix the quit→relaunch→restart dance) ─────────────────────
@@ -212,7 +223,7 @@ test('B [c] runs checkNow and STAYS on the Updates screen showing live progress'
   // happened" — the reported bug. Stay put and show what's happening.
   assert.equal(tui.mode, 'updates', 'stays on the Updates screen');
   assert.ok(tui.updateBusy, 'shows live progress while it runs');
-  assert.match(strip(tui._renderUpdatesDetail().join(' ')), /Checking npm/);
+  assert.match(strip(tui._renderUpdatesDetail().join(' ')), /Checking for updates/);
 
   release();
   await new Promise(r => setImmediate(r));

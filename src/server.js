@@ -169,6 +169,49 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
 
+      // Native clients use the same authenticated loopback listener as the proxy,
+      // but all mutations remain backend-owned. The app sends typed commands here;
+      // it never edits config or credentials itself.
+      if (req.url === '/maxpool/control') {
+        if (!isLocal) {
+          sendControlJson(res, 403, { ok: false, error: { code: 'loopback_only', message: 'Control API is available only on loopback.' } });
+          return;
+        }
+        if (proxyApiKey && clientKey !== proxyApiKey) {
+          sendControlJson(res, 401, { ok: false, error: { code: 'authentication_error', message: 'Invalid proxy API key' } });
+          return;
+        }
+        try {
+          if (req.method === 'GET') {
+            const snapshot = hooks.onControlSnapshot?.() || accountManager.getStatus();
+            sendControlJson(res, 200, snapshot);
+            return;
+          }
+          if (req.method === 'POST') {
+            if (!hooks.onControlCommand) {
+              sendControlJson(res, 503, { ok: false, error: { code: 'unavailable', message: 'Control service is unavailable.' } });
+              return;
+            }
+            const command = await readControlJson(req);
+            const result = await hooks.onControlCommand(command);
+            sendControlJson(res, 200, result);
+            return;
+          }
+          sendControlJson(res, 405, { ok: false, error: { code: 'method_not_allowed', message: 'Use GET or POST.' } });
+        } catch (error) {
+          const status = Number.isInteger(error?.status) ? error.status : 500;
+          sendControlJson(res, status, {
+            ok: false,
+            error: {
+              code: error?.code || 'control_error',
+              message: status >= 500 ? 'Control command failed.' : String(error?.message || 'Invalid control command.'),
+            },
+          });
+          if (status >= 500) console.error(`[alPool] Control command failed: ${error?.message || error}`);
+        }
+        return;
+      }
+
       // Status exposes account names and quota state, so require the local
       // proxy key even for loopback callers.
       if (req.method === 'GET' && req.url === '/maxpool/status') {
@@ -211,7 +254,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             type: 'error',
             error: {
               type: 'restart_in_progress',
-              message: 'Maxpool is restarting — finishing in-flight requests first. This retries automatically; your session is not lost.',
+              message: 'alPool is restarting — finishing in-flight requests first. This retries automatically; your session is not lost.',
             },
           }));
           return;
@@ -247,7 +290,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           type: 'error',
           error: {
             type: 'restart_in_progress',
-            message: 'Maxpool is restarting — finishing in-flight requests first. This retries automatically; your session is not lost.',
+            message: 'alPool is restarting — finishing in-flight requests first. This retries automatically; your session is not lost.',
           },
         }));
         return;
@@ -307,7 +350,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         );
       } catch (err) {
         ctx.status = ctx.status || 502;
-        console.error('[Maxpool] Unhandled error:', err);
+        console.error('[alPool] Unhandled error:', err);
         // Only attempt an error body if the socket is still writable — a client
         // that aborted during body-read leaves res destroyed; writing then throws.
         if (!res.destroyed && !res.writableEnded && !res.headersSent) {
@@ -324,7 +367,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         });
       }
     } catch (err) {
-      console.error('[Maxpool] Unhandled error:', err);
+      console.error('[alPool] Unhandled error:', err);
     }
   });
 
@@ -334,6 +377,43 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   server.maxpoolBeginDrain = () => { draining = true; };
 
   return server;
+}
+
+function sendControlJson(res, status, body) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+  });
+  res.end(JSON.stringify(body));
+}
+
+async function readControlJson(req) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    if (bytes > 64 * 1024) {
+      const error = new Error('Control command exceeds 64 KiB.');
+      error.status = 413;
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  if (!bytes) {
+    const error = new Error('Control command body is required.');
+    error.status = 400;
+    error.code = 'invalid_json';
+    throw error;
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    const error = new Error('Control command must be valid JSON.');
+    error.status = 400;
+    error.code = 'invalid_json';
+    throw error;
+  }
 }
 
 /**
@@ -364,7 +444,7 @@ async function relayRaw(req, res, upstream) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    console.error('[Maxpool] Raw relay error:', err.message);
+    console.error('[alPool] Raw relay error:', err.message);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -386,7 +466,7 @@ async function writeRequestLog(logDir, reqId, sections) {
   try {
     await writeFile(join(logDir, filename), sections.join('\n\n'), 'utf-8');
   } catch (err) {
-    console.error(`[Maxpool] Failed to write log: ${err.message}`);
+    console.error(`[alPool] Failed to write log: ${err.message}`);
   }
 }
 
@@ -471,7 +551,7 @@ async function forwardRequest(
     const retryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
     // Surface the routing decision (logs go to the TUI; this is the only record
     // of WHY a request was rejected rather than queued).
-    console.log(`[Maxpool] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
+    console.log(`[alPool] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
     sendErrorResponse(res, requestInfo, 429, {
       type: 'error',
       error: {
@@ -552,7 +632,7 @@ async function forwardRequest(
       type: 'error',
       error: {
         type: 'authentication_error',
-        message: `Claude account "${account.name}" could not refresh its OAuth token. Run maxpool accounts -v or log in again.`,
+        message: `Claude account "${account.name}" could not refresh its OAuth token. Run alpool accounts -v or log in again.`,
       },
     });
     return;
@@ -724,7 +804,7 @@ async function forwardRequest(
             incident.retryAfter,
             parsedError?.message || parsedError?.type || 'matching_request_wide_429s',
           );
-          console.log('[Maxpool] Every eligible Claude account returned the same server-side 429; opening shared Anthropic throttle');
+          console.log('[alPool] Every eligible Claude account returned the same server-side 429; opening shared Anthropic throttle');
 
           const queued = await queueAndRetry(
             'Anthropic upstream is temporarily limiting requests',
@@ -738,7 +818,7 @@ async function forwardRequest(
             type: 'error',
             error: {
               type: 'rate_limit_error',
-              message: 'Anthropic is temporarily limiting requests. Maxpool will retry automatically when capacity returns.',
+              message: 'Anthropic is temporarily limiting requests. alPool will retry automatically when capacity returns.',
             },
           }, { 'retry-after': String(computeRetryAfter(accountManager, requestInfo)) });
           return;
@@ -795,7 +875,7 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
         if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
       }
-      console.log(`[Maxpool] 429 on "${account.name}" — failing over before first byte`);
+      console.log(`[alPool] 429 on "${account.name}" — failing over before first byte`);
       excludedIndexes.add(account.index);
 
       if (
@@ -822,7 +902,7 @@ async function forwardRequest(
       const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
       const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
       const clientRetryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
-      console.log(`[Maxpool] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
+      console.log(`[alPool] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
       sendErrorResponse(res, requestInfo, 429, {
         type: 'error',
         error: {
@@ -855,7 +935,7 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" ${forbidden ? `cooled down ${PROVIDER_FORBIDDEN_COOLDOWN_SEC}s (quota/forbidden)` : 'disabled (auth)'}, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
         if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
       }
-      console.log(`[Maxpool] ${upstreamRes.status} on provider "${account.name}" — ${forbidden ? `cooled down ${PROVIDER_FORBIDDEN_COOLDOWN_SEC}s (recoverable)` : 'disabled'} and failing over before first byte`);
+      console.log(`[alPool] ${upstreamRes.status} on provider "${account.name}" — ${forbidden ? `cooled down ${PROVIDER_FORBIDDEN_COOLDOWN_SEC}s (recoverable)` : 'disabled'} and failing over before first byte`);
 
       if (
         canRetryBufferedBody &&
@@ -915,7 +995,7 @@ async function forwardRequest(
       if (accountManager.shouldPromoteUpstreamFailure(incident, requestInfo)) {
         accountManager.clearProvisionalUpstreamFailures(fingerprint, incident.accounts);
         accountManager.markUpstreamThrottled(incident.retryAfter, 'matching_request_wide_529s');
-        console.log('[Maxpool] Every eligible Claude account returned the same 529; opening shared Anthropic throttle');
+        console.log('[alPool] Every eligible Claude account returned the same 529; opening shared Anthropic throttle');
 
         const queued = await queueAndRetry(
           'Anthropic upstream is overloaded',
@@ -929,7 +1009,7 @@ async function forwardRequest(
           type: 'error',
           error: {
             type: 'overloaded_error',
-            message: 'Anthropic is temporarily overloaded. Maxpool will retry automatically when capacity returns.',
+            message: 'Anthropic is temporarily overloaded. alPool will retry automatically when capacity returns.',
           },
         });
         return;
@@ -1015,7 +1095,7 @@ async function forwardRequest(
         const why = (() => {
           try { return JSON.parse(errorBody)?.error?.message || errorBody; } catch { return errorBody; }
         })();
-        console.log(`[Maxpool] ${upstreamRes.status} from "${account.name}": ${String(why).slice(0, 300)}`);
+        console.log(`[alPool] ${upstreamRes.status} from "${account.name}": ${String(why).slice(0, 300)}`);
       }
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
@@ -1035,7 +1115,7 @@ async function forwardRequest(
         writeRequestLog(logDir, reqId, logSections);
       }
       if (errorType === 'invalid_thinking_signature') {
-        console.log(`[Maxpool] Non-retryable Anthropic thinking signature error on "${account.name}"`);
+        console.log(`[alPool] Non-retryable Anthropic thinking signature error on "${account.name}"`);
         // Fail-safe: if this request had been MIGRATED to a different Claude account
         // this turn (cross-account thinking rebalance), the rejected block was issued
         // by the PRE-MIGRATION account. Revert the session there, exclude the failed
@@ -1058,7 +1138,7 @@ async function forwardRequest(
           && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
           accountManager.revertSessionBinding(requestInfo.sessionKey, lease.migratedFromName);
           excludedIndexes.add(account.index);
-          console.log(`[Maxpool] Thinking-signature fail-safe: reverting session to issuer "${lease.migratedFromName}" and retrying`);
+          console.log(`[alPool] Thinking-signature fail-safe: reverting session to issuer "${lease.migratedFromName}" and retrying`);
           return forwardRequest(
             req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, { ...requestInfo, pinnedAccountName: lease.migratedFromName },
@@ -1077,7 +1157,7 @@ async function forwardRequest(
           // same rejected setting every turn, and each rejection would otherwise charge a
           // consecutive-failure to a healthy account and deprioritise it in the router.
           accountManager.markSessionEffort?.(requestInfo.sessionKey, requestInfo.model, fix.effort);
-          console.log(`[Maxpool] "${requestInfo.model || 'model'}" rejected effort "${requestInfo.effort || 'xhigh'}" (via ${account.name}); retrying with ${fix.effort ? `effort "${fix.effort}"` : 'the effort setting removed'}`);
+          console.log(`[alPool] "${requestInfo.model || 'model'}" rejected effort "${requestInfo.effort || 'xhigh'}" (via ${account.name}); retrying with ${fix.effort ? `effort "${fix.effort}"` : 'the effort setting removed'}`);
           return forwardRequest(
             req, res, fix.body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, { ...requestInfo, effortRepaired: true },
@@ -1101,13 +1181,13 @@ async function forwardRequest(
       // 2026-08-10: "history too large to rewrite automatically" on a session the strip
       // would have fixed in 20ms. The retry it schedules re-checks the SHRUNK size.
       if (isSignatureRejection && !requestInfo.thinkingStripped && canRepairBody) {
-        console.log(`[Maxpool] Anthropic rejected a block: ${describeRejectedBlock(body, errorBody)}`);
+        console.log(`[alPool] Anthropic rejected a block: ${describeRejectedBlock(body, errorBody)}`);
         const { body: cleanBody, removed, converted } = stripForeignThinkingBlocks(body);
         if (cleanBody) {
           // Latch it so EVERY later turn is stripped up front instead of re-paying this
           // rejected round-trip (the client resends the full poisoned history each turn).
           accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
-          console.log(`[Maxpool] Recovering session on Claude: stripped ${removed} provider thinking block(s), converted ${converted} provider search block(s) to text`);
+          console.log(`[alPool] Recovering session on Claude: stripped ${removed} provider thinking block(s), converted ${converted} provider search block(s) to text`);
           // Re-derive the retry budget from the SHRUNK body. Inheriting the old flag
           // would leave a now-5.7MB body permanently marked "too big to retry" because
           // it was 11.5MB before the repair — barring the very failover the repair
@@ -1136,7 +1216,7 @@ async function forwardRequest(
           // setting it here would bar the broad strip on the retry.
           const preStripCanRepeat = type === 'thinking';
           if (preStripCanRepeat) accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
-          console.log(`[Maxpool] Recovering session on Claude: Anthropic rejected a "${type}" block by index; removed ${removed} block(s) of that type`);
+          console.log(`[alPool] Recovering session on Claude: Anthropic rejected a "${type}" block by index; removed ${removed} block(s) of that type`);
           return forwardRequest(
             req, res, fixedBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, {
@@ -1160,7 +1240,7 @@ async function forwardRequest(
         && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
         accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
         excludedIndexes.add(account.index);
-        console.log(`[Maxpool] Anthropic rejected this transcript (server_tool_use/thinking); pinning session to GLM/Kimi and retrying`);
+        console.log(`[alPool] Anthropic rejected this transcript (server_tool_use/thinking); pinning session to GLM/Kimi and retrying`);
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, { ...requestInfo, anthropicIncompatible: true },
@@ -1187,7 +1267,7 @@ async function forwardRequest(
         for (const a of (accountManager.accounts || [])) {
           if (a.type === 'provider') excludedIndexes.add(a.index);
         }
-        console.log(`[Maxpool] Provider "${account.name}" context too small for this request; pinning session to Claude and retrying`);
+        console.log(`[alPool] Provider "${account.name}" context too small for this request; pinning session to Claude and retrying`);
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, { ...requestInfo, largeContext: true },
@@ -1209,7 +1289,7 @@ async function forwardRequest(
         // Log the shape on the way out: this is the ONE place a give-up is observable,
         // and without it the two surviving explanations (a block the strip cannot see
         // vs. a body over the retry buffer) are indistinguishable in the log.
-        console.log(`[Maxpool] Unrepaired signature 400: ${describeRejectedBlock(body, errorBody)} bufferable=${canRetryBufferedBody} stripped=${!!requestInfo.thinkingStripped}`);
+        console.log(`[alPool] Unrepaired signature 400: ${describeRejectedBlock(body, errorBody)} bufferable=${canRetryBufferedBody} stripped=${!!requestInfo.thinkingStripped}`);
         // `peek` (not the full class-strip) — reads only `.type`, no parse+rebuild.
         // Read it regardless of body size: the repairs are no longer size-gated, so a
         // large body reaches here for a REAL reason (an unremovable block type) and the
@@ -1218,14 +1298,14 @@ async function forwardRequest(
         // NOTE: no "too large to rewrite" branch any more — the repairs above are no
         // longer gated on canRetryBufferedBody, so size never blocks a repair attempt.
         const what = rejectedType && rejectedType !== 'thinking' && rejectedType !== 'redacted_thinking'
-            ? `Anthropic rejected a "${rejectedType}" block in this session's history, which maxpool cannot remove without losing conversation content.`
+            ? `Anthropic rejected a "${rejectedType}" block in this session's history, which alPool cannot remove without losing conversation content.`
             : requestInfo.thinkingStripped || requestInfo.rejectedBlockStripped
-              ? 'This session ran on GLM/Kimi earlier, and Anthropic will not accept parts of what they wrote. Maxpool repaired what it could and retried on Claude, but Anthropic still rejected the history.'
-              : "Anthropic rejected part of this session's history that maxpool could not repair automatically.";
+              ? 'This session ran on GLM/Kimi earlier, and Anthropic will not accept parts of what they wrote. alPool repaired what it could and retried on Claude, but Anthropic still rejected the history.'
+              : "Anthropic rejected part of this session's history that alPool could not repair automatically.";
         const hint = provs.length === 0
           ? ''
           : provs.every(a => a.enabled === false)
-            ? ' If this session previously ran on GLM/Kimi, re-enabling that provider in the maxpool TUI (a → t) lets it continue there.'
+            ? ' If this session previously ran on GLM/Kimi, re-enabling that provider in the alPool TUI (a → t) lets it continue there.'
             : '';
         ctx.status = 400;
         sendErrorResponse(res, requestInfo, 400, {
@@ -1359,7 +1439,7 @@ async function forwardRequest(
       // was still waiting" — and the elapsed time is what exposes a client watchdog firing
       // at its floor while maxpool was still happily holding the request.
       const heldMs = Date.now() - (requestInfo.startedAt || Date.now());
-      console.log(`[Maxpool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" `
+      console.log(`[alPool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" `
         + `(${res.headersSent ? 'mid-response — output already sent' : 'still waiting, nothing sent'})`);
       releaseOnClientGone();
       return;
@@ -1369,7 +1449,7 @@ async function forwardRequest(
     // "fetch failed" lines and ZERO ECONNRESET/ENOTFOUND/UND_ERR in the whole log, leaving
     // every incident unattributable (DNS? TLS? socket exhaustion?).
     const rootCause = err.cause?.code || err.cause?.message || err.code || '';
-    console.error(`[Maxpool] Upstream error (account "${account.name}"):`, err.message
+    console.error(`[alPool] Upstream error (account "${account.name}"):`, err.message
       + (rootCause && !String(err.message).includes(rootCause) ? ` (cause: ${rootCause})` : ''));
 
     if (logDir) {
@@ -1412,7 +1492,7 @@ async function forwardRequest(
       ctx.status = 503;
       // Record the user-facing failure explicitly so it's greppable in the event
       // log (the in-memory TUI feed scrolls away). `err` is the last network error.
-      console.error(`[Maxpool] Returned connection_unavailable (503) after network errors on all routes (last: "${account.name}" — ${err.code || err.message})`);
+      console.error(`[alPool] Returned connection_unavailable (503) after network errors on all routes (last: "${account.name}" — ${err.code || err.message})`);
       // Name what actually happened. "Check your internet connection" sent the user
       // hunting a fault that wasn't there: measured 2026-08-04, 10 requests failed this
       // way within one hour while every other session kept working — the connection to
@@ -1424,7 +1504,7 @@ async function forwardRequest(
         type: 'error',
         error: {
           type: 'connection_unavailable',
-          message: `The connection to Claude dropped on every account maxpool tried (${lastCode}). `
+          message: `The connection to Claude dropped on every account alPool tried (${lastCode}). `
             + 'This is not a quota problem, and it is usually brief — sending the message again normally works. '
             + 'If it keeps happening, the link between this machine and Anthropic is unstable.',
         },
@@ -2194,7 +2274,7 @@ async function queueAndRetry(
 ) {
   if (!queueConfig.enabled || !canQueueBufferedBody || (res.headersSent && !requestInfo.queueHeartbeatActive) || res.destroyed) {
     if (queueConfig.enabled && !canQueueBufferedBody && requestInfo.queueBlockedReason) {
-      console.log(`[Maxpool] Not queueing request: ${requestInfo.queueBlockedReason}`);
+      console.log(`[alPool] Not queueing request: ${requestInfo.queueBlockedReason}`);
     }
     return false;
   }
@@ -2225,7 +2305,7 @@ async function queueAndRetry(
       : NETWORK_SOAK_NONSTREAM_MS;
     requestInfo.networkSoakDeadline ||= Date.now() + budgetMs;
     if (Date.now() >= requestInfo.networkSoakDeadline) {
-      console.log(`[Maxpool] Network soak budget spent (${Math.round(budgetMs / 1000)}s) — returning the connection error instead of holding longer`);
+      console.log(`[alPool] Network soak budget spent (${Math.round(budgetMs / 1000)}s) — returning the connection error instead of holding longer`);
       return false;
     }
   }
@@ -2317,7 +2397,7 @@ async function queueAndRetry(
     // Backpressure: too many requests already waiting / too many bytes buffered.
     // Reject honestly instead of growing the heap unbounded.
     return finishQueuedStreamIfNeeded(res, requestInfo,
-      'Maxpool queue is full — too many requests are already waiting for capacity. Try again shortly.');
+      'alPool queue is full — too many requests are already waiting for capacity. Try again shortly.');
   }
   const elapsed = Date.now() - requestInfo.queueStartedAt;
   const remaining = queueWindowMs - elapsed;
@@ -2328,7 +2408,7 @@ async function queueAndRetry(
 
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
-  console.log(`[Maxpool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
+  console.log(`[alPool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
   ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
@@ -2758,7 +2838,7 @@ function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setInterva
     const bytes = res.socket?.bytesWritten ?? lastBytes;
     if (bytes !== lastBytes) { lastBytes = bytes; lastProgressAt = now(); return; }
     if (now() - lastProgressAt >= idleMs && !res.writableEnded && !res.destroyed) {
-      console.error(`[Maxpool] Request ${reqId} — no write progress for ${Math.round(idleMs / 1000)}s (backstop reaper); force-aborting a stuck request to free its account slot`);
+      console.error(`[alPool] Request ${reqId} — no write progress for ${Math.round(idleMs / 1000)}s (backstop reaper); force-aborting a stuck request to free its account slot`);
       res.destroy();
     }
   }, Math.min(60_000, idleMs));

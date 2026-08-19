@@ -1,4 +1,4 @@
-# Maxpool — living context & decision log
+# alPool — living context & decision log
 
 > **This is the project memory.** Read it before non-trivial work; append to it as
 > soon as a decision is made or a change ships. It travels with the repo, so any
@@ -17,6 +17,19 @@
 ---
 
 ## Current focus
+
+Ahmed's personal fork is branded alPool. The executable is `alpool`, the personal
+repository is `ahmedLawal/alPool`, and the globally linked checkout pulls its own
+`origin/main`. Compatibility-sensitive identifiers remain unchanged: alPool uses
+the existing `~/.config/maxpool.json`, `MAXPOOL_*` environment variables,
+`x-maxpool-*` headers, and `/maxpool/status` endpoint, so no account or integration
+migration is required. Upstream remains `2solarmax/maxpool`; synchronization runs
+locally through a six-hour macOS LaunchAgent and a transactional Bash script.
+
+A native SwiftUI macOS client is the primary IO layer. The Node
+backend remains the sole owner of proxying, credentials, configuration, routing,
+updates, and lifecycle; the app attaches to a headless backend and can close
+without interrupting traffic. The existing TUI remains a fallback client.
 
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
@@ -49,6 +62,87 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-19 · #13 — Finder launches Node explicitly and the linked checkout stays on main
+
+**Context:** Finder does not inherit the interactive shell's NVM path, so invoking
+the linked `alpool` shebang through `/usr/bin/env node` failed even though the app
+found the executable. Separately, the globally linked checkout remained on a
+feature branch, causing the intentionally conservative git updater to reject every
+automatic pull.
+**Decision:** Resolve and invoke Node explicitly, preferring the binary beside the
+discovered `alpool` executable and supporting `ALPOOL_NODE_EXECUTABLE` as an
+override. Integrate feature work into personal `main` and keep the globally linked
+primary checkout on that branch.
+**Consequences:** The native app works when launched from Finder without shell
+initialization. Automatic updates can fast-forward the clean linked checkout again;
+development branches remain isolated in separate worktrees.
+
+### 2026-08-18 · #12 — Native macOS app is an IO client, not a backend port
+
+**Context:** The terminal dashboard makes alPool operationally opaque and ties its
+controls to the terminal that launched the proxy. Ahmed wants a native macOS app
+but does not want the routing, quota, credential, or update logic rewritten in
+Swift.
+**Decision:** Keep Node as the single backend and extract TUI-owned operations into
+a shared control service. Expose authenticated loopback status and command
+interfaces, then build a native SwiftUI client that renders state and sends typed
+commands. Run the backend independently of the app; closing the app never stops
+traffic. Keep the TUI as a fallback adapter over the same service.
+**Consequences:** Backend behavior stays testable once and consistent across both
+frontends. A one-time, separately controlled cutover will eventually replace the
+terminal-owned process with a login agent. Development and validation happen in an
+isolated worktree and do not touch the live listener on port 3456.
+
+### 2026-08-17 · #11 — Upstream synchronization runs locally, not in GitHub Actions
+
+**Context:** Decision #9 used a scheduled GitHub workflow to merge and validate
+upstream. Ahmed prefers the synchronization authority to remain on his Mac and
+explicitly requested a local Bash-like job instead.
+**Decision:** Supersede the hosted-sync portion of #9. Install a per-user macOS
+LaunchAgent that runs `scripts/sync-upstream.sh` at login and every six hours. The
+script fetches both remotes, merges in a disposable detached worktree, runs the
+full test suite and lint, and pushes `origin/main` only after validation succeeds.
+The existing alPool updater remains responsible for fast-forwarding the clean live
+checkout and seamlessly reloading it.
+**Consequences:** GitHub CI no longer decides when upstream is imported. A failed
+merge, test, lint, authentication, or non-fast-forward push leaves personal `main`
+unchanged. The LaunchAgent requires this Mac to be awake and logged in; a missed
+interval is recovered by `RunAtLoad` or the next six-hour run.
+
+### 2026-08-17 · #10 — Personal fork is branded alPool without migrating credentials
+
+**Context:** Installing the personal fork under the upstream `maxpool` command made
+it unclear whether a terminal was running Ahmed's fork or the former global tool.
+Renaming config, environment variables, or routing headers at the same time would
+strand accounts and break existing Claude aliases.
+**Decision:** Rename the product and logs to `alPool`, expose only the `alpool` CLI,
+and rename the personal repository/checkout. Preserve `~/.config/maxpool.json`,
+`MAXPOOL_*`, `x-maxpool-*`, and `/maxpool/status` as compatibility interfaces.
+**Consequences:** `npm uninstall -g maxpool` can remove the former executable and
+`npm link` installs the unambiguous `alpool` command. Existing credentials and
+client integrations continue to work unchanged.
+
+### 2026-08-17 · #9 — Personal-fork updates use a tested upstream sync plus checkout pulls
+
+**Context:** npm auto-update always installs `maxpool@latest`, which would replace
+Ahmed's personal quota-display changes with the upstream package. A separate npm
+package would require new publishing credentials and release infrastructure. The
+runtime symptom behind GLM rows stuck on "probing" was also concrete: Ahmed's
+config still carries `quotaProbeSeconds: 0`, the original generated default, so
+the otherwise-working z.ai monitor endpoint never runs.
+**Decision:** Add a scheduled/manual GitHub workflow that merges upstream `main`,
+runs tests and lint, and pushes only on success. Add a `git` update source that
+checks a configured remote/ref and pulls it with `--ff-only` for linked checkout
+installs; this personal fork defaults to that Git source, while upstream retains
+its npm behavior. Treat a legacy zero probe
+interval without `quotaProbeEnabled` as the old generated default and migrate it
+to 60 seconds; `quotaProbeEnabled: false` is the unambiguous opt-out. Render
+`quota off` when monitoring is intentionally disabled.
+**Consequences:** The personal fork receives upstream work without borrowing the
+upstream npm publishing identity, local modifications block rather than being
+overwritten, and GLM 5-hour/weekly bars populate automatically for legacy users.
+The personal checkout must be globally linked (`npm link`) for git-source updates.
+
 ### 2026-08-10 · #8 — Five named routing modes replace crossProviderFallbackPolicy
 
 **Context:** `crossProviderFallbackPolicy: 'always'` read as "load balance across
@@ -78,7 +172,7 @@ sequentially only for names the cache lacks. Measured: 5/5 resolve in 17.5s
 (4 from cache instantly, 1 gcloud miss) vs 2/5 before.
 **Consequences:** No new attack surface (an attacker who can read the cache
 already has everything). Cache staleness bounded: a rotated key 401s → provider
-shows error → degrades gracefully. Maxpool restart picks up refreshed cache.
+shows error → degrades gracefully. alPool restart picks up refreshed cache.
 
 ### 2026-08-10 · #6 — Seamless restart skips the pre-drain
 
@@ -97,7 +191,7 @@ reads "finishing in-flight requests first" instead of "Retry immediately".
 
 ### 2026-08-07 · #5 — Multi-provider support (GLM/Kimi)
 
-**Context:** Maxpool was Anthropic-only. Max wanted to add GLM (z.ai) and Kimi
+**Context:** alPool was Anthropic-only. Max wanted to add GLM (z.ai) and Kimi
 (Moonshot) accounts to the pool so Claude Code sessions could spread across three
 providers.
 **Decision:** Provider accounts carry an API key (not OAuth). Keys stored in
@@ -111,7 +205,7 @@ registry: `mokka-workspace/knowledge/technical/maxpool-api-key-registry.md`.
 
 ### 2026-07-23 · #4 — Project-context harness is committed in-repo
 
-**Context:** Maxpool lives outside the mokka-workspace, so it inherits none of
+**Context:** alPool lives outside the mokka-workspace, so it inherits none of
 that workspace's skills/rules/memory. Goal: a fresh Claude Code session should
 pick up full project context + keep an evolving memory.
 **Decision:** Ship the harness as committed files in *this* repo — `CLAUDE.md`
@@ -156,7 +250,7 @@ set to "require 2FA and disallow tokens"; OIDC publish unaffected.
 
 ### 2026-07-23 · #1 — Release-record posture: forward-only + in-repo, log-not-announce
 
-**Context:** Maxpool is a ToS gray-area tool; the public GitHub Release page is
+**Context:** alPool is a ToS gray-area tool; the public GitHub Release page is
 the first npm-linked, search-indexed "what this does" surface, and commit
 subjects can describe quota/rate mechanics.
 **Decision:** Keep the rich record **in-repo** (`CHANGELOG.md`); go **forward-only**

@@ -17,7 +17,7 @@ async function tmpLog() {
 test('appendEventLog writes a timestamped, redacted, newline-terminated line', async () => {
   const path = await tmpLog();
   setEventLogPath(path);
-  appendEventLog('[Maxpool] Switched to account "personal"');
+  appendEventLog('[alPool] Switched to account "personal"');
   await flushEventLog();
   const text = await readFile(path, 'utf-8');
   assert.match(text, /^\d{4}-\d\d-\d\dT[\d:.]+Z .*Switched to account "personal"\n$/);
@@ -35,10 +35,10 @@ test('setConsoleStdoutSuppressed mutes the mirror STDOUT passthrough but keeps t
   installConsoleMirror();
   try {
     setConsoleStdoutSuppressed(true);
-    console.log('[Maxpool] muzzled-line-should-not-hit-stdout');
+    console.log('[alPool] muzzled-line-should-not-hit-stdout');
     const hitsWhileSuppressed = stdoutHits;
     setConsoleStdoutSuppressed(false);
-    console.log('[Maxpool] audible-line');
+    console.log('[alPool] audible-line');
     assert.equal(hitsWhileSuppressed, 0, 'suppressed → zero stdout writes');
     assert.ok(stdoutHits > 0, 'lifted → stdout writes resume');
   } finally {
@@ -63,7 +63,7 @@ test('redactSecrets strips tokens/bearer/refresh+access tokens/api keys', () => 
 test('a multi-line message is collapsed to ONE line and capped < PIPE_BUF (macOS 512B atomicity)', async () => {
   const path = await tmpLog();
   setEventLogPath(path);
-  appendEventLog('[Maxpool] boom\n  at a()\n  at b()');                 // multi-line stack
+  appendEventLog('[alPool] boom\n  at a()\n  at b()');                 // multi-line stack
   appendEventLog('X'.repeat(2000));                                     // oversized ASCII
   appendEventLog('的'.repeat(600));                                     // oversized MULTIBYTE (3 B/char → ~1800 B)
   appendEventLog('🔥'.repeat(400));                                     // oversized emoji (4 B/char)
@@ -85,7 +85,7 @@ test('installConsoleMirror tees console.log to the file AND preserves output; re
   let passthrough = '';
   console.log = (...a) => { passthrough += a.join(' '); }; // capture the "original" the mirror should still call
   installConsoleMirror();
-  console.log('[Maxpool] hello from the mirror');
+  console.log('[alPool] hello from the mirror');
   await flushEventLog();
   const text = await readFile(path, 'utf-8');
   assert.match(text, /hello from the mirror/, 'teed to the file');
@@ -96,7 +96,7 @@ test('installConsoleMirror tees console.log to the file AND preserves output; re
 
 test('appendEventLog NEVER throws on an unwritable path, and the queue drains', async () => {
   setEventLogPath('/this/path/does/not/exist/maxpool.log');
-  assert.doesNotThrow(() => appendEventLog('[Maxpool] should be swallowed'));
+  assert.doesNotThrow(() => appendEventLog('[alPool] should be swallowed'));
   await flushEventLog(); // resolves (errors swallowed)
   __resetEventLogForTest();
 });
@@ -114,7 +114,7 @@ test('rotation is best-effort and SINGLE-owner: rotateIfNeeded archives to .1 on
   assert.equal(existsSync(`${path}.1`), true, 'archived to .1 when over the cap');
   const archive = await stat(`${path}.1`);
   assert.ok(archive.size > 5 * 1024 * 1024, 'the .1 archive holds the full pre-rotation content');
-  appendEventLog('[Maxpool] post-rotation line');
+  appendEventLog('[alPool] post-rotation line');
   await flushEventLog();
   assert.match(await readFile(path, 'utf-8'), /post-rotation line/, 'live log restarted cleanly after rotation');
   __resetEventLogForTest();
@@ -122,6 +122,6 @@ test('rotation is best-effort and SINGLE-owner: rotateIfNeeded archives to .1 on
 
 test('disabled path: appendEventLog is a no-op when no path is set', async () => {
   __resetEventLogForTest(); // logPath = null
-  assert.doesNotThrow(() => appendEventLog('[Maxpool] nothing should happen'));
+  assert.doesNotThrow(() => appendEventLog('[alPool] nothing should happen'));
   await flushEventLog();
 });

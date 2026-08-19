@@ -243,11 +243,12 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, controlService = null, onQuit, onRestart }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
+    this.control = controlService;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
     // Set by index.js after construction (a deferred closure, not a constructor literal —
@@ -283,7 +284,7 @@ export class TUI {
     try {
       process.stdin.setRawMode(true);
     } catch (err) {
-      process.stderr.write(`[Maxpool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
+      process.stderr.write(`[alPool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
       return false;
     }
 
@@ -349,7 +350,7 @@ export class TUI {
   }
 
   _addLog(msg) {
-    msg = msg.replace(/^\[Maxpool\]\s*/, '');
+    msg = msg.replace(/^\[alPool\]\s*/, '');
     // Persist too — in TUI mode console is re-pointed here, bypassing the console
     // mirror, so this is where TUI-mode lines reach the on-disk event log.
     appendEventLog(msg);
@@ -419,13 +420,13 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') {
       this._confirm(
-        'Stop Maxpool?',
+        'Stop alPool?',
         'New requests will stop; active requests will drain before the server exits.',
         () => { this.stop(); this.onQuit?.(); },
       );
     } else if (k === 'r') {
       this._confirm(
-        'Restart Maxpool?',
+        'Restart alPool?',
         // Say what actually happens to the user's sessions. The old text ("pause new
         // requests, drain active work") was accurate but hid the consequence: with
         // several long requests in flight, NEW requests get a 503 for up to the drain
@@ -473,7 +474,7 @@ export class TUI {
       // back to the dashboard was indistinguishable from "nothing happened".
       if (!this.checkNow) { this._addLog('Update check unavailable on this worker'); return; }
       if (this.updateBusy) return;                       // already running
-      this.updateBusy = 'Checking npm…';
+      this.updateBusy = 'Checking for updates…';
       this.render();
       Promise.resolve(this.checkNow())
         .catch(() => {})
@@ -550,9 +551,10 @@ export class TUI {
     const out = [];
     out.push(` ${bold('Updates')}`);
     if (!v) {
-      out.push(` ${dim('Running')} ${running}   ${dim('· checking npm for a newer version…')}`);
+      out.push(` ${dim('Running')} ${running}   ${dim('· checking for updates…')}`);
     } else if (v.hasUpdate && v.latest) {
-      out.push(` ${dim('Running')} ${running}   ${yellow(`v${v.latest} is available`)}`);
+      const available = v.source === 'git' ? v.latest : `v${v.latest}`;
+      out.push(` ${dim('Running')} ${running}   ${yellow(`${available} is available`)}`);
       out.push(auto
         ? ` ${dim('It installs itself automatically. Press')} ${bold('c')} ${dim('to get it right now.')}`
         : ` ${dim('Automatic updates are off. Press')} ${bold('c')} ${dim('to install it now, or')} ${bold('t')} ${dim('to turn automatic on.')}`);
@@ -566,6 +568,11 @@ export class TUI {
 
   async _toggleAutoUpdate() {
     const turnOn = !this._autoUpdateOn();
+    if (this.control) {
+      await this.control.execute({ type: 'set-automatic-updates', payload: { enabled: turnOn } });
+      this.mode = 'normal';
+      return;
+    }
     // ON = the full hands-free chain; OFF = keep checking (banner still shows) but never
     // install/reload without the user. Mutating this.config (=== the object index.js's
     // update timer reads) takes effect live; saveConfig persists it (index.js writes these
@@ -662,7 +669,7 @@ export class TUI {
         const key = await this._resolveCredential(input);
         if (!key) return;
         this.mode = 'accounts';
-        this._confirm('Add this API key?', 'Store it in Maxpool config as a new Anthropic API account.',
+        this._confirm('Add this API key?', 'Store it in alPool config as a new Anthropic API account.',
           () => this._doAddKey(key));
       };
       return;
@@ -712,7 +719,7 @@ export class TUI {
     buf.push(dim('     A) Paste it — stored in your config (0600). No cloud setup.'));
     buf.push(dim('     B) Type a GCP Secret Manager name — the key never touches disk.'));
     buf.push(dim('        Store it:  ') + 'gcloud secrets create MY_KEY --data-file=-');
-    buf.push(dim('        Maxpool reads it as YOU:  ') + 'gcloud auth application-default login');
+    buf.push(dim('        alPool reads it as YOU:  ') + 'gcloud auth application-default login');
     buf.push(dim('        Delete the secret and the account stops working everywhere.'));
   }
 
@@ -847,6 +854,13 @@ export class TUI {
     const cur = this.am._claudeFallbackFor?.(providerKey) || 'never';
     const next = order[(order.indexOf(cur) + 1) % order.length];
     const apply = async () => {
+      if (this.control) {
+        await this.control.execute({
+          type: 'set-provider-fallback',
+          payload: { provider: providerKey, policy: next },
+        });
+        return;
+      }
       this.am.setClaudeFallbackForProvider?.(providerKey, next);
       const sched = { ...(this.config.scheduler || {}) };
       sched.providers = { ...(sched.providers || {}) };
@@ -891,6 +905,10 @@ export class TUI {
     const modes = TUI.ROUTING_MODES;
     const cur = this.am.scheduler?.routingMode || 'sticky';
     const next = modes[(modes.findIndex(m => m.id === cur) + 1) % modes.length];
+    if (this.control) {
+      await this.control.execute({ type: 'set-routing-mode', payload: { mode: next.id } });
+      return;
+    }
     this.am.setProviderRoutingMode?.(next.id);
     this.config.scheduler = { ...(this.config.scheduler || {}), routingMode: next.id };
     // Clear the stale legacy policy so it can't contradict the new mode in
@@ -942,7 +960,7 @@ export class TUI {
           : '';
         this._confirm(
           `Delete "${account.name}"?`,
-          `Permanently remove it from Maxpool config. Deletion is blocked while it has active requests.${secret}`,
+          `Permanently remove it from alPool config. Deletion is blocked while it has active requests.${secret}`,
           () => this._doDelete(this.selIdx),
         );
       } else if (this.selAction === 'rename') {
@@ -1062,6 +1080,10 @@ export class TUI {
   // ── account operations ─────────────────────────────
 
   async _doSync() {
+    if (this.control) {
+      await this.control.execute({ type: 'sync-accounts' });
+      return;
+    }
     try {
       this._addLog('Reloading config...');
       const count = await this.syncAccounts();
@@ -1113,8 +1135,8 @@ export class TUI {
       // a false "Added new account".
       const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
       process.stdout.write(updated
-        ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
-        : `\nAdded new account "${name}". Returning to maxpool…\n`);
+        ? `\nRe-authenticated "${name}". Returning to alPool…\n`
+        : `\nAdded new account "${name}". Returning to alPool…\n`);
     } catch (e) {
       process.stdout.write(`\nLogin failed: ${e.message}\n`);
     } finally {
@@ -1126,6 +1148,13 @@ export class TUI {
   // Rename an account in config and in the running manager.
   async _doRename(idx, newName) {
     const account = this.am.accounts[idx];
+    if (this.control && account) {
+      await this.control.execute({
+        type: 'rename-account',
+        payload: { name: account.name, newName },
+      });
+      return;
+    }
     if (!account) { this._addLog('Account no longer exists'); return; }
     if (!newName) { this._addLog('Rename cancelled (empty name)'); return; }
     if (this.am.accounts.some((a, i) => i !== idx && a.name === newName)) {
@@ -1220,7 +1249,7 @@ export class TUI {
       // token; a later "REJECTED sent fp=<other>" then means an upstream revocation,
       // not a lost persist. console.log (not _addLog) so it's VISIBLE during the
       // stopped-TUI login flow, mirroring the sibling "Persisted rotated token" line.
-      console.log(`[Maxpool] Re-authenticated "${name}" — fresh token persisted (fp=${tokenFingerprint(creds.refreshToken)})`);
+      console.log(`[alPool] Re-authenticated "${name}" — fresh token persisted (fp=${tokenFingerprint(creds.refreshToken)})`);
       return { updated: true, name };
     } else {
       this.config.accounts.push(entry);
@@ -1265,6 +1294,10 @@ export class TUI {
   }
 
   async _setAutomaticRouting() {
+    if (this.control) {
+      await this.control.execute({ type: 'set-preferred-account', payload: { name: null } });
+      return;
+    }
     const previous = this.config.routing;
     this.config.routing = { mode: 'automatic', preferredAccount: null };
     try {
@@ -1278,6 +1311,10 @@ export class TUI {
   }
 
   async _setPreferredRouting(name) {
+    if (this.control) {
+      await this.control.execute({ type: 'set-preferred-account', payload: { name } });
+      return;
+    }
     const account = this.am.accounts.find(candidate => candidate.name === name);
     if (!account?.enabled || account.type === 'provider') {
       throw new Error(`Claude account "${name}" must be enabled before it can be preferred`);
@@ -1330,6 +1367,13 @@ export class TUI {
   async _doToggle(idx, enabled) {
     const account = this.am.accounts[idx];
     if (!account) return;
+    if (this.control) {
+      await this.control.execute({
+        type: 'set-account-enabled',
+        payload: { name: account.name, enabled },
+      });
+      return;
+    }
     const configIndex = this._configAccountIndex(account);
     if (configIndex < 0) {
       // A runtime provider (GLM/Kimi) isn't in config — it's re-created from the `cc all`
@@ -1367,6 +1411,10 @@ export class TUI {
   async _doDelete(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const account = this.am.accounts[idx];
+    if (this.control) {
+      await this.control.execute({ type: 'delete-account', payload: { name: account.name } });
+      return;
+    }
     const name = account.name;
     if (account.inFlight > 0) {
       this._addLog(`Cannot delete "${name}" while ${account.inFlight} request(s) are active; disable it and retry when idle`);
@@ -1451,7 +1499,7 @@ export class TUI {
     const auto = this._autoUpdateOn()
       ? green('· auto-update on')
       : dim('· auto-update off');
-    const left = bold(' Maxpool') + verStr + ' ' + auto;
+    const left = bold(' alPool') + verStr + ' ' + auto;
     const port = this.config.proxy?.port || 3456;
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
@@ -1471,15 +1519,19 @@ export class TUI {
         : 'finishing up…';
       lines.push(` ${cyan(SPINNER[this.frame])} ${yellow('Restarting')}  ${dim(detail)}`);
     }
-    // Update reminder: a prominent, actionable banner when a newer npm version is
-    // published — nothing when on latest or the check hasn't resolved (no permanent
+    // Update reminder: a prominent, actionable banner when a newer release/revision is
+    // available — nothing when on latest or the check hasn't resolved (no permanent
     // blank line). The persistent banner IS the reminder; a long-lived session's
     // periodic re-check keeps it current (index.js updateTimer refreshes versionInfo).
     if (v?.hasUpdate && v?.latest) {
       // No more "run npm i -g, then press r" — that manual dance is what the Updates menu
       // kills. Auto-update ON: it applies itself; either way 'u' pulls + reloads in place.
       const how = this._autoUpdateOn() ? 'applying automatically · or press u now' : 'press u to update now';
-      lines.push('  ' + yellow(`↑ Update available: v${v.current} → v${v.latest}`) + dim(`  ·  ${how}`));
+      const from = v.source === 'git'
+        ? `main@${String(v.currentRevision || '').slice(0, 7) || 'unknown'}`
+        : `v${v.current}`;
+      const to = v.source === 'git' ? v.latest : `v${v.latest}`;
+      lines.push('  ' + yellow(`↑ Update available: ${from} → ${to}`) + dim(`  ·  ${how}`));
     }
     // Routing header: name the mode + show the one-line description the operator
     // picked when cycling. Under `preferred`, show the manual-preference line (still
@@ -1875,6 +1927,9 @@ export class TUI {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);
       note = `  ${dim('console-only')}`;
+    } else if (!this.am.quotaProbeIntervalMs || this.am.quotaProbeIntervalMs <= 0) {
+      sesCell = emptyBar('quota off', bw);
+      wkCell = emptyBar('quota off', bw);
     } else {
       sesCell = emptyBar('probing', bw);
       wkCell = emptyBar('probing', bw);

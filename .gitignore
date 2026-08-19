@@ -1,4 +1,7 @@
 node_modules/
+dist/
+macos/.build/
+.DS_Store
 config.json
 *.log
 package-lock.json

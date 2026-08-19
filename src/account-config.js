@@ -8,7 +8,7 @@ export async function resolveAccounts(config) {
       if (acct.accessToken) {
         accounts.push(acct);
       } else {
-        console.error(`No token for "${acct.name}", skipping — re-add it with: maxpool login`);
+        console.error(`No token for "${acct.name}", skipping — re-add it with: alpool login`);
       }
     } else if (acct.type === 'apikey' && acct.apiKey) {
       accounts.push(acct);

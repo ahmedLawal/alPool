@@ -1,6 +1,6 @@
 // Persistent, rotating, low-overhead event log so incidents are investigable
 // after the fact (the TUI activity feed is in-memory only and scrolls away). It
-// mirrors the existing `[Maxpool] …` console stream — routing, network errors,
+// mirrors the existing `[alPool] …` console stream — routing, network errors,
 // cooldowns, token refreshes, reloads, upstream-throttle — to a file that
 // survives the terminal. Logging must NEVER throw into the proxy path, so every
 // write is fire-and-forget and all errors are swallowed.

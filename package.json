@@ -1,11 +1,11 @@
 {
-  "name": "maxpool",
+  "name": "alpool",
   "version": "1.6.1",
-  "description": "Multi-account Claude Code proxy with adaptive, rate-aware load balancing across Claude accounts",
+  "description": "alPool multi-account Claude Code proxy with adaptive, rate-aware load balancing",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "maxpool": "src/index.js"
+    "alpool": "src/index.js"
   },
   "files": [
     "src/",
@@ -15,6 +15,11 @@
     "start": "node src/index.js",
     "test": "bash scripts/run-tests.sh",
     "lint": "eslint src/ test/",
+    "sync:upstream": "bash scripts/sync-upstream.sh",
+    "sync:install": "bash scripts/install-local-sync.sh",
+    "macos:test": "swift test --package-path macos",
+    "macos:build": "bash scripts/build-macos-app.sh",
+    "macos:install-backend": "bash scripts/install-backend-agent.sh",
     "release": "bash scripts/release.sh",
     "version": "bash scripts/update-changelog.sh"
   },
@@ -31,11 +36,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/2solarmax/maxpool.git"
+    "url": "git+https://github.com/ahmedLawal/alPool.git"
   },
-  "homepage": "https://github.com/2solarmax/maxpool#readme",
+  "homepage": "https://github.com/ahmedLawal/alPool#readme",
   "bugs": {
-    "url": "https://github.com/2solarmax/maxpool/issues"
+    "url": "https://github.com/ahmedLawal/alPool/issues"
   },
   "engines": {
     "node": ">=20.3.0"

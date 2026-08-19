@@ -159,7 +159,7 @@ test('seamless reload: in-flight stream survives, no ECONNREFUSED, supervisor st
 
   const econnrefused = [];
   try {
-    await waitForLine(child, /Maxpool Proxy|Listening on 127\.0\.0\.1:/, () => allOutput);
+    await waitForLine(child, /alPool Proxy|Listening on 127\.0\.0\.1:/, () => allOutput);
 
     // Warm up: retry until the cold worker is actually serving (eliminates the
     // pure startup-timing race so the assertions below isolate RELOAD behavior).

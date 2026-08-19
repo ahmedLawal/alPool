@@ -51,10 +51,13 @@ export function createDefaultConfig() {
     // streams survive Maintenance Sleep; the Mac sleeps normally when idle. Set false
     // to disable. AC power only; the display still sleeps (screen stays dark).
     preventSleep: true,
-    // On startup, check npm for a newer maxpool and notify. Set false to disable.
+    // On startup, check the configured update source and notify. Set false to disable.
     updateCheck: true,
-    // When true, a newer version is installed automatically (npm i -g maxpool@latest)
-    // and applied on the NEXT restart — running sessions are never interrupted.
+    // This personal fork is globally linked from its checkout, so updates fast-forward
+    // origin/main instead of replacing the fork with the upstream npm package.
+    updateSource: { type: 'git', remote: 'origin', ref: 'main' },
+    // When true, a newer version/revision is installed automatically. The TUI's
+    // automatic-update toggle also enables seamless application via autoApply.
     autoUpdate: false,
     // Per-account "stop using this account" gate, applied to BOTH the 5h
     // session window and the 7d weekly window (whichever utilization is
@@ -66,7 +69,8 @@ export function createDefaultConfig() {
     // Background quota probe: poll every account's real 5h/7d utilization from the
     // zero-spend usage endpoint every N seconds. ON by default — without it maxpool
     // is blind to idle / out-of-band-used accounts and the scorer will pile traffic
-    // onto exactly the account it cannot see. 0 = off.
+    // onto exactly the account it cannot see. Use quotaProbeEnabled:false to opt out.
+    quotaProbeEnabled: true,
     quotaProbeSeconds: 60,
     routing: {
       mode: 'automatic',
@@ -113,7 +117,7 @@ export function createDefaultConfig() {
       providerCrossFallback: true,
       // Per-provider Claude→provider control (TUI routing: g = GLM, k = Kimi). Same values
       // as the policy above; unset inherits it. Default 'never' — a Claude session that
-      // finishes on a provider comes back with thinking blocks Anthropic rejects (Maxpool
+      // finishes on a provider comes back with thinking blocks Anthropic rejects (alPool
       // repairs that automatically, but a provider server-tool call is unrepairable).
       // Left EMPTY: an unset provider inherits the policy above, so off-by-default holds
       // without shadowing it. The TUI writes an entry here only when you steer one
@@ -196,6 +200,13 @@ export async function loadConfig() {
   // wins; only genuinely-missing keys inherit the default.
   if (parsed && typeof parsed === 'object') {
     const defaults = createDefaultConfig();
+    // `quotaProbeSeconds: 0` was the generated default before probing became
+    // default-on. Old configs therefore look identical to a deliberate numeric
+    // opt-out and can sit on "probing" forever. The new boolean makes intent
+    // unambiguous: migrate a legacy zero unless the user explicitly opted out.
+    if (!('quotaProbeEnabled' in parsed) && Number(parsed.quotaProbeSeconds) === 0) {
+      parsed.quotaProbeSeconds = defaults.quotaProbeSeconds;
+    }
     for (const key of Object.keys(defaults)) {
       if (!(key in parsed)) parsed[key] = defaults[key];
     }

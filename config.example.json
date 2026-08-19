@@ -5,8 +5,14 @@
     "apiKey": "mp-change-me-to-a-secret"
   },
   "upstream": "https://api.anthropic.com",
+  "updateSource": {
+    "type": "git",
+    "remote": "origin",
+    "ref": "main"
+  },
   "switchThreshold": 0.90,
-  "quotaProbeSeconds": 0,
+  "quotaProbeEnabled": true,
+  "quotaProbeSeconds": 60,
   "scheduler": {
     "mode": "adaptive-least-loaded",
     "safetyMaxActivePerAccount": 50,

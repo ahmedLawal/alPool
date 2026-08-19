@@ -1806,6 +1806,52 @@ test('status endpoint requires proxy api key even from loopback', async () => {
   }
 });
 
+test('control endpoint is authenticated and dispatches typed commands', async () => {
+  const am = new AccountManager(accounts(), 0.90);
+  const commands = [];
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:1',
+  }, {
+    onControlSnapshot: () => ({ ok: true, source: 'control' }),
+    onControlCommand: async command => {
+      commands.push(command);
+      return { ok: true, message: 'accepted' };
+    },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const noKey = await fetch(`http://127.0.0.1:${proxyPort}/maxpool/control`);
+    assert.equal(noKey.status, 401);
+
+    const snapshot = await fetch(`http://127.0.0.1:${proxyPort}/maxpool/control`, {
+      headers: { 'x-api-key': 'tc-test' },
+    });
+    assert.equal(snapshot.status, 200);
+    assert.deepEqual(await snapshot.json(), { ok: true, source: 'control' });
+
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/maxpool/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ type: 'set-routing-mode', payload: { mode: 'balance' } }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true, message: 'accepted' });
+    assert.deepEqual(commands, [{ type: 'set-routing-mode', payload: { mode: 'balance' } }]);
+
+    const invalid = await fetch(`http://127.0.0.1:${proxyPort}/maxpool/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: '{',
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal((await invalid.json()).error.code, 'invalid_json');
+  } finally {
+    await close(proxy);
+  }
+});
+
 test('headerValue falls back to legacy x-teamclaude-* names (backward compat)', () => {
   const { headerValue, getMaxpoolProfile } = __serverTest;
   // New name present → used.
