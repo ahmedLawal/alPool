@@ -274,12 +274,24 @@ private struct UpdatesView: View {
         Form {
             Section("Backend") {
                 LabeledContent("Running", value: snapshot.version?.current.map { "v\($0)" } ?? "Unknown")
-                LabeledContent("Available", value: snapshot.version?.latest ?? "Up to date")
+                LabeledContent("Fork revision", value: snapshot.version?.latest ?? "Unknown")
                 Toggle("Install and apply backend updates automatically", isOn: Binding(
                     get: { snapshot.control.automaticUpdates },
                     set: { enabled in Task { await model.send(.init(type: "set-automatic-updates", payload: .init(enabled: enabled))) } }
                 ))
                 Button("Check and apply now") { Task { await model.send(.init(type: "check-update")) } }
+            }
+            Section("MaxPool upstream") {
+                LabeledContent("Installed", value: versionLabel(snapshot.upstreamSync?.installedVersion ?? snapshot.version?.current))
+                LabeledContent("Latest found", value: versionLabel(snapshot.upstreamSync?.availableVersion))
+                LabeledContent("Sync status") {
+                    Label(upstreamStatusLabel, systemImage: upstreamStatusSymbol)
+                        .foregroundStyle(upstreamStatusColor)
+                }
+                if snapshot.upstreamSync?.state == "failed" {
+                    Text(snapshot.upstreamSync?.error ?? "The upstream update failed. The installed version is still active.")
+                        .foregroundStyle(.red)
+                }
             }
             Section {
                 Text("The native app is only the IO layer. Backend updates do not replace or rewrite the SwiftUI app.")
@@ -288,6 +300,39 @@ private struct UpdatesView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Updates")
+    }
+
+    private func versionLabel(_ version: String?) -> String {
+        guard let version, !version.isEmpty else { return "Not checked" }
+        return version.hasPrefix("v") ? version : "v\(version)"
+    }
+
+    private var upstreamStatusLabel: String {
+        switch snapshot.upstreamSync?.state {
+        case "up-to-date": "Up to date"
+        case "update-available": "Update found"
+        case "checking": "Checking"
+        case "failed": "Update failed"
+        default: "Not checked"
+        }
+    }
+
+    private var upstreamStatusSymbol: String {
+        switch snapshot.upstreamSync?.state {
+        case "up-to-date": "checkmark.circle.fill"
+        case "failed": "exclamationmark.triangle.fill"
+        case "checking": "arrow.triangle.2.circlepath"
+        default: "clock"
+        }
+    }
+
+    private var upstreamStatusColor: Color {
+        switch snapshot.upstreamSync?.state {
+        case "up-to-date": .green
+        case "failed": .red
+        case "checking", "update-available": .orange
+        default: .secondary
+        }
     }
 }
 

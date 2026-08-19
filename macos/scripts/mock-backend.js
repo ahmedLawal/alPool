@@ -37,6 +37,12 @@ function account(name, type, provider, session, weekly, status) {
 function snapshot() {
   return {
     version: { current: '1.5.86', latest: null, hasUpdate: false, source: 'git' },
+    upstreamSync: {
+      state: 'failed', phase: 'merge', checkedAt: new Date().toISOString(),
+      lastSuccessAt: null, installedVersion: '1.6.1', installedRevision: '80d5ed4',
+      availableVersion: '1.7.1', availableRevision: 'aac169c',
+      error: 'The MaxPool upstream update could not be merged automatically.',
+    },
     currentAccount: 'glm personal',
     routing: { mode: 'automatic', preferredAccount: null, providerMode: routingMode, crossProviderFallbackPolicy: 'always' },
     accounts,

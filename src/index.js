@@ -31,6 +31,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { ControlError, ControlService } from './control-service.js';
+import { readUpstreamSyncStatus } from './upstream-sync-status.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine } from './updater.js';
 import {
@@ -1134,6 +1135,7 @@ async function serverWorkerCommand() {
     persistConfig: persistLiveConfig,
     syncAccounts: syncAccountsNow,
     checkForUpdates: () => checkForUpdatesNow(),
+    getUpstreamSyncStatus: () => readUpstreamSyncStatus(),
     requestRestart: () => restartController.requestRestart(),
     requestStop: () => shutdownGracefully('app', { cleanExit: true }),
     log: message => (tui?._addLog ? tui._addLog(message) : console.log(`[alPool] ${message}`)),

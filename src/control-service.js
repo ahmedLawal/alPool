@@ -22,6 +22,7 @@ export class ControlService {
     persistConfig,
     syncAccounts,
     checkForUpdates,
+    getUpstreamSyncStatus = () => null,
     requestRestart,
     requestStop,
     log = () => {},
@@ -31,14 +32,28 @@ export class ControlService {
     this.persistConfig = persistConfig;
     this.syncAccounts = syncAccounts;
     this.checkForUpdates = checkForUpdates;
+    this.getUpstreamSyncStatus = getUpstreamSyncStatus;
     this.requestRestart = requestRestart;
     this.requestStop = requestStop;
     this.log = log;
   }
 
   snapshot() {
+    const status = this.am.getStatus();
+    const upstreamSync = this.getUpstreamSyncStatus?.() || {
+      state: 'unknown',
+      phase: null,
+      checkedAt: null,
+      lastSuccessAt: null,
+      installedVersion: status.version?.current ?? null,
+      installedRevision: status.version?.currentRevision ?? null,
+      availableVersion: null,
+      availableRevision: null,
+      error: null,
+    };
     return {
-      ...this.am.getStatus(),
+      ...status,
+      upstreamSync,
       control: {
         generatedAt: new Date().toISOString(),
         backendPid: process.pid,

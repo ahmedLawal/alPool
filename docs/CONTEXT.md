@@ -65,6 +65,19 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-19 · #16 — Upstream sync health is part of the control snapshot
+
+**Context:** The native Updates page could compare the running checkout with the
+personal fork, but an upstream MaxPool merge failure left `origin/main` unchanged
+and therefore looked "up to date" unless Ahmed inspected the LaunchAgent log.
+**Decision:** Persist a small, atomic upstream-sync status record containing the
+installed and latest upstream versions, sync phase, timestamps, and a safe failure
+summary. Expose it through the Node control snapshot and render it in the existing
+SwiftUI Updates form.
+**Consequences:** Merge and validation failures are visible without parsing or
+exposing logs. The live backend remains on the last validated version, while the
+app identifies both that installed version and the blocked upstream version.
+
 ### 2026-08-19 · #15 — Overview summarizes enabled accounts only
 
 **Context:** The native Overview account list repeated disabled rows that cannot

@@ -12,6 +12,7 @@ public struct BackendConnection: Codable, Sendable {
 
 public struct ControlSnapshot: Decodable, Sendable {
     public let version: VersionInfo?
+    public let upstreamSync: UpstreamSyncInfo?
     public let currentAccount: String?
     public let routing: RoutingInfo
     public let accounts: [AccountStatus]
@@ -19,6 +20,18 @@ public struct ControlSnapshot: Decodable, Sendable {
     public let upstreamThrottle: ThrottleInfo?
     public let sessions: SessionInfo?
     public let control: ControlInfo
+}
+
+public struct UpstreamSyncInfo: Decodable, Sendable {
+    public let state: String
+    public let phase: String?
+    public let checkedAt: String?
+    public let lastSuccessAt: String?
+    public let installedVersion: String?
+    public let installedRevision: String?
+    public let availableVersion: String?
+    public let availableRevision: String?
+    public let error: String?
 }
 
 public struct VersionInfo: Decodable, Sendable {

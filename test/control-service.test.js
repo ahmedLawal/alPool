@@ -33,6 +33,12 @@ function fixture() {
     config,
     persistConfig: async () => { saves++; },
     syncAccounts: async () => 2,
+    getUpstreamSyncStatus: () => ({
+      state: 'failed', phase: 'merge', checkedAt: '2026-08-19T09:00:00Z',
+      lastSuccessAt: '2026-08-19T03:00:00Z', installedVersion: '1.6.1',
+      installedRevision: '80d5ed4', availableVersion: '1.7.1',
+      availableRevision: 'aac169c', error: 'The update could not be merged.',
+    }),
   });
   return { service, am, config, saves: () => saves };
 }
@@ -43,6 +49,9 @@ test('snapshot exposes safe control metadata', () => {
   assert.equal(snapshot.control.automaticUpdates, false);
   assert.equal(snapshot.control.capabilities.addAccounts, false);
   assert.equal(typeof snapshot.control.backendPid, 'number');
+  assert.equal(snapshot.upstreamSync.state, 'failed');
+  assert.equal(snapshot.upstreamSync.installedVersion, '1.6.1');
+  assert.equal(snapshot.upstreamSync.availableVersion, '1.7.1');
 });
 
 test('routing and account commands update runtime and persistent config', async () => {

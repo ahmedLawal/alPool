@@ -21,6 +21,14 @@ test('macOS overview lists enabled accounts only', () => {
   assert.match(content, /ForEach\(enabledAccounts\)/);
 });
 
+test('macOS updates page shows installed upstream version and sync failures', () => {
+  const content = readFileSync(new URL('../macos/Sources/alPoolApp/ContentView.swift', import.meta.url), 'utf8');
+  assert.match(content, /Section\("MaxPool upstream"\)/);
+  assert.match(content, /LabeledContent\("Installed"/);
+  assert.match(content, /case "failed": "Update failed"/);
+  assert.match(content, /snapshot\.upstreamSync\?\.error/);
+});
+
 test('backend LaunchAgent installer is guarded and valid', () => {
   const script = new URL('../scripts/install-backend-agent.sh', import.meta.url);
   accessSync(script, constants.X_OK);

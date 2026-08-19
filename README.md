@@ -59,7 +59,10 @@ stop the update safely. A local macOS LaunchAgent runs at login and every six ho
 it invokes `scripts/sync-upstream.sh`, merges `2solarmax/maxpool/main` in a temporary
 worktree, and pushes the fork only after the merged result passes tests and lint.
 The live checkout is never modified by the sync job. Its log is at
-`~/Library/Logs/alPool/upstream-sync.log`.
+`~/Library/Logs/alPool/upstream-sync.log`. The synchronizer also writes a safe
+status record at `~/.local/state/alpool/upstream-sync.json`; the native app's
+Updates page shows the installed and latest upstream versions and reports fetch,
+merge, test, lint, or push failures without exposing log contents.
 
 Run `npm run sync:upstream` for an immediate manual sync, or rerun
 `npm run sync:install` to reinstall the LaunchAgent. In alPool, open

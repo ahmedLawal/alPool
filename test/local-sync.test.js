@@ -53,6 +53,7 @@ test('local sync validates a divergent merge before pushing personal main', asyn
     const fakeBin = join(temp, 'bin');
     const fakeLog = join(temp, 'npm.log');
     const syncTmp = join(temp, 'tmp');
+    const statusPath = join(temp, 'upstream-sync.json');
 
     run('git', ['init', '--bare', origin], temp);
     run('git', ['init', '--bare', upstream], temp);
@@ -60,7 +61,8 @@ test('local sync validates a divergent merge before pushing personal main', asyn
     run('git', ['config', 'user.name', 'Test'], seed);
     run('git', ['config', 'user.email', 'test@example.com'], seed);
     await writeFile(join(seed, 'base.txt'), 'base\n');
-    run('git', ['add', 'base.txt'], seed);
+    await writeFile(join(seed, 'package.json'), '{"version":"1.0.0"}\n');
+    run('git', ['add', 'base.txt', 'package.json'], seed);
     run('git', ['commit', '-m', 'base'], seed);
     run('git', ['remote', 'add', 'origin', origin], seed);
     run('git', ['remote', 'add', 'upstream', upstream], seed);
@@ -76,7 +78,8 @@ test('local sync validates a divergent merge before pushing personal main', asyn
     run('git', ['config', 'user.name', 'Test'], upstreamWork);
     run('git', ['config', 'user.email', 'test@example.com'], upstreamWork);
     await writeFile(join(upstreamWork, 'upstream.txt'), 'upstream\n');
-    run('git', ['add', 'upstream.txt'], upstreamWork);
+    await writeFile(join(upstreamWork, 'package.json'), '{"version":"1.1.0"}\n');
+    run('git', ['add', 'upstream.txt', 'package.json'], upstreamWork);
     run('git', ['commit', '-m', 'upstream'], upstreamWork);
     run('git', ['push', 'origin', 'main'], upstreamWork);
 
@@ -94,6 +97,7 @@ test('local sync validates a divergent merge before pushing personal main', asyn
       TMPDIR: syncTmp,
       ALPOOL_REPO_ROOT: checkout,
       ALPOOL_FAKE_NPM_LOG: fakeLog,
+      ALPOOL_UPSTREAM_SYNC_STATUS: statusPath,
     };
     const script = new URL('../scripts/sync-upstream.sh', import.meta.url).pathname;
     const dryRun = run('/bin/bash', [script], checkout, { ...env, ALPOOL_SYNC_DRY_RUN: '1' });
@@ -105,12 +109,44 @@ test('local sync validates a divergent merge before pushing personal main', asyn
       'test',
       'run lint',
     ]);
+    const dryRunStatus = JSON.parse(await readFile(statusPath, 'utf8'));
+    assert.equal(dryRunStatus.state, 'update-available');
+    assert.equal(dryRunStatus.installedVersion, '1.0.0');
+    assert.equal(dryRunStatus.availableVersion, '1.1.0');
 
     const realRun = run('/bin/bash', [script], checkout, env);
     assert.match(realRun.stdout, /Upstream sync complete/);
     run('git', ['fetch', 'origin', 'main'], checkout);
     assert.equal(run('git', ['show', 'origin/main:personal.txt'], checkout).stdout, 'personal\n');
     assert.equal(run('git', ['show', 'origin/main:upstream.txt'], checkout).stdout, 'upstream\n');
+    const successStatus = JSON.parse(await readFile(statusPath, 'utf8'));
+    assert.equal(successStatus.state, 'up-to-date');
+    assert.equal(successStatus.installedVersion, '1.1.0');
+    assert.equal(successStatus.availableVersion, '1.1.0');
+
+    run('git', ['pull', '--ff-only', 'origin', 'main'], checkout);
+    run('git', ['config', 'user.name', 'Test'], checkout);
+    run('git', ['config', 'user.email', 'test@example.com'], checkout);
+    await writeFile(join(checkout, 'conflict.txt'), 'personal version\n');
+    run('git', ['add', 'conflict.txt'], checkout);
+    run('git', ['commit', '-m', 'personal conflict'], checkout);
+    run('git', ['push', 'origin', 'main'], checkout);
+
+    await writeFile(join(upstreamWork, 'conflict.txt'), 'upstream version\n');
+    await writeFile(join(upstreamWork, 'package.json'), '{"version":"1.2.0"}\n');
+    run('git', ['add', 'conflict.txt', 'package.json'], upstreamWork);
+    run('git', ['commit', '-m', 'conflicting upstream'], upstreamWork);
+    run('git', ['push', 'origin', 'main'], upstreamWork);
+
+    const failedRun = spawnSync('/bin/bash', [script], { cwd: checkout, env, encoding: 'utf8' });
+    assert.notEqual(failedRun.status, 0, 'an unmergeable upstream update must fail closed');
+    const failedStatus = JSON.parse(await readFile(statusPath, 'utf8'));
+    assert.equal(failedStatus.state, 'failed');
+    assert.equal(failedStatus.phase, 'merge');
+    assert.equal(failedStatus.installedVersion, '1.1.0');
+    assert.equal(failedStatus.availableVersion, '1.2.0');
+    assert.match(failedStatus.error, /could not be merged/i);
+    assert.equal(run('git', ['show', 'origin/main:conflict.txt'], checkout).stdout, 'personal version\n');
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

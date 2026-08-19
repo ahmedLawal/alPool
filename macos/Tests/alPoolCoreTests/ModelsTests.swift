@@ -3,10 +3,13 @@ import XCTest
 
 final class ModelsTests: XCTestCase {
     func testDecodesControlSnapshot() throws {
-        let data = Data(#"{"routing":{"mode":"automatic","preferredAccount":null,"providerMode":"balance","crossProviderFallbackPolicy":"always"},"accounts":[],"scheduler":{"mode":"adaptive-least-loaded","globalInFlight":0,"admissionPaused":false},"control":{"generatedAt":"2026-08-18T00:00:00Z","backendPid":42,"automaticUpdates":true,"capabilities":{"setRoutingMode":true,"preferAccount":true,"manageAccounts":true,"addAccounts":false,"syncAccounts":true,"manageUpdates":true,"restart":true,"stop":true}}}"#.utf8)
+        let data = Data(#"{"upstreamSync":{"state":"failed","phase":"merge","checkedAt":"2026-08-19T09:00:00Z","lastSuccessAt":"2026-08-19T03:00:00Z","installedVersion":"1.6.1","installedRevision":"80d5ed4","availableVersion":"1.7.1","availableRevision":"aac169c","error":"The update could not be merged."},"routing":{"mode":"automatic","preferredAccount":null,"providerMode":"balance","crossProviderFallbackPolicy":"always"},"accounts":[],"scheduler":{"mode":"adaptive-least-loaded","globalInFlight":0,"admissionPaused":false},"control":{"generatedAt":"2026-08-18T00:00:00Z","backendPid":42,"automaticUpdates":true,"capabilities":{"setRoutingMode":true,"preferAccount":true,"manageAccounts":true,"addAccounts":false,"syncAccounts":true,"manageUpdates":true,"restart":true,"stop":true}}}"#.utf8)
         let snapshot = try JSONDecoder().decode(ControlSnapshot.self, from: data)
         XCTAssertEqual(snapshot.control.backendPid, 42)
         XCTAssertTrue(snapshot.control.automaticUpdates)
+        XCTAssertEqual(snapshot.upstreamSync?.state, "failed")
+        XCTAssertEqual(snapshot.upstreamSync?.installedVersion, "1.6.1")
+        XCTAssertEqual(snapshot.upstreamSync?.availableVersion, "1.7.1")
     }
 
     func testCommandEncodesTypedPayload() throws {
