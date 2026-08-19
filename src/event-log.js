@@ -26,6 +26,7 @@ let writeChain = Promise.resolve();
 let queued = 0;
 let dropped = 0;
 let origConsole = null;
+const eventObservers = new Set();
 
 export function setEventLogPath(path, { manageRotation: owns = false } = {}) {
   logPath = path || null;
@@ -55,8 +56,20 @@ export function redactSecrets(s) {
     .replace(/(["']?api[_-]?key["']?\s*[:=]\s*["']?)[A-Za-z0-9._-]{8,}/gi, '$1[redacted]');
 }
 
-export function appendEventLog(msg) {
-  if (!logPath || msg == null) return;
+export function subscribeEventLog(listener) {
+  if (typeof listener !== 'function') return () => {};
+  eventObservers.add(listener);
+  return () => eventObservers.delete(listener);
+}
+
+export function appendEventLog(msg, { level = 'info' } = {}) {
+  if (msg == null) return;
+  let observable = redactSecrets(String(msg)).replace(/\s*\n\s*/g, ' ');
+  observable = capBytes(observable, MAX_BODY);
+  for (const observer of eventObservers) {
+    try { observer(observable, { level }); } catch { /* observers must never affect logging */ }
+  }
+  if (!logPath) return;
   if (queued >= MAX_QUEUED) { dropped++; return; } // disk stalled — drop, don't grow memory unbounded
   queued++;
   writeChain = writeChain.then(() => writeLine(msg)).catch(() => {}).finally(() => { queued--; });
@@ -128,7 +141,11 @@ export function installConsoleMirror() {
   for (const method of ['log', 'error']) {
     const orig = origConsole[method];
     console[method] = (...args) => {
-      try { appendEventLog(args.map(a => (typeof a === 'string' ? a : String(a))).join(' ')); } catch { /* never */ }
+      try {
+        appendEventLog(args.map(a => (typeof a === 'string' ? a : String(a))).join(' '), {
+          level: method === 'error' ? 'error' : 'info',
+        });
+      } catch { /* never */ }
       if (!stdoutSuppressed) orig(...args);
     };
   }
@@ -142,4 +159,5 @@ export function __resetEventLogForTest() {
   if (origConsole) { console.log = origConsole.log; console.error = origConsole.error; origConsole = null; }
   if (rotationTimer) { clearInterval(rotationTimer); rotationTimer = null; }
   logPath = null; manageRotation = false; writeChain = Promise.resolve(); queued = 0; dropped = 0; stdoutSuppressed = false;
+  eventObservers.clear();
 }

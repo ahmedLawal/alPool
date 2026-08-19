@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   setEventLogPath, appendEventLog, flushEventLog, redactSecrets,
-  installConsoleMirror, setConsoleStdoutSuppressed, rotateIfNeeded, __resetEventLogForTest,
+  installConsoleMirror, setConsoleStdoutSuppressed, rotateIfNeeded, subscribeEventLog,
+  __resetEventLogForTest,
 } from '../src/event-log.js';
 
 async function tmpLog() {
@@ -58,6 +59,18 @@ test('redactSecrets strips tokens/bearer/refresh+access tokens/api keys', () => 
   assert.match(redactSecrets('apiKey=AKIA1234567890abcd'), /\[redacted\]/);
   // a normal account name / status is NOT mangled
   assert.equal(redactSecrets('Switched to account "max@dubner.io" (200)'), 'Switched to account "max@dubner.io" (200)');
+});
+
+test('event observers receive redacted messages even when disk logging is disabled', () => {
+  __resetEventLogForTest();
+  const seen = [];
+  const unsubscribe = subscribeEventLog((message, metadata) => seen.push({ message, metadata }));
+  appendEventLog('[alPool] request failed with Bearer abc.def-123', { level: 'error' });
+  unsubscribe();
+  assert.equal(seen.length, 1);
+  assert.match(seen[0].message, /Bearer \[redacted\]/);
+  assert.equal(seen[0].metadata.level, 'error');
+  __resetEventLogForTest();
 });
 
 test('a multi-line message is collapsed to ONE line and capped < PIPE_BUF (macOS 512B atomicity)', async () => {

@@ -39,6 +39,11 @@ function fixture() {
       installedRevision: '80d5ed4', availableVersion: '1.7.1',
       availableRevision: 'aac169c', error: 'The update could not be merged.',
     }),
+    getActivity: () => ({
+      activeCount: 1, sessionCount: 1,
+      active: [{ id: '7', method: 'POST', path: '/v1/messages', account: 'glm' }],
+      recent: [{ id: '1', message: 'POST /v1/messages → glm (200, 1.2s)' }],
+    }),
   });
   return { service, am, config, saves: () => saves };
 }
@@ -52,6 +57,8 @@ test('snapshot exposes safe control metadata', () => {
   assert.equal(snapshot.upstreamSync.state, 'failed');
   assert.equal(snapshot.upstreamSync.installedVersion, '1.6.1');
   assert.equal(snapshot.upstreamSync.availableVersion, '1.7.1');
+  assert.equal(snapshot.activity.activeCount, 1);
+  assert.equal(snapshot.activity.recent.length, 1);
 });
 
 test('routing and account commands update runtime and persistent config', async () => {

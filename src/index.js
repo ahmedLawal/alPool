@@ -4,7 +4,7 @@ import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
-import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed } from './event-log.js';
+import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, subscribeEventLog } from './event-log.js';
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
@@ -32,6 +32,7 @@ import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { ControlError, ControlService } from './control-service.js';
 import { readUpstreamSyncStatus } from './upstream-sync-status.js';
+import { ActivityFeed } from './activity-feed.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine } from './updater.js';
 import {
@@ -581,6 +582,10 @@ async function serverWorkerCommand() {
 
   const threshold = config.switchThreshold || 0.90;
   const accountManager = new AccountManager(accounts, threshold, config.scheduler || {});
+  const activityFeed = new ActivityFeed({
+    accountType: name => accountManager.accounts.find(account => account.name === name)?.type ?? null,
+  });
+  subscribeEventLog((message, metadata) => activityFeed.addMessage(message, metadata));
   // (macOS) Keep the system awake ONLY while there is work in flight or queued, so a
   // long overnight streaming request survives Maintenance Sleep; the Mac sleeps
   // normally when idle. Disable via `preventSleep: false` in config.
@@ -853,15 +858,20 @@ async function serverWorkerCommand() {
   const hooks = {
     onRequestStart: (id, info) => {
       const accepted = restartController.requestStarted(id);
-      if (accepted) tui?.onRequestStart(id, info);
+      if (accepted) {
+        activityFeed.onRequestStart(id, info);
+        tui?.onRequestStart(id, info);
+      }
       return accepted;
     },
     onRequestRouted: (id, info) => {
       restartController.requestRouted(id, info.account);
+      activityFeed.onRequestRouted(id, info);
       tui?.onRequestRouted(id, info);
     },
     onRequestEnd: (id, info) => {
       restartController.requestEnded(id);
+      activityFeed.onRequestEnd(id, info);
       tui?.onRequestEnd(id, info);
     },
   };
@@ -1136,6 +1146,7 @@ async function serverWorkerCommand() {
     syncAccounts: syncAccountsNow,
     checkForUpdates: () => checkForUpdatesNow(),
     getUpstreamSyncStatus: () => readUpstreamSyncStatus(),
+    getActivity: () => activityFeed.snapshot(),
     requestRestart: () => restartController.requestRestart(),
     requestStop: () => shutdownGracefully('app', { cleanExit: true }),
     log: message => (tui?._addLog ? tui._addLog(message) : console.log(`[alPool] ${message}`)),

@@ -29,6 +29,15 @@ test('macOS updates page shows installed upstream version and sync failures', ()
   assert.match(content, /snapshot\.upstreamSync\?\.error/);
 });
 
+test('macOS app restores the live TUI activity feed', () => {
+  const content = readFileSync(new URL('../macos/Sources/alPoolApp/ContentView.swift', import.meta.url), 'utf8');
+  assert.match(content, /case activity = "Activity"/);
+  assert.match(content, /private struct ActivityView/);
+  assert.match(content, /ForEach\(active\)/);
+  assert.match(content, /ForEach\(recent\)/);
+  assert.match(content, /Request bodies and credentials are never shown/);
+});
+
 test('backend LaunchAgent installer is guarded and valid', () => {
   const script = new URL('../scripts/install-backend-agent.sh', import.meta.url);
   accessSync(script, constants.X_OK);

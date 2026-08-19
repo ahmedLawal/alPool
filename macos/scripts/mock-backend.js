@@ -43,6 +43,17 @@ function snapshot() {
       availableVersion: '1.7.1', availableRevision: 'aac169c',
       error: 'The MaxPool upstream update could not be merged automatically.',
     },
+    activity: {
+      activeCount: 1, sessionCount: 1,
+      active: [{
+        id: 'live-1', startedAt: new Date(Date.now() - 4_200).toISOString(), elapsedMs: 4_200,
+        method: 'POST', path: '/v1/messages?beta=true', account: 'glm personal',
+      }],
+      recent: [
+        { id: 'event-2', timestamp: new Date().toISOString(), kind: 'request', level: 'info', message: 'POST /v1/messages?beta=true → claude@example.com (200, 2.8s)', method: 'POST', path: '/v1/messages?beta=true', account: 'claude@example.com', status: 200, durationMs: 2_800 },
+        { id: 'event-1', timestamp: new Date(Date.now() - 5_000).toISOString(), kind: 'message', level: 'error', message: 'No route for request — returning 429 (cause: rate_limited, recovers-soon: true)', method: null, path: null, account: null, status: null, durationMs: null },
+      ],
+    },
     currentAccount: 'glm personal',
     routing: { mode: 'automatic', preferredAccount: null, providerMode: routingMode, crossProviderFallbackPolicy: 'always' },
     accounts,

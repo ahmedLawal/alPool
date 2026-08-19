@@ -23,6 +23,7 @@ export class ControlService {
     syncAccounts,
     checkForUpdates,
     getUpstreamSyncStatus = () => null,
+    getActivity = () => ({ activeCount: 0, sessionCount: 0, active: [], recent: [] }),
     requestRestart,
     requestStop,
     log = () => {},
@@ -33,6 +34,7 @@ export class ControlService {
     this.syncAccounts = syncAccounts;
     this.checkForUpdates = checkForUpdates;
     this.getUpstreamSyncStatus = getUpstreamSyncStatus;
+    this.getActivity = getActivity;
     this.requestRestart = requestRestart;
     this.requestStop = requestStop;
     this.log = log;
@@ -54,6 +56,7 @@ export class ControlService {
     return {
       ...status,
       upstreamSync,
+      activity: this.getActivity(),
       control: {
         generatedAt: new Date().toISOString(),
         backendPid: process.pid,

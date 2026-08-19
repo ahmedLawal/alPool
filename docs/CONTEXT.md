@@ -65,6 +65,19 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-19 · #17 — Native Activity uses a shared redacted backend feed
+
+**Context:** The TUI kept an in-memory list of in-flight and completed requests,
+but the headless backend used by the native app had no equivalent state in its
+control snapshot, so moving to the app removed real-time traffic visibility.
+**Decision:** Maintain one bounded, redacted activity feed in the Node worker from
+the existing request hooks and event-log observer. Expose active requests and the
+latest 200 completed/backend events through the control snapshot for both IO
+clients, without request bodies, credentials, or full session identifiers.
+**Consequences:** The native Activity page reaches operational parity with the TUI
+on its existing two-second polling cycle. Activity is intentionally process-local
+and starts fresh whenever the backend worker restarts.
+
 ### 2026-08-19 · #16 — Upstream sync health is part of the control snapshot
 
 **Context:** The native Updates page could compare the running checkout with the

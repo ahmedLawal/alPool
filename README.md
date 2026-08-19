@@ -71,8 +71,11 @@ Run `npm run sync:upstream` for an immediate manual sync, or rerun
 ## Native macOS app
 
 The SwiftUI app is an IO client for the existing Node backend. It shows live
-accounts, five-hour and weekly quota, routing, updates, and lifecycle controls;
-closing the app does not stop the proxy.
+accounts, five-hour and weekly quota, routing, updates, lifecycle controls, and
+the same live request activity available in the TUI; closing the app does not
+stop the proxy. The Activity page refreshes every two seconds and shows in-flight
+routing plus the latest 200 completed requests and backend events. Request bodies,
+credentials, and full session identifiers are never exposed to the app.
 
 ```bash
 npm run macos:test

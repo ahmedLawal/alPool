@@ -13,6 +13,7 @@ public struct BackendConnection: Codable, Sendable {
 public struct ControlSnapshot: Decodable, Sendable {
     public let version: VersionInfo?
     public let upstreamSync: UpstreamSyncInfo?
+    public let activity: ActivityInfo?
     public let currentAccount: String?
     public let routing: RoutingInfo
     public let accounts: [AccountStatus]
@@ -20,6 +21,35 @@ public struct ControlSnapshot: Decodable, Sendable {
     public let upstreamThrottle: ThrottleInfo?
     public let sessions: SessionInfo?
     public let control: ControlInfo
+}
+
+public struct ActivityInfo: Decodable, Sendable {
+    public let activeCount: Int
+    public let sessionCount: Int
+    public let active: [ActivityRequest]
+    public let recent: [ActivityEvent]
+}
+
+public struct ActivityRequest: Decodable, Identifiable, Sendable {
+    public let id: String
+    public let startedAt: String
+    public let elapsedMs: Double
+    public let method: String
+    public let path: String
+    public let account: String?
+}
+
+public struct ActivityEvent: Decodable, Identifiable, Sendable {
+    public let id: String
+    public let timestamp: String
+    public let kind: String
+    public let level: String
+    public let message: String
+    public let method: String?
+    public let path: String?
+    public let account: String?
+    public let status: Int?
+    public let durationMs: Double?
 }
 
 public struct UpstreamSyncInfo: Decodable, Sendable {

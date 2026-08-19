@@ -1,8 +1,10 @@
+import Foundation
 import SwiftUI
 import alPoolCore
 
 private enum AppSection: String, CaseIterable, Identifiable {
     case overview = "Overview"
+    case activity = "Activity"
     case accounts = "Accounts"
     case routing = "Routing"
     case updates = "Updates"
@@ -10,6 +12,7 @@ private enum AppSection: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .overview: "gauge.with.dots.needle.67percent"
+        case .activity: "waveform.path.ecg"
         case .accounts: "person.2"
         case .routing: "arrow.triangle.branch"
         case .updates: "arrow.triangle.2.circlepath"
@@ -33,6 +36,7 @@ struct ContentView: View {
                 if let snapshot = model.snapshot {
                     switch selection ?? .overview {
                     case .overview: OverviewView(snapshot: snapshot)
+                    case .activity: ActivityView(snapshot: snapshot)
                     case .accounts: AccountsView(snapshot: snapshot)
                     case .routing: RoutingView(snapshot: snapshot)
                     case .updates: UpdatesView(snapshot: snapshot)
@@ -149,6 +153,114 @@ private struct OverviewView: View {
         }
         .navigationTitle("Overview")
     }
+}
+
+private struct ActivityView: View {
+    let snapshot: ControlSnapshot
+
+    private var active: [ActivityRequest] { snapshot.activity?.active ?? [] }
+    private var recent: [ActivityEvent] { snapshot.activity?.recent ?? [] }
+
+    var body: some View {
+        List {
+            Section {
+                if active.isEmpty {
+                    Text("No requests in flight").foregroundStyle(.secondary)
+                } else {
+                    ForEach(active) { request in
+                        ActiveRequestRow(request: request)
+                    }
+                }
+            } header: {
+                Text(inFlightHeader)
+            }
+
+            Section("Recent") {
+                if recent.isEmpty {
+                    ContentUnavailableView(
+                        "No activity yet",
+                        systemImage: "waveform.path.ecg",
+                        description: Text("Request routing and backend events appear here as they happen.")
+                    )
+                } else {
+                    ForEach(recent) { event in
+                        ActivityEventRow(event: event)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Activity")
+        .safeAreaInset(edge: .bottom) {
+            Text("Updates every 2 seconds. Request bodies and credentials are never shown.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.bar)
+        }
+    }
+
+    private var inFlightHeader: String {
+        let activeCount = snapshot.activity?.activeCount ?? active.count
+        let sessionCount = snapshot.activity?.sessionCount ?? 0
+        let requests = "\(activeCount) in flight"
+        guard sessionCount > 0 else { return requests }
+        return "\(requests) · \(sessionCount) session\(sessionCount == 1 ? "" : "s")"
+    }
+}
+
+private struct ActiveRequestRow: View {
+    let request: ActivityRequest
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ProgressView().controlSize(.small)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(request.method) \(request.path)")
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                HStack(spacing: 6) {
+                    if let account = request.account { Text(account) }
+                    Text(durationLabel(request.elapsedMs))
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+private struct ActivityEventRow: View {
+    let event: ActivityEvent
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: event.level == "error" ? "exclamationmark.circle.fill" : "checkmark.circle")
+                .foregroundStyle(event.level == "error" ? Color.red : Color.secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(event.message)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                Text(timeLabel(event.timestamp))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    private func timeLabel(_ timestamp: String) -> String {
+        guard timestamp.count >= 19 else { return timestamp }
+        return String(timestamp.dropFirst(11).prefix(8))
+    }
+}
+
+private func durationLabel(_ milliseconds: Double) -> String {
+    if milliseconds < 1_000 { return "\(Int(milliseconds)) ms" }
+    return String(format: "%.1f s", milliseconds / 1_000)
 }
 
 private struct AccountsView: View {
