@@ -29,7 +29,10 @@ locally through a six-hour macOS LaunchAgent and a transactional Bash script.
 A native SwiftUI macOS client is the primary IO layer. The Node
 backend remains the sole owner of proxying, credentials, configuration, routing,
 updates, and lifecycle; the app attaches to a headless backend and can close
-without interrupting traffic. The existing TUI remains a fallback client.
+without interrupting traffic. The signed app is installed at
+`/Applications/alPool.app`; the backend runs through the per-user
+`com.ahmedlawal.alpool.backend` LaunchAgent. The existing TUI remains a fallback
+client.
 
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
@@ -61,6 +64,20 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-08-19 · #14 — Native app and login-managed backend are active
+
+**Context:** The native client and control API were tested in isolation, while the
+live proxy still belonged to a terminal process. That process could not expose the
+new control endpoint or survive login independently of its terminal.
+**Decision:** Install the signed app in `/Applications` and complete the one-time
+cutover to the guarded `com.ahmedlawal.alpool.backend` LaunchAgent after the tested
+integration reached personal `main`. Use the authenticated control API—not an
+operating-system signal—for future app-initiated restart and stop operations.
+**Consequences:** alPool starts when Ahmed logs in, closing the app does not stop
+traffic, and backend logs live at `~/Library/Logs/alPool/backend.log`. The primary
+checkout stays clean on `main`, so git-source automatic updates can fast-forward
+and reload it again.
 
 ### 2026-08-19 · #13 — Finder launches Node explicitly and the linked checkout stays on main
 
