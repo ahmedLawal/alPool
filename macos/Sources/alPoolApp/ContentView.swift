@@ -127,6 +127,10 @@ private enum LifecycleConfirmation: Equatable {
 private struct OverviewView: View {
     let snapshot: ControlSnapshot
 
+    private var enabledAccounts: [AccountStatus] {
+        snapshot.accounts.filter(\.enabled)
+    }
+
     var body: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 16)], spacing: 16) {
@@ -139,7 +143,7 @@ private struct OverviewView: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 Text("Accounts").font(.title2.bold())
-                ForEach(snapshot.accounts) { account in AccountCard(account: account) }
+                ForEach(enabledAccounts) { account in AccountCard(account: account) }
             }
             .padding([.horizontal, .bottom])
         }

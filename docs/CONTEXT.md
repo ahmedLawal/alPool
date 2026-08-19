@@ -65,6 +65,15 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-19 · #15 — Overview summarizes enabled accounts only
+
+**Context:** The native Overview account list repeated disabled rows that cannot
+serve traffic, making the operational summary noisier than the active pool.
+**Decision:** Filter Overview cards to enabled accounts while keeping the Accounts
+management page as the complete inventory.
+**Consequences:** Overview reflects the currently usable pool; disabled accounts
+remain visible and re-enableable under Accounts.
+
 ### 2026-08-19 · #14 — Native app and login-managed backend are active
 
 **Context:** The native client and control API were tested in isolation, while the

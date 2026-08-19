@@ -15,6 +15,12 @@ test('native macOS client is a SwiftUI IO layer over the control API', () => {
   assert.doesNotMatch(client, /refreshToken|accessToken|secretName/);
 });
 
+test('macOS overview lists enabled accounts only', () => {
+  const content = readFileSync(new URL('../macos/Sources/alPoolApp/ContentView.swift', import.meta.url), 'utf8');
+  assert.match(content, /private var enabledAccounts:[\s\S]*snapshot\.accounts\.filter\(\\\.enabled\)/);
+  assert.match(content, /ForEach\(enabledAccounts\)/);
+});
+
 test('backend LaunchAgent installer is guarded and valid', () => {
   const script = new URL('../scripts/install-backend-agent.sh', import.meta.url);
   accessSync(script, constants.X_OK);
