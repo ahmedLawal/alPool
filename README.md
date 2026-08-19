@@ -76,6 +76,10 @@ the same live request activity available in the TUI; closing the app does not
 stop the proxy. The Activity page refreshes every two seconds and shows in-flight
 routing plus the latest 200 completed requests and backend events. Request bodies,
 credentials, and full session identifiers are never exposed to the app.
+Overview quota bars use green, amber, and red usage thresholds. Its compact view
+hides request and token totals while retaining both quota windows; the selected
+view is remembered across launches. Accounts serving live requests receive a
+green outline and serving badge.
 
 ```bash
 npm run macos:test

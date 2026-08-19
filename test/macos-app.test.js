@@ -21,6 +21,20 @@ test('macOS overview lists enabled accounts only', () => {
   assert.match(content, /ForEach\(enabledAccounts\)/);
 });
 
+test('macOS overview supports compact account cards and traffic-light quota safety', () => {
+  const content = readFileSync(new URL('../macos/Sources/alPoolApp/ContentView.swift', import.meta.url), 'utf8');
+  assert.match(content, /@AppStorage\("overviewAccountDensity"\)/);
+  assert.match(content, /Picker\("Account detail"/);
+  assert.match(content, /Text\("Compact"\)/);
+  assert.match(content, /Text\("Detailed"\)/);
+  assert.match(content, /if density == \.detailed/);
+  assert.equal(content.includes('Label("Serving \\(account.inFlight)"'), true);
+  assert.match(content, /hidesRoutineStatus && status == "Active"/);
+  assert.match(content, /if usage >= 0\.85 \{ return \.red \}/);
+  assert.match(content, /if usage >= 0\.60 \{ return \.orange \}/);
+  assert.match(content, /return \.green/);
+});
+
 test('macOS updates page shows installed upstream version and sync failures', () => {
   const content = readFileSync(new URL('../macos/Sources/alPoolApp/ContentView.swift', import.meta.url), 'utf8');
   assert.match(content, /Section\("MaxPool upstream"\)/);

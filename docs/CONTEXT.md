@@ -65,6 +65,21 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-19 · #18 — Overview distinguishes quota safety from live serving
+
+**Context:** Uniform blue quota bars hid the difference between safe, caution,
+and critical usage. Every healthy account also displayed “Active,” which looked
+like every account was currently serving traffic, while detailed request/token
+totals made the overview unnecessarily tall for routine monitoring.
+**Decision:** Use solid traffic-light quota fills: green below 60%, amber from
+60–84%, and red at 85% or higher. Suppress routine healthy “Active” on Overview,
+but keep exceptional health states and use `inFlight` for a green card outline and
+Serving badge. Add a persistent Compact/Detailed toggle; Compact hides only
+request/token totals and both modes retain separate five-hour and weekly rows.
+**Consequences:** Quota risk and live traffic are visually distinct. Overview can
+be dense without losing reset windows, while Accounts management retains complete
+status and controls.
+
 ### 2026-08-19 · #17 — Native Activity uses a shared redacted backend feed
 
 **Context:** The TUI kept an in-memory list of in-flight and completed requests,

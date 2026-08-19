@@ -128,11 +128,21 @@ private enum LifecycleConfirmation: Equatable {
     }
 }
 
+private enum OverviewAccountDensity: String {
+    case compact
+    case detailed
+}
+
 private struct OverviewView: View {
     let snapshot: ControlSnapshot
+    @AppStorage("overviewAccountDensity") private var densityValue = OverviewAccountDensity.detailed.rawValue
 
     private var enabledAccounts: [AccountStatus] {
         snapshot.accounts.filter(\.enabled)
+    }
+
+    private var density: OverviewAccountDensity {
+        OverviewAccountDensity(rawValue: densityValue) ?? .detailed
     }
 
     var body: some View {
@@ -146,8 +156,20 @@ private struct OverviewView: View {
             .padding()
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("Accounts").font(.title2.bold())
-                ForEach(enabledAccounts) { account in AccountCard(account: account) }
+                HStack(spacing: 16) {
+                    Text("Accounts").font(.title2.bold())
+                    Spacer()
+                    Picker("Account detail", selection: $densityValue) {
+                        Text("Compact").tag(OverviewAccountDensity.compact.rawValue)
+                        Text("Detailed").tag(OverviewAccountDensity.detailed.rawValue)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
+                    SafetyLegend()
+                }
+                ForEach(enabledAccounts) { account in
+                    AccountCard(account: account, density: density, hidesRoutineStatus: true)
+                }
             }
             .padding([.horizontal, .bottom])
         }
@@ -468,19 +490,39 @@ private struct MetricCard: View {
 
 private struct AccountCard: View {
     let account: AccountStatus
+    var density = OverviewAccountDensity.detailed
+    var hidesRoutineStatus = false
     var showsControls = false
     var toggle: (() -> Void)?
 
+    private var visibleStatus: String? {
+        let status = account.displayStatus
+        return hidesRoutineStatus && status == "Active" ? nil : status
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: density == .compact ? 7 : 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(account.name).font(.headline)
-                    Text("\(account.providerLabel) · \(account.displayStatus)")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text("·").foregroundStyle(.tertiary)
+                    Text(account.providerLabel).font(.caption).foregroundStyle(.secondary)
+                    if let visibleStatus {
+                        Text("·").foregroundStyle(.tertiary)
+                        Text(visibleStatus).font(.caption).foregroundStyle(.secondary)
+                    }
                 }
+                .lineLimit(1)
                 Spacer()
-                if account.inFlight > 0 { Label("\(account.inFlight)", systemImage: "waveform") }
+                if account.inFlight > 0 {
+                    Label("Serving \(account.inFlight)", systemImage: "waveform")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(Color.green.opacity(0.14), in: Capsule())
+                        .accessibilityLabel("\(account.inFlight) requests in flight")
+                }
                 if showsControls, let toggle {
                     Button(account.enabled ? "Disable" : "Enable", action: toggle)
                 }
@@ -492,17 +534,49 @@ private struct AccountCard: View {
                 reset: account.quota.weeklyReset,
                 empty: account.quota.weeklyAbsent == true ? "No weekly limit" : "Waiting for quota"
             )
-            HStack {
-                Text("\(account.usage.totalRequests) requests")
-                Text("·")
-                Text("\(account.usage.totalInputTokens + account.usage.totalOutputTokens) tokens")
+            if density == .detailed {
+                HStack {
+                    Text("\(account.usage.totalRequests) requests")
+                    Text("·")
+                    Text("\(account.usage.totalInputTokens + account.usage.totalOutputTokens) tokens")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
-        .padding(14)
+        .padding(density == .compact ? 12 : 14)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(account.inFlight > 0 ? Color.green.opacity(0.75) : Color.clear, lineWidth: 1.5)
+        }
         .opacity(account.enabled ? 1 : 0.65)
+    }
+}
+
+private struct SafetyLegend: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            SafetyLegendItem(label: "Safe <60%", color: .green)
+            SafetyLegendItem(label: "Caution 60–84%", color: .orange)
+            SafetyLegendItem(label: "Critical ≥85%", color: .red)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Usage safety: safe below 60 percent, caution from 60 to 84 percent, critical at 85 percent or more")
+    }
+}
+
+private struct SafetyLegendItem: View {
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text(label)
+        }
     }
 }
 
@@ -514,18 +588,24 @@ private struct QuotaRow: View {
 
     var body: some View {
         HStack {
-            Text(label).frame(width: 58, alignment: .leading)
+            Text(label)
+                .font(.body.weight(.medium))
+                .frame(width: 68, alignment: .leading)
             if let value {
                 ProgressView(value: min(max(value, 0), 1))
+                    .tint(quotaSafetyColor(value))
                 Text(value, format: .percent.precision(.fractionLength(0)))
+                    .font(.caption)
                     .monospacedDigit().frame(width: 42, alignment: .trailing)
-                Text(resetLabel(reset)).foregroundStyle(.secondary).frame(width: 72, alignment: .trailing)
+                Text(resetLabel(reset))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 72, alignment: .trailing)
             } else {
-                Text(empty).foregroundStyle(.secondary)
+                Text(empty).font(.caption).foregroundStyle(.secondary)
                 Spacer()
             }
         }
-        .font(.caption)
     }
 
     private func resetLabel(_ timestamp: Double?) -> String {
@@ -536,6 +616,12 @@ private struct QuotaRow: View {
         if remaining < 86_400 { return "\(Int(remaining / 3600))h" }
         return "\(Int(remaining / 86_400))d"
     }
+}
+
+private func quotaSafetyColor(_ usage: Double) -> Color {
+    if usage >= 0.85 { return .red }
+    if usage >= 0.60 { return .orange }
+    return .green
 }
 
 private func routingLabel(_ routing: RoutingInfo) -> String {
