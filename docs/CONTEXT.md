@@ -26,6 +26,11 @@ the existing `~/.config/maxpool.json`, `MAXPOOL_*` environment variables,
 migration is required. Upstream remains `2solarmax/maxpool`; synchronization runs
 locally through a six-hour macOS LaunchAgent and a transactional Bash script.
 
+A native SwiftUI macOS client is the primary IO layer. The Node
+backend remains the sole owner of proxying, credentials, configuration, routing,
+updates, and lifecycle; the app attaches to a headless backend and can close
+without interrupting traffic. The existing TUI remains a fallback client.
+
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
 routing modes. Current version: **v1.5.83** (installed as a global symlink to
@@ -56,6 +61,37 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-08-19 · #13 — Finder launches Node explicitly and the linked checkout stays on main
+
+**Context:** Finder does not inherit the interactive shell's NVM path, so invoking
+the linked `alpool` shebang through `/usr/bin/env node` failed even though the app
+found the executable. Separately, the globally linked checkout remained on a
+feature branch, causing the intentionally conservative git updater to reject every
+automatic pull.
+**Decision:** Resolve and invoke Node explicitly, preferring the binary beside the
+discovered `alpool` executable and supporting `ALPOOL_NODE_EXECUTABLE` as an
+override. Integrate feature work into personal `main` and keep the globally linked
+primary checkout on that branch.
+**Consequences:** The native app works when launched from Finder without shell
+initialization. Automatic updates can fast-forward the clean linked checkout again;
+development branches remain isolated in separate worktrees.
+
+### 2026-08-18 · #12 — Native macOS app is an IO client, not a backend port
+
+**Context:** The terminal dashboard makes alPool operationally opaque and ties its
+controls to the terminal that launched the proxy. Ahmed wants a native macOS app
+but does not want the routing, quota, credential, or update logic rewritten in
+Swift.
+**Decision:** Keep Node as the single backend and extract TUI-owned operations into
+a shared control service. Expose authenticated loopback status and command
+interfaces, then build a native SwiftUI client that renders state and sends typed
+commands. Run the backend independently of the app; closing the app never stops
+traffic. Keep the TUI as a fallback adapter over the same service.
+**Consequences:** Backend behavior stays testable once and consistent across both
+frontends. A one-time, separately controlled cutover will eventually replace the
+terminal-owned process with a login agent. Development and validation happen in an
+isolated worktree and do not touch the live listener on port 3456.
 
 ### 2026-08-17 · #11 — Upstream synchronization runs locally, not in GitHub Actions
 

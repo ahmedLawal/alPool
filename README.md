@@ -65,6 +65,25 @@ Run `npm run sync:upstream` for an immediate manual sync, or rerun
 `npm run sync:install` to reinstall the LaunchAgent. In alPool, open
 **Updates** and press `t` once to enable the full automatic pull-and-reload flow.
 
+## Native macOS app
+
+The SwiftUI app is an IO client for the existing Node backend. It shows live
+accounts, five-hour and weekly quota, routing, updates, and lifecycle controls;
+closing the app does not stop the proxy.
+
+```bash
+npm run macos:test
+npm run macos:build
+open dist/alPool.app
+```
+
+The app discovers the linked `alpool` executable and asks it for safe local
+connection details. Provider and OAuth credentials remain inside the backend.
+The backend LaunchAgent installer is intentionally guarded: while a service is
+already listening it exits without changing anything. The one-time switch from a
+terminal-owned service requires the explicit
+`npm run macos:install-backend -- --replace` command.
+
 ## Recommended setup
 
 The cleanest way to use alPool day-to-day: **keep your normal `claude` login untouched, and add a separate alias that routes through the pool.** Then plain `claude` still uses your default single account, and `ccal` spreads work across all your accounts.

@@ -169,6 +169,49 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
 
+      // Native clients use the same authenticated loopback listener as the proxy,
+      // but all mutations remain backend-owned. The app sends typed commands here;
+      // it never edits config or credentials itself.
+      if (req.url === '/maxpool/control') {
+        if (!isLocal) {
+          sendControlJson(res, 403, { ok: false, error: { code: 'loopback_only', message: 'Control API is available only on loopback.' } });
+          return;
+        }
+        if (proxyApiKey && clientKey !== proxyApiKey) {
+          sendControlJson(res, 401, { ok: false, error: { code: 'authentication_error', message: 'Invalid proxy API key' } });
+          return;
+        }
+        try {
+          if (req.method === 'GET') {
+            const snapshot = hooks.onControlSnapshot?.() || accountManager.getStatus();
+            sendControlJson(res, 200, snapshot);
+            return;
+          }
+          if (req.method === 'POST') {
+            if (!hooks.onControlCommand) {
+              sendControlJson(res, 503, { ok: false, error: { code: 'unavailable', message: 'Control service is unavailable.' } });
+              return;
+            }
+            const command = await readControlJson(req);
+            const result = await hooks.onControlCommand(command);
+            sendControlJson(res, 200, result);
+            return;
+          }
+          sendControlJson(res, 405, { ok: false, error: { code: 'method_not_allowed', message: 'Use GET or POST.' } });
+        } catch (error) {
+          const status = Number.isInteger(error?.status) ? error.status : 500;
+          sendControlJson(res, status, {
+            ok: false,
+            error: {
+              code: error?.code || 'control_error',
+              message: status >= 500 ? 'Control command failed.' : String(error?.message || 'Invalid control command.'),
+            },
+          });
+          if (status >= 500) console.error(`[alPool] Control command failed: ${error?.message || error}`);
+        }
+        return;
+      }
+
       // Status exposes account names and quota state, so require the local
       // proxy key even for loopback callers.
       if (req.method === 'GET' && req.url === '/maxpool/status') {
@@ -334,6 +377,43 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   server.maxpoolBeginDrain = () => { draining = true; };
 
   return server;
+}
+
+function sendControlJson(res, status, body) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+  });
+  res.end(JSON.stringify(body));
+}
+
+async function readControlJson(req) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    if (bytes > 64 * 1024) {
+      const error = new Error('Control command exceeds 64 KiB.');
+      error.status = 413;
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  if (!bytes) {
+    const error = new Error('Control command body is required.');
+    error.status = 400;
+    error.code = 'invalid_json';
+    throw error;
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    const error = new Error('Control command must be valid JSON.');
+    error.status = 400;
+    error.code = 'invalid_json';
+    throw error;
+  }
 }
 
 /**

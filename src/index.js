@@ -30,6 +30,7 @@ import { Prober } from './prober.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
+import { ControlError, ControlService } from './control-service.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine } from './updater.js';
 import {
@@ -123,6 +124,10 @@ switch (command) {
     break;
   case 'status':
     await statusCommand();
+    process.exit(0);
+    break;
+  case 'app-connection':
+    await appConnectionCommand();
     process.exit(0);
     break;
   case 'accounts':
@@ -1013,7 +1018,7 @@ async function serverWorkerCommand() {
     // terminal, re-creating the headless orphan. So even a drain-timeout or close
     // error during a terminal close exits 0 (the terminal is gone; there's nothing
     // to keep alive for).
-    const cleanExitCode = options.terminalClose ? 0 : 1;
+    const cleanExitCode = options.terminalClose || options.cleanExit ? 0 : 1;
     if (draining) {
       console.error(`\n[alPool] Force exiting with ${restartController.activeRequests.size} active request(s) still open.`);
       process.exit(cleanExitCode);
@@ -1074,59 +1079,72 @@ async function serverWorkerCommand() {
     server.closeIdleConnections?.();
   };
 
+  const persistLiveConfig = () => atomicConfigUpdate(async diskConfig => {
+    diskConfig.routing = {
+      mode: config.routing?.mode || 'automatic',
+      preferredAccount: config.routing?.preferredAccount || null,
+    };
+    if (config.scheduler?.crossProviderFallbackPolicy || config.scheduler?.providers || config.scheduler?.routingMode) {
+      diskConfig.scheduler = {
+        ...diskConfig.scheduler,
+        ...(config.scheduler.crossProviderFallbackPolicy
+          ? { crossProviderFallbackPolicy: config.scheduler.crossProviderFallbackPolicy } : {}),
+        ...(config.scheduler.providers ? { providers: config.scheduler.providers } : {}),
+        ...(config.scheduler.routingMode ? { routingMode: config.scheduler.routingMode } : {}),
+      };
+      if (!config.scheduler.crossProviderFallbackPolicy) delete diskConfig.scheduler.crossProviderFallbackPolicy;
+    }
+    for (const key of ['updateCheck', 'autoUpdate', 'autoApply']) {
+      if (config[key] !== undefined) diskConfig[key] = config[key];
+    }
+    diskConfig.accounts = config.accounts.map(a => {
+      const am = accountManager.accounts.find(candidate =>
+        (a.accountUuid && candidate.accountUuid === a.accountUuid) || candidate.name === a.name
+      );
+      const live = am ? {
+        ...a,
+        accessToken: am.credential,
+        refreshToken: am.refreshToken,
+        expiresAt: am.expiresAt,
+      } : a;
+      const diskAcct = diskConfig.accounts.find(
+        d => (a.accountUuid && d.accountUuid === a.accountUuid) || d.name === a.name
+      );
+      return diskAcct ? { ...diskAcct, ...live } : live;
+    });
+    if (Array.isArray(config.providers)) {
+      diskConfig.providers = config.providers.map(provider => {
+        const diskProvider = Array.isArray(diskConfig.providers)
+          ? diskConfig.providers.find(candidate => candidate.name === provider.name)
+          : null;
+        return diskProvider ? { ...diskProvider, ...provider } : provider;
+      });
+    }
+  });
+
+  const syncAccountsNow = async () => {
+    const diskConfig = await loadConfig();
+    if (!diskConfig) return 0;
+    return syncAccountsFromDisk(diskConfig, config, accountManager);
+  };
+
+  const controlService = new ControlService({
+    accountManager,
+    config,
+    persistConfig: persistLiveConfig,
+    syncAccounts: syncAccountsNow,
+    checkForUpdates: () => checkForUpdatesNow(),
+    requestRestart: () => restartController.requestRestart(),
+    requestStop: () => shutdownGracefully('app', { cleanExit: true }),
+    log: message => (tui?._addLog ? tui._addLog(message) : console.log(`[alPool] ${message}`)),
+  });
+
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
-      saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        diskConfig.routing = {
-          mode: config.routing?.mode || 'automatic',
-          preferredAccount: config.routing?.preferredAccount || null,
-        };
-        // Persist live-toggled scheduler policy (e.g. the cross-provider fallback
-        // policy cycled with the TUI 'f' key). Without this, the toggle takes effect
-        // in memory but silently reverts on the next config write / restart. Merge
-        // onto the existing disk scheduler block so other scheduler keys survive.
-        if (config.scheduler?.crossProviderFallbackPolicy || config.scheduler?.providers) {
-          diskConfig.scheduler = {
-            ...diskConfig.scheduler,
-            ...(config.scheduler.crossProviderFallbackPolicy
-              ? { crossProviderFallbackPolicy: config.scheduler.crossProviderFallbackPolicy } : {}),
-            // Per-provider Claude→provider settings (TUI routing g / k). Must be listed
-            // here explicitly or the toggle takes effect in memory and silently reverts.
-            ...(config.scheduler.providers ? { providers: config.scheduler.providers } : {}),
-          };
-        }
-        // Persist live-toggled automatic-update flags (the TUI 'u' Updates menu). Same
-        // reason as the policy above: without this the toggle takes effect in memory but
-        // silently reverts on the next config write / restart. Only write keys defined
-        // in-memory so a disk value is never clobbered with undefined.
-        for (const key of ['updateCheck', 'autoUpdate', 'autoApply']) {
-          if (config[key] !== undefined) diskConfig[key] = config[key];
-        }
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map(a => {
-          const am = accountManager.accounts.find(candidate =>
-            (a.accountUuid && candidate.accountUuid === a.accountUuid) || candidate.name === a.name
-          );
-          const live = am ? {
-            ...a,
-            accessToken: am.credential,
-            refreshToken: am.refreshToken,
-            expiresAt: am.expiresAt,
-          } : a;
-          const diskAcct = diskConfig.accounts.find(
-            d => (a.accountUuid && d.accountUuid === a.accountUuid) || d.name === a.name
-          );
-          return diskAcct ? { ...diskAcct, ...live } : live;
-        });
-      }),
-      syncAccounts: async () => {
-        const diskConfig = await loadConfig();
-        if (!diskConfig) return 0;
-        return syncAccountsFromDisk(diskConfig, config, accountManager);
-      },
+      saveConfig: persistLiveConfig,
+      syncAccounts: syncAccountsNow,
+      controlService,
       onQuit: () => {
         shutdownGracefully('quit');
       },
@@ -1135,6 +1153,12 @@ async function serverWorkerCommand() {
       },
     });
   }
+
+  hooks.onControlSnapshot = () => controlService.snapshot();
+  hooks.onControlCommand = command => {
+    if (!hasLease) throw new ControlError('Control commands run on the primary worker only.', 503, 'not_primary');
+    return controlService.execute(command);
+  };
 
   server = createProxyServer(accountManager, config, hooks);
   let syncInFlight = false;
@@ -1685,6 +1709,19 @@ async function statusCommand() {
   }
 }
 
+// Machine-readable connection details for the native macOS IO client. This emits
+// only the local proxy credential; provider and OAuth credentials never cross the
+// app boundary.
+async function appConnectionCommand() {
+  const config = await loadOrCreateConfig();
+  const host = config.proxy.host || '127.0.0.1';
+  const port = config.proxy.port || 3456;
+  console.log(JSON.stringify({
+    baseURL: `http://${host}:${port}`,
+    apiKey: config.proxy.apiKey || '',
+  }));
+}
+
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
@@ -1909,6 +1946,7 @@ Commands:
   env [--with-key]    Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
+  app-connection      Print native app connection JSON
   accounts            List configured accounts
   remove <name>       Remove an account
   rename <name|#> <new>  Rename an account (by name or list number)

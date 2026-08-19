@@ -17,6 +17,9 @@
     "lint": "eslint src/ test/",
     "sync:upstream": "bash scripts/sync-upstream.sh",
     "sync:install": "bash scripts/install-local-sync.sh",
+    "macos:test": "swift test --package-path macos",
+    "macos:build": "bash scripts/build-macos-app.sh",
+    "macos:install-backend": "bash scripts/install-backend-agent.sh",
     "release": "bash scripts/release.sh",
     "version": "bash scripts/update-changelog.sh"
   },

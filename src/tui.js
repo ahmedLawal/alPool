@@ -243,11 +243,12 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, controlService = null, onQuit, onRestart }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
+    this.control = controlService;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
     // Set by index.js after construction (a deferred closure, not a constructor literal —
@@ -548,6 +549,11 @@ export class TUI {
 
   async _toggleAutoUpdate() {
     const turnOn = !this._autoUpdateOn();
+    if (this.control) {
+      await this.control.execute({ type: 'set-automatic-updates', payload: { enabled: turnOn } });
+      this.mode = 'normal';
+      return;
+    }
     // ON = the full hands-free chain; OFF = keep checking (banner still shows) but never
     // install/reload without the user. Mutating this.config (=== the object index.js's
     // update timer reads) takes effect live; saveConfig persists it (index.js writes these
@@ -829,6 +835,13 @@ export class TUI {
     const cur = this.am._claudeFallbackFor?.(providerKey) || 'never';
     const next = order[(order.indexOf(cur) + 1) % order.length];
     const apply = async () => {
+      if (this.control) {
+        await this.control.execute({
+          type: 'set-provider-fallback',
+          payload: { provider: providerKey, policy: next },
+        });
+        return;
+      }
       this.am.setClaudeFallbackForProvider?.(providerKey, next);
       const sched = { ...(this.config.scheduler || {}) };
       sched.providers = { ...(sched.providers || {}) };
@@ -873,6 +886,10 @@ export class TUI {
     const modes = TUI.ROUTING_MODES;
     const cur = this.am.scheduler?.routingMode || 'sticky';
     const next = modes[(modes.findIndex(m => m.id === cur) + 1) % modes.length];
+    if (this.control) {
+      await this.control.execute({ type: 'set-routing-mode', payload: { mode: next.id } });
+      return;
+    }
     this.am.setProviderRoutingMode?.(next.id);
     this.config.scheduler = { ...(this.config.scheduler || {}), routingMode: next.id };
     // Clear the stale legacy policy so it can't contradict the new mode in
@@ -1044,6 +1061,10 @@ export class TUI {
   // ── account operations ─────────────────────────────
 
   async _doSync() {
+    if (this.control) {
+      await this.control.execute({ type: 'sync-accounts' });
+      return;
+    }
     try {
       this._addLog('Reloading config...');
       const count = await this.syncAccounts();
@@ -1108,6 +1129,13 @@ export class TUI {
   // Rename an account in config and in the running manager.
   async _doRename(idx, newName) {
     const account = this.am.accounts[idx];
+    if (this.control && account) {
+      await this.control.execute({
+        type: 'rename-account',
+        payload: { name: account.name, newName },
+      });
+      return;
+    }
     if (!account) { this._addLog('Account no longer exists'); return; }
     if (!newName) { this._addLog('Rename cancelled (empty name)'); return; }
     if (this.am.accounts.some((a, i) => i !== idx && a.name === newName)) {
@@ -1247,6 +1275,10 @@ export class TUI {
   }
 
   async _setAutomaticRouting() {
+    if (this.control) {
+      await this.control.execute({ type: 'set-preferred-account', payload: { name: null } });
+      return;
+    }
     const previous = this.config.routing;
     this.config.routing = { mode: 'automatic', preferredAccount: null };
     try {
@@ -1260,6 +1292,10 @@ export class TUI {
   }
 
   async _setPreferredRouting(name) {
+    if (this.control) {
+      await this.control.execute({ type: 'set-preferred-account', payload: { name } });
+      return;
+    }
     const account = this.am.accounts.find(candidate => candidate.name === name);
     if (!account?.enabled || account.type === 'provider') {
       throw new Error(`Claude account "${name}" must be enabled before it can be preferred`);
@@ -1312,6 +1348,13 @@ export class TUI {
   async _doToggle(idx, enabled) {
     const account = this.am.accounts[idx];
     if (!account) return;
+    if (this.control) {
+      await this.control.execute({
+        type: 'set-account-enabled',
+        payload: { name: account.name, enabled },
+      });
+      return;
+    }
     const configIndex = this._configAccountIndex(account);
     if (configIndex < 0) {
       // A runtime provider (GLM/Kimi) isn't in config — it's re-created from the `cc all`
@@ -1349,6 +1392,10 @@ export class TUI {
   async _doDelete(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const account = this.am.accounts[idx];
+    if (this.control) {
+      await this.control.execute({ type: 'delete-account', payload: { name: account.name } });
+      return;
+    }
     const name = account.name;
     if (account.inFlight > 0) {
       this._addLog(`Cannot delete "${name}" while ${account.inFlight} request(s) are active; disable it and retry when idle`);

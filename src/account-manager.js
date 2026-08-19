@@ -3322,6 +3322,7 @@ export class AccountManager {
       routing: {
         mode: this.routingMode,
         preferredAccount: this.preferredAccountName,
+        providerMode: this.scheduler.routingMode,
         crossProviderFallbackPolicy: this._crossProviderFallbackPolicy(),
       },
       accounts: this.accounts.map(a => ({

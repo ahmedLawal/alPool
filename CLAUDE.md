@@ -137,6 +137,10 @@ never add IP/fingerprint spoofing or MITM — PRs adding them are rejected.
   keep-awake, self-update.
 - `scripts/sync-upstream.sh` + `scripts/install-local-sync.sh` — local, tested
   upstream synchronization and its six-hour macOS LaunchAgent installer.
+- `src/control-service.js` + `macos/` — shared backend control contract and the
+  native SwiftUI IO client. The app never owns proxy or credential logic.
+- `scripts/install-backend-agent.sh` — guarded headless backend LaunchAgent
+  installer; it refuses to replace a live listener without `--replace`.
 - Config knobs: `proxy` (host/port/apiKey), `upstream`, `switchThreshold`,
   `scheduler.*` thresholds, `retry.*`. See `config.example.json`.
 
