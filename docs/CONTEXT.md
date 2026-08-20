@@ -36,8 +36,8 @@ client.
 
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
-routing modes. Current version: **v1.5.83** (installed as a global symlink to
-`~/maxpool`, so `git pull` updates the running install).
+routing modes. Current version: **v1.7.1** (installed as a global symlink to
+`~/Sources/repo/Me/alPool`, so validated fast-forwards update the running install).
 
 **Recently shipped (2026-08-10/11):**
 - v1.5.80: routing modes (`balance`, `prefer-claude`, `prefer-zai`, `prefer-kimi`,
@@ -64,6 +64,23 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-08-20 · #20 — Known package branding conflicts are reconciled semantically
+
+**Context:** MaxPool v1.7.1 changed the upstream package version in the same JSON
+region where the personal fork carries its alPool name, command, scripts, and
+repository metadata. Git therefore stopped every local upstream sync even though
+the changes were compatible.
+**Decision:** When `package.json` is the sole unresolved path, perform a guarded
+three-way JSON merge after verifying the Git stages are MaxPool base, alPool fork,
+and MaxPool upstream. Preserve changes made on only one side, combine compatible
+object changes, and reject values changed differently on both sides. All other
+conflicts continue to fail closed. Integrate the validated MaxPool v1.7.1 merge
+while retaining alPool's identity.
+**Consequences:** Routine upstream version bumps no longer require manual conflict
+resolution, but genuine package or source conflicts cannot be silently accepted.
+The merged result still must pass dependency installation, tests, and lint before
+the personal `main` branch is pushed.
 
 ### 2026-08-20 · #19 — Density picker label is accessible but visually hidden
 

@@ -60,8 +60,16 @@ test('local sync validates a divergent merge before pushing personal main', asyn
     run('git', ['init', '-b', 'main', seed], temp);
     run('git', ['config', 'user.name', 'Test'], seed);
     run('git', ['config', 'user.email', 'test@example.com'], seed);
+    const basePackage = {
+      name: 'maxpool',
+      version: '1.0.0',
+      description: 'Upstream package',
+      bin: { maxpool: 'src/index.js' },
+      scripts: { test: 'node --test' },
+      repository: { type: 'git', url: 'https://example.com/maxpool.git' },
+    };
     await writeFile(join(seed, 'base.txt'), 'base\n');
-    await writeFile(join(seed, 'package.json'), '{"version":"1.0.0"}\n');
+    await writeFile(join(seed, 'package.json'), `${JSON.stringify(basePackage, null, 2)}\n`);
     run('git', ['add', 'base.txt', 'package.json'], seed);
     run('git', ['commit', '-m', 'base'], seed);
     run('git', ['remote', 'add', 'origin', origin], seed);
@@ -78,7 +86,10 @@ test('local sync validates a divergent merge before pushing personal main', asyn
     run('git', ['config', 'user.name', 'Test'], upstreamWork);
     run('git', ['config', 'user.email', 'test@example.com'], upstreamWork);
     await writeFile(join(upstreamWork, 'upstream.txt'), 'upstream\n');
-    await writeFile(join(upstreamWork, 'package.json'), '{"version":"1.1.0"}\n');
+    await writeFile(join(upstreamWork, 'package.json'), `${JSON.stringify({
+      ...basePackage,
+      version: '1.1.0',
+    }, null, 2)}\n`);
     run('git', ['add', 'upstream.txt', 'package.json'], upstreamWork);
     run('git', ['commit', '-m', 'upstream'], upstreamWork);
     run('git', ['push', 'origin', 'main'], upstreamWork);
@@ -127,13 +138,53 @@ test('local sync validates a divergent merge before pushing personal main', asyn
     run('git', ['pull', '--ff-only', 'origin', 'main'], checkout);
     run('git', ['config', 'user.name', 'Test'], checkout);
     run('git', ['config', 'user.email', 'test@example.com'], checkout);
+    const forkPackage = {
+      ...basePackage,
+      name: 'alpool',
+      version: '1.1.0',
+      description: 'Personal alPool package',
+      bin: { alpool: 'src/index.js' },
+      scripts: { ...basePackage.scripts, 'sync:upstream': 'bash scripts/sync-upstream.sh' },
+      repository: { type: 'git', url: 'https://example.com/alpool.git' },
+    };
+    await writeFile(join(checkout, 'package.json'), `${JSON.stringify(forkPackage, null, 2)}\n`);
+    run('git', ['add', 'package.json'], checkout);
+    run('git', ['commit', '-m', 'brand personal fork'], checkout);
+    run('git', ['push', 'origin', 'main'], checkout);
+
+    const nextUpstreamPackage = {
+      ...basePackage,
+      version: '1.2.0',
+      scripts: { ...basePackage.scripts, 'upstream:new': 'node upstream.js' },
+    };
+    await writeFile(join(upstreamWork, 'package.json'), `${JSON.stringify(nextUpstreamPackage, null, 2)}\n`);
+    run('git', ['add', 'package.json'], upstreamWork);
+    run('git', ['commit', '-m', 'upstream package update'], upstreamWork);
+    run('git', ['push', 'origin', 'main'], upstreamWork);
+
+    const resolvedRun = run('/bin/bash', [script], checkout, env);
+    assert.match(resolvedRun.stdout, /Resolving the known MaxPool-to-alPool package metadata conflict/);
+    run('git', ['fetch', 'origin', 'main'], checkout);
+    const resolvedPackage = JSON.parse(run('git', ['show', 'origin/main:package.json'], checkout).stdout);
+    assert.equal(resolvedPackage.name, 'alpool');
+    assert.equal(resolvedPackage.version, '1.2.0');
+    assert.equal(resolvedPackage.description, 'Personal alPool package');
+    assert.equal(resolvedPackage.bin.alpool, 'src/index.js');
+    assert.equal(resolvedPackage.scripts['sync:upstream'], 'bash scripts/sync-upstream.sh');
+    assert.equal(resolvedPackage.scripts['upstream:new'], 'node upstream.js');
+    assert.equal(resolvedPackage.repository.url, 'https://example.com/alpool.git');
+
+    run('git', ['pull', '--ff-only', 'origin', 'main'], checkout);
     await writeFile(join(checkout, 'conflict.txt'), 'personal version\n');
     run('git', ['add', 'conflict.txt'], checkout);
     run('git', ['commit', '-m', 'personal conflict'], checkout);
     run('git', ['push', 'origin', 'main'], checkout);
 
     await writeFile(join(upstreamWork, 'conflict.txt'), 'upstream version\n');
-    await writeFile(join(upstreamWork, 'package.json'), '{"version":"1.2.0"}\n');
+    await writeFile(join(upstreamWork, 'package.json'), `${JSON.stringify({
+      ...nextUpstreamPackage,
+      version: '1.3.0',
+    }, null, 2)}\n`);
     run('git', ['add', 'conflict.txt', 'package.json'], upstreamWork);
     run('git', ['commit', '-m', 'conflicting upstream'], upstreamWork);
     run('git', ['push', 'origin', 'main'], upstreamWork);
@@ -143,8 +194,8 @@ test('local sync validates a divergent merge before pushing personal main', asyn
     const failedStatus = JSON.parse(await readFile(statusPath, 'utf8'));
     assert.equal(failedStatus.state, 'failed');
     assert.equal(failedStatus.phase, 'merge');
-    assert.equal(failedStatus.installedVersion, '1.1.0');
-    assert.equal(failedStatus.availableVersion, '1.2.0');
+    assert.equal(failedStatus.installedVersion, '1.2.0');
+    assert.equal(failedStatus.availableVersion, '1.3.0');
     assert.match(failedStatus.error, /could not be merged/i);
     assert.equal(run('git', ['show', 'origin/main:conflict.txt'], checkout).stdout, 'personal version\n');
   } finally {

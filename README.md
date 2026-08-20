@@ -63,6 +63,9 @@ The live checkout is never modified by the sync job. Its log is at
 status record at `~/.local/state/alpool/upstream-sync.json`; the native app's
 Updates page shows the installed and latest upstream versions and reports fetch,
 merge, test, lint, or push failures without exposing log contents.
+The synchronizer safely reconciles the expected `package.json` version/branding
+conflict when it is the only conflict. Any unrelated or incompatible conflict
+still stops the update before validation or push.
 
 Run `npm run sync:upstream` for an immediate manual sync, or rerun
 `npm run sync:install` to reinstall the LaunchAgent. In alPool, open

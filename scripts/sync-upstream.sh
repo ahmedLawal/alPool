@@ -15,6 +15,7 @@ LOCK_DIR="${TMPDIR:-/tmp}/alpool-upstream-sync-${UID}.lock"
 WORKTREE=""
 WORKTREE_ADDED=0
 STATUS_WRITER="$SCRIPT_DIR/record-upstream-sync-status.mjs"
+PACKAGE_RESOLVER="$SCRIPT_DIR/resolve-upstream-package.mjs"
 STATUS_STATE="checking"
 STATUS_PHASE="initialize"
 INSTALLED_VERSION=""
@@ -166,10 +167,32 @@ git -C "$REPO_ROOT" worktree add --detach "$WORKTREE" "origin/$BRANCH" >/dev/nul
 WORKTREE_ADDED=1
 
 log "Merging upstream/$BRANCH in temporary worktree"
-git -C "$WORKTREE" \
+if ! git -C "$WORKTREE" \
   -c user.name="alPool local sync" \
   -c user.email="alpool-sync@localhost" \
-  merge --no-edit "upstream/$BRANCH"
+  merge --no-edit "upstream/$BRANCH"; then
+  UNRESOLVED="$(git -C "$WORKTREE" diff --name-only --diff-filter=U)"
+  if [[ "$UNRESOLVED" != "package.json" ]]; then
+    log "The upstream merge has unsupported conflicts:"
+    printf '%s\n' "$UNRESOLVED"
+    exit 1
+  fi
+
+  log "Resolving the known MaxPool-to-alPool package metadata conflict"
+  if ! (cd "$WORKTREE" && node "$PACKAGE_RESOLVER"); then
+    log "The package metadata conflict was not safe to resolve automatically."
+    exit 1
+  fi
+  git -C "$WORKTREE" add package.json
+  if [[ -n "$(git -C "$WORKTREE" diff --name-only --diff-filter=U)" ]]; then
+    log "The upstream merge still has unresolved conflicts."
+    exit 1
+  fi
+  git -C "$WORKTREE" \
+    -c user.name="alPool local sync" \
+    -c user.email="alpool-sync@localhost" \
+    commit --no-edit
+fi
 
 STATUS_PHASE="install"
 record_status
