@@ -164,6 +164,7 @@ private struct OverviewView: View {
                         Text("Detailed").tag(OverviewAccountDensity.detailed.rawValue)
                     }
                     .pickerStyle(.segmented)
+                    .labelsHidden()
                     .frame(width: 180)
                     SafetyLegend()
                 }

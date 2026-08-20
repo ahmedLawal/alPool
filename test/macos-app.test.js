@@ -25,6 +25,7 @@ test('macOS overview supports compact account cards and traffic-light quota safe
   const content = readFileSync(new URL('../macos/Sources/alPoolApp/ContentView.swift', import.meta.url), 'utf8');
   assert.match(content, /@AppStorage\("overviewAccountDensity"\)/);
   assert.match(content, /Picker\("Account detail"/);
+  assert.match(content, /\.pickerStyle\(\.segmented\)\s*\.labelsHidden\(\)/);
   assert.match(content, /Text\("Compact"\)/);
   assert.match(content, /Text\("Detailed"\)/);
   assert.match(content, /if density == \.detailed/);

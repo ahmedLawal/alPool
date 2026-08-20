@@ -65,6 +65,17 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-20 · #19 — Density picker label is accessible but visually hidden
+
+**Context:** The Compact/Detailed segmented picker rendered its “Account detail”
+label in the Accounts header. Constrained by the toggle and safety legend, the
+label wrapped into a malformed vertical column.
+**Decision:** Apply SwiftUI's native `labelsHidden()` modifier to the segmented
+picker, preserving its semantic label for accessibility while removing it from
+the visual layout.
+**Consequences:** The Accounts header contains only the intended title, density
+control, and safety legend without sacrificing the picker's accessible name.
+
 ### 2026-08-19 · #18 — Overview distinguishes quota safety from live serving
 
 **Context:** Uniform blue quota bars hid the difference between safe, caution,
