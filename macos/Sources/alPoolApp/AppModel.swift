@@ -10,6 +10,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var lastMessage: String?
     @Published private(set) var commandInFlight = false
 
+    let notifications = NotificationCoordinator()
+
     private var api: BackendAPI?
     private var pollingTask: Task<Void, Never>?
 
@@ -17,6 +19,7 @@ final class AppModel: ObservableObject {
 
     func start() async {
         guard pollingTask == nil else { return }
+        Task { [notifications] in await notifications.prepare() }
         do {
             let connection = try ConnectionLoader.load()
             api = BackendAPI(connection: connection)
@@ -36,7 +39,9 @@ final class AppModel: ObservableObject {
     func refresh(silent: Bool = false) async {
         guard let api else { return }
         do {
-            snapshot = try await api.snapshot()
+            let latest = try await api.snapshot()
+            snapshot = latest
+            await notifications.process(latest)
             connectionState = "Connected"
             if !silent { lastMessage = nil }
         } catch {

@@ -65,6 +65,23 @@ routing modes. Current version: **v1.7.1** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-21 · #21 — Native quota notifications follow confirmed state transitions
+
+**Context:** Quota safety and reset timing were visible in the native Overview,
+but Ahmed had to keep watching the app to know when an account crossed a risky
+usage level or became available after a reset.
+**Decision:** Evaluate the existing two-second control snapshots in a deterministic
+Swift core engine and deliver native macOS alerts from the SwiftUI IO client.
+Notify enabled accounts once when either quota window crosses 60%, 85%, or 100%,
+and notify a reset only when usage drops with an advanced/elapsed reset cycle.
+Persist the last observations, suppress the initial snapshot, and expose separate
+threshold/reset toggles plus permission status and a test action in a grouped
+Notifications page.
+**Consequences:** Alerts reuse the backend's normalized provider quota without
+moving quota logic or credentials into the app. Missing windows and unlimited
+weekly plans do not alert, relaunches do not replay warnings, and notifications
+continue after the window closes but stop if the alPool app process is quit.
+
 ### 2026-08-20 · #20 — Known package branding conflicts are reconciled semantically
 
 **Context:** MaxPool v1.7.1 changed the upstream package version in the same JSON

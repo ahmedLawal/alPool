@@ -84,6 +84,12 @@ hides request and token totals while retaining both quota windows; the selected
 view is remembered across launches. Accounts serving live requests receive a
 green outline and serving badge.
 
+The Notifications page controls native quota alerts. alPool notifies once when
+an enabled account crosses 60%, 85%, or 100% usage and again when a five-hour or
+weekly quota window resets. The first snapshot establishes a baseline, and that
+state is saved across launches so existing usage does not replay old alerts.
+Closing the app window keeps notifications active; quitting alPool stops them.
+
 ```bash
 npm run macos:test
 npm run macos:build

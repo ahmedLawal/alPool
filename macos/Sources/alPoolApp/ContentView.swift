@@ -7,6 +7,7 @@ private enum AppSection: String, CaseIterable, Identifiable {
     case activity = "Activity"
     case accounts = "Accounts"
     case routing = "Routing"
+    case notifications = "Notifications"
     case updates = "Updates"
     var id: Self { self }
     var symbol: String {
@@ -15,6 +16,7 @@ private enum AppSection: String, CaseIterable, Identifiable {
         case .activity: "waveform.path.ecg"
         case .accounts: "person.2"
         case .routing: "arrow.triangle.branch"
+        case .notifications: "bell"
         case .updates: "arrow.triangle.2.circlepath"
         }
     }
@@ -39,6 +41,7 @@ struct ContentView: View {
                     case .activity: ActivityView(snapshot: snapshot)
                     case .accounts: AccountsView(snapshot: snapshot)
                     case .routing: RoutingView(snapshot: snapshot)
+                    case .notifications: NotificationsView(coordinator: model.notifications)
                     case .updates: UpdatesView(snapshot: snapshot)
                     }
                 } else {
@@ -112,6 +115,81 @@ struct ContentView: View {
         .padding(.horizontal)
         .padding(.vertical, 7)
         .background(.bar)
+    }
+}
+
+private struct NotificationsView: View {
+    @ObservedObject var coordinator: NotificationCoordinator
+
+    var body: some View {
+        Form {
+            Section("Permission") {
+                LabeledContent("System notifications") {
+                    Label(coordinator.permissionState.rawValue, systemImage: permissionSymbol)
+                        .foregroundStyle(permissionColor)
+                }
+
+                if coordinator.permissionState == .denied {
+                    Button("Open notification settings") {
+                        coordinator.openNotificationSettings()
+                    }
+                } else if coordinator.permissionState == .notRequested {
+                    Button("Allow notifications") {
+                        Task { await coordinator.requestPermission() }
+                    }
+                }
+
+                Button("Send test notification") {
+                    Task { await coordinator.sendTestNotification() }
+                }
+                .disabled(coordinator.permissionState == .denied)
+            }
+
+            Section("Quota alerts") {
+                Toggle("Threshold alerts", isOn: Binding(
+                    get: { coordinator.thresholdAlertsEnabled },
+                    set: { enabled in coordinator.setThresholdAlertsEnabled(enabled) }
+                ))
+                Text("Notify when an enabled account crosses 60%, 85%, or 100% usage in its 5-hour or weekly window.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Reset alerts", isOn: Binding(
+                    get: { coordinator.resetAlertsEnabled },
+                    set: { enabled in coordinator.setResetAlertsEnabled(enabled) }
+                ))
+                Text("Notify when alPool confirms that a quota window has rolled over and usage has dropped.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Text("alPool checks quota with the existing two-second backend snapshot. Alerts are deduplicated across app relaunches. Closing the window keeps alerts active; quitting alPool stops them.")
+                    .foregroundStyle(.secondary)
+                if let error = coordinator.lastDeliveryError {
+                    Text(error).foregroundStyle(.red)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Notifications")
+        .task { await coordinator.refreshPermissionState() }
+    }
+
+    private var permissionSymbol: String {
+        switch coordinator.permissionState {
+        case .allowed: "checkmark.circle.fill"
+        case .denied: "exclamationmark.triangle.fill"
+        case .checking, .notRequested: "clock"
+        }
+    }
+
+    private var permissionColor: Color {
+        switch coordinator.permissionState {
+        case .allowed: .green
+        case .denied: .red
+        case .checking, .notRequested: .orange
+        }
     }
 }
 
