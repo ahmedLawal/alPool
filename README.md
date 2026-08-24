@@ -98,6 +98,9 @@ open dist/alPool.app
 
 The app discovers the linked `alpool` executable and asks it for safe local
 connection details. Provider and OAuth credentials remain inside the backend.
+When a readable Google Application Default Credentials file is available, the
+backend installer passes its path to the LaunchAgent so GCP Secret Manager-backed
+provider keys can resolve non-interactively after login or reboot.
 The backend LaunchAgent installer is intentionally guarded: while a service is
 already listening it exits without changing anything. The one-time switch from a
 terminal-owned service requires the explicit

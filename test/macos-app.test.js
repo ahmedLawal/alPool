@@ -62,6 +62,9 @@ test('backend LaunchAgent installer is guarded and valid', () => {
   assert.match(source, /No process was changed/);
   assert.match(source, /MODE" != "--replace"/);
   assert.match(source, /MAXPOOL_FORCE_SUPERVISOR/);
+  assert.match(source, /CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE/);
+  assert.match(source, /application_default_credentials\.json/);
+  assert.match(source, /\[\[ -r "\$GCLOUD_CREDENTIAL_FILE" \]\]/);
   assert.match(source, /SuccessfulExit/);
 });
 

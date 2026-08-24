@@ -65,6 +65,22 @@ routing modes. Current version: **v1.7.1** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-24 · #23 — Backend LaunchAgent receives explicit GCP credentials
+
+**Context:** Three enabled z.ai accounts remained `secret-unresolved` in the
+native app even though their Secret Manager entries existed and were readable
+from Ahmed's terminal. The backend LaunchAgent did not inherit the shell's
+`CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`; uncached secret lookups therefore used
+interactive gcloud credentials and could not reauthenticate from a headless job.
+**Decision:** At installation, detect the shell's explicit ADC override or the
+standard per-user Application Default Credentials file and add that readable
+path to the LaunchAgent environment. Keep the cache-first resolver unchanged and
+never copy credentials into the plist or repository.
+**Consequences:** GCP-backed provider secrets resolve after app-managed startup
+and login without an interactive prompt. Machines without a readable ADC file
+retain the existing cache/gcloud behavior, and the plist exposes only a local
+file path under mode 0600.
+
 ### 2026-08-24 · #22 — Activity timestamps render in the Mac's timezone
 
 **Context:** The native Activity page extracted the clock portion directly from
