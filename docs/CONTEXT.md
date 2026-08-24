@@ -36,7 +36,7 @@ client.
 
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
-routing modes. Current version: **v1.7.1** (installed as a global symlink to
+routing modes. Current version: **v1.10.2** (installed as a global symlink to
 `~/Sources/repo/Me/alPool`, so validated fast-forwards update the running install).
 
 **Recently shipped (2026-08-10/11):**
@@ -64,6 +64,25 @@ routing modes. Current version: **v1.7.1** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-08-24 · #24 — MaxPool v1.10.2 capacity and repair updates are integrated
+
+**Context:** The automatic upstream merge stopped at six overlapping hunks in
+`package.json`, `account-manager.js`, and `index.js`. MaxPool added its capacity
+ledger, executing-version reporting, drain-time state merge, and transcript
+repair fixes where alPool already carried branding, live activity capture, and
+native lifecycle integration. The new running-version test also imported Max's
+checkout through an absolute `/Users/maxkrasnykh/...` path; another capacity test
+failed the repository lint on an unused variable, and the live invariant utility
+still defaulted to the retired `teamclaude.state.json` filename.
+**Decision:** Merge the latest v1.10.2 release manually. Preserve alPool identity,
+activity subscriptions, and log branding while accepting the upstream capacity,
+boot-version, and safe drain-flush behavior. Make the running-version test import
+the repository-relative account manager, remove the unused test variable, and
+derive the invariant utility's default from the real configured state path.
+**Consequences:** alPool receives v1.8.0 through v1.10.2 without dropping its
+native IO features. Future source overlaps continue to fail closed, and the
+portable test correction should be proposed upstream to prevent recurrence.
 
 ### 2026-08-24 · #23 — Backend LaunchAgent receives explicit GCP credentials
 

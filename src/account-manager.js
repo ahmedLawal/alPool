@@ -1,4 +1,13 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { CapacityLedger } from './capacity-ledger.js';
+
+// Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
+// local table so account-manager does not import a private constant).
+const WINDOW_MS_BY_KIND = { ses: 5 * 3600_000, wk: 7 * 86400_000 };
+
+// A capacity window boundary must move by at least this much to count as a real
+// window ADVANCE rather than reset-stamp jitter (see noteCapacityWindowAdvance).
+const WINDOW_ADVANCE_EPSILON_MS = 60_000;
 import { peakWindowState, DEFAULT_PEAK_CAP } from './peak-window.js';
 
 // Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
@@ -332,6 +341,9 @@ export class AccountManager {
     this.preferredAccountName = null;
     this.sessionBindings = new Map();
     this._peakCache = null;   // per-UTC-minute peak-window memo (see _peakStateFor)
+    // CAPACITY LEDGER (2026-08-22): observed tokens per completed window cycle, so
+    // "true capacity" is comparable across providers. Restored from state on boot.
+    this.capacity = new CapacityLedger();
     this.sessionPolicies = new Map();
     this.upstreamThrottle = {
       until: null,
@@ -1058,9 +1070,14 @@ export class AccountManager {
     let changed = false;
     let session = false;
 
-    // Clear expired unified quotas
+    // Clear expired unified quotas. The capacity cycle closes HERE, before the stamp
+    // is nulled: this is the authoritative rollover moment, and it fires wherever the
+    // rollover is noticed (TUI render tick, every routed request) — not only on a
+    // prober sweep that happens to land inside the sub-second window before the stamp
+    // disappears (without this, OAuth cycles essentially never close: red-team 2026-08-22).
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[alPool] Account "${account.name}" session quota reset`);
+      this.capacity?.closeCycle?.(account.name, 'ses', q.unified5hReset, { resetAt: q.unified5hReset });
       q.unified5h = null;
       q.unified5hReset = null;
       changed = true;
@@ -1068,6 +1085,7 @@ export class AccountManager {
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[alPool] Account "${account.name}" weekly quota reset`);
+      this.capacity?.closeCycle?.(account.name, 'wk', q.unified7dReset, { resetAt: q.unified7dReset });
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -1914,6 +1932,10 @@ export class AccountManager {
   setAccountEnabled(index, enabled) {
     const account = this.accounts[index];
     if (!account) return false;
+    // CAPACITY LEDGER: a cycle that spent part of its life DISABLED did not get the
+    // chance to deliver its true capacity, so it is not a capacity observation —
+    // flag it partial (shown, excluded from the averages).
+    if (!enabled && account.enabled) this.capacity.markPartial(account.name, { disabled: true });
     account.enabled = Boolean(enabled);
     if (!enabled && account.name === this.preferredAccountName) {
       this.setRoutingMode('automatic');
@@ -2668,6 +2690,10 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
+    // CAPACITY LEDGER: prev stamps, so a probe observing the window ADVANCE closes
+    // the old cycle (the OAuth twin of the applyProviderUsage hook).
+    const prevSesReset = q.unified5hReset;
+    const prevWkReset = q.unified7dReset;
 
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = clamp01(usage.fiveHour.utilization);
@@ -2677,6 +2703,14 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt);
+    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt);
+    // Utilization readings feed the capacity ESTIMATE. The probe path passes per-window
+    // marks so the DELTA method can difference consecutive readings.
+    this.capacity.noteUtilizationObserved(Date.now(), [
+      { name: account.name, window: 'ses', utilization: usage.fiveHour?.utilization },
+      { name: account.name, window: 'wk', utilization: usage.sevenDay?.utilization },
+    ]);
     // Only a SUCCESSFUL probe carrying the flag speaks to this. A header-driven update
     // can't see the limits[] array, and a FAILED read knows nothing about the account's
     // caps — either one claiming "uncapped" would mislabel a capped account as having no
@@ -2787,6 +2821,11 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
+    // CAPACITY LEDGER: snapshot the previous reset stamps so a probe observing the
+    // window ADVANCE (new stamp) closes the capacity cycle at the old boundary —
+    // covers windows whose old stamp was never learned (clock-close can't fire).
+    const prevSesReset = q.providerSesReset;
+    const prevWkReset = q.providerWkReset;
     if (usage.error) {
       // Distinguish "no pollable quota" (Kimi) from a transient probe failure.
       // Never clear existing values on a transient error — let them age into the
@@ -2814,6 +2853,12 @@ export class AccountManager {
       q.weeklyAbsent = true;
     }
     q.lastProbeOkAt = Date.now();
+    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses?.resetAt);
+    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk?.resetAt);
+    this.capacity.noteUtilizationObserved(Date.now(), [
+      { name: account.name, window: 'ses', utilization: usage.ses?.utilization },
+      { name: account.name, window: 'wk', utilization: usage.wk?.utilization },
+    ]);
   }
 
   /**
@@ -2839,6 +2884,17 @@ export class AccountManager {
   updateQuota(accountIndex, headers) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // Utilization from RESPONSE HEADERS (every request) feeds the capacity estimate's
+    // delta marks too — header-driven moves arrive far more often than probe cycles.
+    const hdrU5 = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
+    const hdrU7 = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    if (!isNaN(hdrU5) || !isNaN(hdrU7)) {
+      this.capacity.noteUtilizationObserved(Date.now(), [
+        { name: account.name, window: 'ses', utilization: isNaN(hdrU5) ? undefined : clamp01(hdrU5) },
+        { name: account.name, window: 'wk', utilization: isNaN(hdrU7) ? undefined : clamp01(hdrU7) },
+      ]);
+    }
 
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
@@ -2947,6 +3003,118 @@ export class AccountManager {
         console.log(`[alPool] Account "${account.name}" at ${pct}% usage — limiting new placement (${reason})`);
       }
     }
+  }
+
+  /** Restore the ledger from persisted state. A BOOT GAP (the open cycle's last
+   *  accrual is far behind now) means maxpool was down for part of that cycle, so the
+   *  cycle is no longer a truthful capacity observation — flag it partial (B2/SC6).
+   *  It still displays; it is excluded from averages. */
+  restoreCapacityState(payload, now = Date.now(), downtimeMs = null) {
+    this.capacity = CapacityLedger.fromSerialized(payload);
+    // Partial is keyed on MAXPOOL'S OWN downtime, NEVER on the account's last request:
+    // an account parked >10min mid-cycle is normal fleet rotation, and keying on its
+    // last request discarded valid observations on every reload (red-team F3). The
+    // caller passes measured downtime (state mtime at save → boot now); when it
+    // cannot (a seamless reload handoff — the old worker was provably serving
+    // throughout), null skips the check entirely.
+    // 60s absorbs a restart's own turnaround; anything longer is real downtime, and
+    // it disqualifies EVERY open cycle (maxpool was not serving, so no account could
+    // deliver its true capacity) — the downtime is a property of the process, not of
+    // any one account's traffic.
+    if (!(downtimeMs > 60_000)) return;
+    const spannedDays = new Set();
+    for (let t = now - downtimeMs; t <= now; t += 3600_000) spannedDays.add(new Date(t).toISOString().slice(0, 10));
+    spannedDays.add(new Date(now).toISOString().slice(0, 10));
+    for (const name of this.capacity.accounts()) {
+      if (this.capacity.openCycle(name, 'ses') || this.capacity.openCycle(name, 'wk')) {
+        this.capacity.markPartial(name);
+      }
+      for (const day of spannedDays) this.capacity.markDayPartial(name, day);
+    }
+  }
+
+  /** Accrue ONE request's tokens into the capacity ledger (per-request values; the
+   *  server seam has already applied max-semantics for streamed output). */
+  /** The capacity ESTIMATE for an account+window, from live utilization. Falls back
+   *  to null when the vendor reports no utilization for that window (the no-weekly GLM
+   *  plans), the account has not accrued, or it is already throttled. */
+  capacityEstimate(accountIndex, window) {
+    const a = this.accounts[accountIndex];
+    if (!a) return null;
+    const q = a.quota || {};
+    const util = window === 'wk'
+      ? (a.type === 'provider' ? q.providerWk : q.unified7d)
+      : (a.type === 'provider' ? q.providerSes : q.unified5h);
+    return this.capacity.estimateFromUtilization(a.name, window, util) || null;
+  }
+
+  accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    this.capacity.accrue(account.name, { input, output });
+  }
+
+  /** Close any window cycle whose reset time has passed — CLOCK-AUTHORITATIVE, so a
+   *  stale or dead probe can never leave a cycle open and mis-attribute the next
+   *  window's tokens to it (pre-mortem M5; worst case is the no-weekly account whose
+   *  probe latches refreshDead). Safe to call on every render tick and prober tick. */
+  closeExpiredCapacityCycles(now = Date.now()) {
+    for (const a of this.accounts) {
+      const q = a.quota || {};
+      const pairs = a.type === 'provider'
+        ? [['ses', 'providerSesReset'], ['wk', 'providerWkReset']]
+        : [['ses', 'unified5hReset'], ['wk', 'unified7dReset']];
+      // Keep the open cycle's windowStartedAt fresh: a NEW reset stamp whose window
+      // start precedes the cycle's open means we joined mid-window (the absolute
+      // estimate is then only a lower bound — see the delta method).
+      for (const [win, stampKey] of pairs) {
+        const resetAt = q[stampKey];
+        const open = this.capacity.openCycle(a.name, win);
+        if (resetAt && open && open.startedAt > resetAt - WINDOW_MS_BY_KIND[win]) {
+          open.windowStartedAt = resetAt - WINDOW_MS_BY_KIND[win];
+        }
+      }
+      for (const [win, stampKey] of pairs) {
+        const resetAt = q[stampKey];
+        // Close ONLY. This path deliberately does NOT null the stamp: the rollover
+        // stays single-shot because closeCycle FOLDS a same-boundary repeat into the
+        // already-closed cycle (one boundary, one cycle), and the very next
+        // refreshExpiredQuotas / request-path _clearExpiredQuotas nulls the stamp with
+        // its full original side effects — the reset log, the `session` signal that
+        // drives _switchOnSessionReset, and the weekly `unifiedStatus` clear. Nulling
+        // here as well (round-2) made a prober-first notice silently swallow all of
+        // those whenever the sweep won the race (red-team round 3, RT3-1).
+        if (resetAt && now >= resetAt) {
+          this.capacity.closeCycle(a.name, win, resetAt, { resetAt });
+        }
+      }
+    }
+  }
+
+  /** Close a cycle because a probe observed the window ADVANCE (a new reset stamp) —
+   *  covers the case where the old stamp was never learned. */
+  noteCapacityWindowAdvance(accountName, window, prevResetAt, nextResetAt) {
+    if (!prevResetAt || !nextResetAt) return;
+    // TWO guards, both learned from live data (2026-08-23):
+    // 1. PAST stamp = a probe that answered late (its window rolled mid-request) or
+    //    vendor clock skew — honoring it closed a minutes-long "cycle" sliver. Close
+    //    at NOW instead: the window genuinely rolled, just later than the stale stamp.
+    // 2. JITTER: OAuth stamps derive per-response as Date.now()+delay*1000
+    //    (parseResetHeader), so one boundary reads ~2s later on every response; a
+    //    bare `>` comparison shredded one real 5h window into 9-10 fake cycles and
+    //    dated a "weekly" cycle a week into the future. A real advance moves a whole
+    //    window (>=5h) — the 60s epsilon separates it by three orders of magnitude.
+    //    Provider stamps (z.ai/Kimi probe) are absolute and never jitter.
+    const nowMs = Date.now();
+    // A close can never be dated in the FUTURE. An advance stamp legitimately points
+    // at the NEW window's reset (a fresh 5h away) — that is evidence the OLD window
+    // rolled, not the moment it rolled. Close at NOW (live 2026-08-23: a 3,658-token
+    // cycle was recorded as endedAt 4.9h in the future; the invariant checker caught
+    // it minutes later). `min` also floors the late-probe case (a stamp already
+    // expired) — endedAt is always within [start, now].
+    const boundary = Math.min(nextResetAt, nowMs);
+    if (boundary - prevResetAt < WINDOW_ADVANCE_EPSILON_MS) return;
+    this.capacity.closeCycle(accountName, window, boundary, { resetAt: prevResetAt });
   }
 
   /**
@@ -3561,6 +3729,12 @@ export class AccountManager {
       // Running version + npm update state (set at startup by maybeCheckForUpdate).
       // null until the check resolves; `current` is known even offline.
       version: this.versionInfo || null,
+      // The version whose CODE is EXECUTING. `version.current` is a package.json DISK
+      // read, so after a self-install (or on an npm-link'd checkout) it reports the
+      // newest INSTALLED build, not the running one — a post-deploy check keyed on it
+      // verifies the wrong thing (measured 2026-08-23: reported 1.8.7 while executing
+      // 1.8.6). This field is the one to assert on.
+      runningVersion: this.runningVersion || null,
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       routing: {

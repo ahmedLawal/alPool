@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
+import { stat } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, subscribeEventLog } from './event-log.js';
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
@@ -27,6 +28,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
   Math.max(1000, Number(process.env.MAXPOOL_FAMILY_ATTEMPT_TIMEOUT_MS) || 5000),
 );
 import { Prober } from './prober.js';
+import { CapacityLedger } from './capacity-ledger.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
@@ -34,7 +36,7 @@ import { ControlError, ControlService } from './control-service.js';
 import { readUpstreamSyncStatus } from './upstream-sync-status.js';
 import { ActivityFeed } from './activity-feed.js';
 import { resolveAccounts } from './account-config.js';
-import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine } from './updater.js';
+import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
@@ -586,6 +588,10 @@ async function serverWorkerCommand() {
     accountType: name => accountManager.accounts.find(account => account.name === name)?.type ?? null,
   });
   subscribeEventLog((message, metadata) => activityFeed.addMessage(message, metadata));
+  // The EXECUTING build: a disk read taken NOW, before any self-install can rewrite
+  // package.json. Fire-and-forget — the status endpoint reports null until it lands
+  // (milliseconds), never a wrong number.
+  captureBootVersion().then(v => { accountManager.runningVersion = v; }).catch(() => {});
   // (macOS) Keep the system awake ONLY while there is work in flight or queued, so a
   // long overnight streaming request survives Maintenance Sleep; the Mac sleeps
   // normally when idle. Disable via `preventSleep: false` in config.
@@ -617,6 +623,18 @@ async function serverWorkerCommand() {
   // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  if (savedState?.capacity) {
+    // Measured maxpool downtime = state-file last write → boot. A seamless reload
+    // worker's state was handed over live (no gap) → null skips the partial check.
+    let downtimeMs = null;
+    try {
+      if (!isReloadWorker) {
+        const st = await stat(getStatePath());
+        downtimeMs = Date.now() - st.mtimeMs;
+      }
+    } catch { downtimeMs = null; }
+    accountManager.restoreCapacityState(savedState.capacity, Date.now(), downtimeMs);
+  }
   // Runtime fallback providers (glm-fallback/kimi-fallback) are created lazily from
   // `cc all` request headers, not config — so without restoring them here a restart
   // shows only the config OAuth accounts until the next `cc all` request re-sends the
@@ -686,12 +704,47 @@ async function serverWorkerCommand() {
         // Runtime providers so glm-fallback/kimi-fallback survive a restart (they're
         // header-derived, not in config). Empty [] when none — harmless.
         runtimeProviders: accountManager.exportRuntimeProviders(),
+        // CAPACITY LEDGER (2026-08-22) rides the SAME payload on purpose: it inherits
+        // the writer lease, the generation guard and the serialized write chain. A
+        // separate file would need its own copy of all three (pre-mortem B2), and the
+        // OPEN cycle must persist or a mid-cycle restart records a near-empty cycle as
+        // a real capacity observation and poisons the averages forever (B1).
+        capacity: accountManager.capacity?.serialize?.() || null,
       },
       { expectedGeneration },
     )
       .then(written => { if (written != null) stateGeneration = written; })
       .catch(() => {});
   };
+  // CAPACITY LEDGER drain-exit merge-flush (B2). `capacityFlushSnapshot` is taken at
+  // the released worker's FINAL flush; everything accrued after it is drain-time work
+  // whose tokens would otherwise be discarded when this worker exits bare.
+  let capacityFlushSnapshot = null;
+  const mergeFlushCapacityDelta = async () => {
+    if (!capacityFlushSnapshot) return;
+    const after = accountManager.capacity?.serialize?.();
+    if (!after) return;
+    const disk = await loadState();
+    if (!disk) { // a failed read must not be "merged" into a quota-less state file (RT2-4)
+      console.error('[alPool] Capacity drain-flush skipped: state file unreadable — drain-time token delta not persisted.');
+      return;
+    }
+    const capacity = CapacityLedger.mergeDelta(disk.capacity, capacityFlushSnapshot, after);
+    // Re-write the FULL on-disk state with only `capacity` replaced: quota and
+    // runtimeProviders belong to the NEW worker now and must not be reverted to ours.
+    // No generation guard — we are deliberately amending a file another writer owns,
+    // and a same-instant race costs at most this drain's delta.
+    const { _generation, ...rest } = disk;
+    // NO generation bump: re-write the file at the SAME generation so the new
+    // worker's stateGeneration stays valid. saveState refuses a lower generation
+    // only — writing the observed one back is accepted and bumps nothing. Bumping
+    // here (the naive first version) wedged the new worker's periodic flush for its
+    // entire tenure: onDisk advanced past its stateGeneration and every guarded
+    // write was refused forever (red-team 2026-08-22).
+    await saveStateUnbumped({ ...rest, capacity }, _generation ?? 0);
+    await flushStateWrites();
+  };
+
   // Persist quota every minute; unref so it never keeps the process alive.
   let quotaSaveInterval = null;
 
@@ -1378,6 +1431,11 @@ async function serverWorkerCommand() {
       //    flipped hasLease=false, and persistQuotaState no-ops without the lease —
       //    so an unforced call here silently drops the reload's final quota flush.
       await persistQuotaState(true);
+      // 3b) CAPACITY LEDGER: snapshot what we had flushed. We keep serving in-flight
+      //     requests for up to RELOAD_DRAIN_MS after this, and those tokens are real
+      //     measured capacity — but the NEW worker owns the state file by then. At
+      //     exit we merge (now − this snapshot) onto whatever it has written (B2).
+      capacityFlushSnapshot = accountManager.capacity?.serialize?.() || null;
       // 4) Barrier: ensure every queued config write (a rotated-token persist is
       //    fire-and-forget) AND state write has actually hit disk before we hand
       //    off (M3 — otherwise the new worker boots from the invalidated token).
@@ -1407,14 +1465,22 @@ async function serverWorkerCommand() {
       // exit(0). Cap = RELOAD_DRAIN_MS (above the idle reaper) so a long streaming
       // response finishes instead of being cut; the supervisor SIGKILLs us only if
       // we outlive its (slightly longer) cap.
+      // Exit only AFTER folding the drain-time capacity delta into the new worker's
+      // state file. Bounded (1s) and best-effort: losing the delta is a measurement
+      // gap, hanging the released worker is an operational fault, so the timeout wins.
+      const exitAfterMergeFlush = () => {
+        Promise.race([mergeFlushCapacityDelta(), delay(1000)])
+          .catch(() => {})
+          .finally(() => process.exit(0));
+      };
       const waitForDrain = () => {
-        if (restartController.activeRequests.size === 0) { process.exit(0); return; }
+        if (restartController.activeRequests.size === 0) { exitAfterMergeFlush(); return; }
       };
       const drainPoll = setInterval(waitForDrain, 200);
       drainPoll.unref?.();
       const hardCap = setTimeout(() => {
         console.error(`[alPool] Released worker reload-drain cap reached with ${restartController.activeRequests.size} active; exiting.`);
-        process.exit(0);
+        exitAfterMergeFlush();
       }, RELOAD_DRAIN_MS);
       hardCap.unref?.();
       waitForDrain();

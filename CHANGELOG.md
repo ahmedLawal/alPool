@@ -5,6 +5,134 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.2] - 2026-08-24
+
+### Fixed
+
+- A thinking-only system turn was deleted; messages[0] guard kept the wrong role
+
+## [1.10.1] - 2026-08-24
+
+### Fixed
+
+- Transcript repair orphaned a mid-array system message, bricking the session
+
+## [1.10.0] - 2026-08-24
+
+### Added
+
+- DELTA-method estimates — exact mid-window, pre-join usage cancels
+
+## [1.9.0] - 2026-08-23
+
+### Added
+
+- Live capacity ESTIMATE from utilization — the page is useful from minute one
+
+## [1.8.9] - 2026-08-23
+
+### Fixed
+
+- RunningVersion populated at construction, not after the first update check
+
+## [1.8.8] - 2026-08-23
+
+### Fixed
+
+- Report the EXECUTING version, not the package.json disk read
+
+## [1.8.7] - 2026-08-23
+
+### Fixed
+
+- Future-endedAt repair at EVERY schema version, not just on v2→v3 migration
+
+## [1.8.6] - 2026-08-23
+
+### Fixed
+
+- V3 migration also clamps a FUTURE-dated endedAt to the cycle start
+
+## [1.8.5] - 2026-08-23
+
+### Fixed
+
+- The summary said '5 of 4 closed cycles'
+- The advance-close dated a cycle 4.9h in the FUTURE
+
+## [1.8.4] - 2026-08-23
+
+### Fixed
+
+- V3 migration demotes unverifiable history; span-based invariant catches the variants the floor missed
+
+## [1.8.3] - 2026-08-23
+
+### Fixed
+
+- Fix(capacity)+monitor: joined-mid-window first cycles are partial; live invariant checker wired into the 15-min health monitor
+
+## [1.8.2] - 2026-08-23
+
+### Fixed
+
+- A late probe's ALREADY-EXPIRED stamp closed a minutes-long sliver cycle
+
+## [1.8.1] - 2026-08-23
+
+### Changed
+
+- Pin the RT3-2 fold condition; de-vacuum J2's header assertion
+
+### Fixed
+
+- OAuth reset-stamp jitter shredded real windows into sliver cycles
+
+## [1.8.0] - 2026-08-22
+
+### Added
+
+- True-capacity ledger — observed tokens per completed cycle, TUI capacity page
+
+### Changed
+
+- Simplify pass — dedupe stamp-advance call sites, share the screen-write tail, drop dead tuple element and a vacuous loop
+
+### Fixed
+
+- Red-team round 1 — both close paths, unbumped merge write, downtime-based partial, calendar 7d window, stream-death accrual
+- Red-team round 2 — single-shot rollover, clock-anchored 7d window, same-boundary fold, weekly-close pin, narrow-width page
+- Red-team round 3 residuals — restore reset-log/session-signal path, fold only complete tails, fail-loud drain bail, pin M2/M4/M5
+- Pad-name truncation aligned every column — the round-3 RT3-4 residual
+
+## [1.7.1] - 2026-08-19
+
+### Fixed
+
+- Peak footer wording + spacing
+
+## [1.7.0] - 2026-08-19
+
+### Added
+
+- Peak settings are now visible and controllable from the routing screen
+
+## [1.6.1] - 2026-08-18
+
+### Fixed
+
+- Critic round 2 — setter coercion trap + a vacuous pin
+
+## [1.6.0] - 2026-08-18
+
+### Added
+
+- Peak-hour governance for provider accounts — de-preference + usage cap
+
+### Fixed
+
+- Red-team round 1 — 7 findings, all fixed and mutation-pinned
+
 ## [1.5.87] - 2026-08-18
 
 ### Changed

@@ -68,7 +68,10 @@ function rpad(s, w) {
   return gap > 0 ? s + ' '.repeat(gap) : s;
 }
 
-/** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
+/** Truncate a string with ANSI codes to exactly w visible characters, then reset.
+ *  The trailing RESET is appended only when something was actually cut — a no-op
+ *  truncate that unconditionally appended it shifted `.padEnd()` (raw-length) fields
+ *  4 columns narrow for every string shorter than the width (red-team round 3, RT3-4). */
 function truncate(s, w) {
   let visible = 0;
   let out = '';
@@ -82,7 +85,7 @@ function truncate(s, w) {
     visible++;
     i++;
   }
-  return out + RESET;
+  return visible < w ? out + ' '.repeat(w - visible) + RESET : out + RESET;
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
@@ -114,6 +117,16 @@ function quotaLabel(ratio, resetTs, width) {
   const full = rst ? `${pct} ${rst}` : pct;
   if (full.length <= width) return full;
   return (rst || pct).slice(0, width);
+}
+
+/** Compact token count for the capacity page. Tokens are the apples-to-apples unit
+ *  across Claude / GLM / Kimi, so the column must stay narrow and scannable. */
+function formatTokens(n) {
+  if (n == null) return '--';
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(n);
 }
 
 function formatMs(ms) {
@@ -258,7 +271,8 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | accounts | routing | select | input | confirm | providers | addtype
+    this.mode = 'normal';    // normal | accounts | routing | capacity | select | input | confirm | providers | addtype
+    this.capacityWindow = 'ses'; // capacity page window: 'ses' (5h) | 'wk' (weekly)
     // Hide disabled accounts from the table. With 8 dead/disabled accounts the live
     // ones scroll off the top; `h` collapses them to a one-line summary.
     this.hideDisabled = false;
@@ -409,6 +423,7 @@ export class TUI {
       case 'accounts': this._keyAccounts(k); break;
       case 'routing': this._keyRouting(k); break;
       case 'updates': this._keyUpdates(k); break;
+      case 'capacity': this._keyCapacity(k); break;
       case 'addtype': this._keyAddType(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
@@ -452,6 +467,8 @@ export class TUI {
       );
     } else if (k === 'u') {
       this.mode = 'updates';
+    } else if (k === 'y') {
+      this.mode = 'capacity';
     } else if (k === 'h') {
       this.hideDisabled = !this.hideDisabled;
       this._addLog(this.hideDisabled ? 'Hiding disabled accounts' : 'Showing all accounts');
@@ -1650,6 +1667,19 @@ export class TUI {
       lines.push(` ${cyan(' Parked')} ${dim(`${queuedCount} request${queuedCount === 1 ? '' : 's'} held  oldest ${formatMs(oldest)}  ·  ${why}`)}`);
     }
 
+    // ── Capacity page — a DEDICATED screen, not a footer panel. It replaces the
+    // account/activity body wholesale so the six columns get the full width; the
+    // header above (version, routing, throttle) stays so the operator never loses
+    // where they are. Reads the in-memory ledger only — no fs per frame.
+    if (this.mode === 'capacity') {
+      lines.push(...this._renderCapacityPage(W));
+      while (lines.length < H - 2) lines.push('');
+      lines.push(' ' + dim('─'.repeat(W - 2)));
+      lines.push(this._renderFooter());
+      this._writeScreen(lines, W, H);
+      return;
+    }
+
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
@@ -1748,7 +1778,12 @@ export class TUI {
     if (this.mode === 'updates') lines.push(...this._renderUpdatesDetail());
     lines.push(this._renderFooter());
 
-    // Write buffer
+    this._writeScreen(lines, W, H);
+  }
+
+  /** Full-screen buffer write: cursor home, H rows fitted to W, then hide the cursor
+   *  (shown only in input mode). */
+  _writeScreen(lines, W, H) {
     let buf = `${ESC}H`;
     for (let i = 0; i < H; i++) {
       buf += fitLine(lines[i] || '', W);
@@ -2010,10 +2045,121 @@ export class TUI {
     };
   }
 
+  _keyCapacity(k) {
+    if (k === 'w') { this.capacityWindow = this.capacityWindow === 'wk' ? 'ses' : 'wk'; }
+    else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  /**
+   * Capacity page — how much an account ACTUALLY delivers before it runs out.
+   *
+   * Each completed 5h/weekly cycle's token total IS that account's measured capacity
+   * for the window, so the columns compare a Claude account and a GLM account on the
+   * same axis. Only COMPLETE, never-disabled cycles count (a cycle maxpool sat out
+   * part of is an observation, not a capacity).
+   *
+   * The no-weekly account (legacy z.ai plan) has no weekly TANK to fill, so its weekly
+   * row is a rolling-7d THROUGHPUT — a volume, labelled as such, never a limit.
+   */
+  _renderCapacityPage(W) {
+    const out = [];
+    const win = this.capacityWindow === 'wk' ? 'wk' : 'ses';
+    const ledger = this.am.capacity;
+    const title = win === 'wk' ? 'Weekly (7d) capacity' : 'Session (5h) capacity';
+    out.push('');
+    out.push(` ${bold(title)}  ${dim('— tokens delivered per completed cycle, per account')}`);
+    out.push('');
+
+    if (!ledger) { out.push(yellow('  Capacity ledger unavailable on this worker.')); return out; }
+
+    // Narrow terminals: drop trailing columns rather than let fitLine chop a number
+    // mid-digit (at W=80 the full 6-column row is 82+ chars — every row silently lost
+    // its last two cells). The dropped ones are the aggregates, not the observations.
+    const ALL_COLS = ['Last', 'Prev', 'Prev-1', 'Avg 3', 'Avg 10', 'All time'];
+    const CW = 9;
+    const nameW = 12;
+    let COLS = ALL_COLS;
+    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 14) > W) {
+      COLS = COLS.slice(0, -1);
+    }
+    const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
+      + COLS.map(c => c.padStart(CW)).join('') + '  Cycles';
+    out.push(dimUnderline(fitLine(header, W)));
+
+    let anyData = false;
+    for (const i of this._displayOrder()) {
+      const a = this.am.accounts[i];
+      if (!a) continue;
+      if (this.hideDisabled && a.enabled === false) continue;
+      const noWeekly = win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent;
+      const name = truncate(a.name, nameW).padEnd(nameW);
+      const prov = gray(providerLabel(a).padEnd(PROVIDER_W));
+      if (noWeekly) {
+        // No weekly limit — the favourite legacy plan. There is no cycle to complete,
+        // so a capacity number would be a fiction. Show what it actually DID move.
+        const t = ledger.rollingThroughput(a.name, 7);
+        anyData = anyData || t.tokens > 0;
+        const vol = t.tokens > 0 ? formatTokens(t.tokens) : '--';
+        // Always disclose the window's age boundary: today is unfinished, so the 7d
+        // figure grows through the day; a genuinely partial day adds the ≤-observed floor.
+        const note = t.partial
+          ? ' (≤ observed — maxpool was down part of the window; includes today, in progress)'
+          : ' (includes today, in progress)';
+        out.push('  ' + name + ' ' + prov + ' '
+          + cyan(`no weekly limit · 7d volume ${vol}`) + dim(note));
+        continue;
+      }
+      const st = ledger.windowStats(a.name, win);
+      if (!st) {
+        // No completed cycle yet — but the vendor's own fullness reading still yields
+        // an ESTIMATE (tokens seen ÷ utilization): useful from minute one, honest about
+        // being an estimate. `~` marks it; a measured column replaces it after the first
+        // full window. A stale-util caveat only when we cannot prove same-window.
+        const est = this.am.capacityEstimate?.(i, win);
+        if (est) {
+          anyData = true;
+          const caveat = est.fresh ? '' : ' (utilization reading may be from the previous window)';
+          // ≥ = absolute method on a window we joined late: the true tank is at least
+          // this. No ≥ when the delta method fired — it is join-independent, or the
+          // window was observed from its start.
+          const op = est.lowerBound ? '≥' : '~';
+          const via = est.method === 'delta'
+            ? `Δ ${(est.utilization * 100).toFixed(0)}% full` : `${(est.utilization * 100).toFixed(0)}% full`;
+          out.push('  ' + name + ' ' + prov + ' ' + cyan(op + formatTokens(est.tokens).padStart(CW - 1))
+            + dim(` est from ${via}${caveat} — measured after this window completes`));
+        } else {
+          out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet'));
+        }
+        continue;
+      }
+      anyData = true;
+      const all = { Last: st.last, Prev: st.prev, 'Prev-1': st.prev1, 'Avg 3': st.avg3, 'Avg 10': st.avg10, 'All time': st.allTime };
+      const cells = COLS.map(c => formatTokens(all[c]).padStart(CW)).join('');
+      out.push('  ' + name + ' ' + prov + ' ' + cells + '  ' + dim(String(st.cycles)));
+    }
+
+    out.push('');
+    if (!anyData) {
+      // Fresh install: the page is honest about WHY it is empty and WHEN it fills,
+      // instead of showing zeros that read like an account delivering nothing.
+      out.push(' ' + yellow('No completed cycles yet.') + dim(
+        win === 'wk'
+          ? ' A weekly figure appears after an account\'s 7d window resets once.'
+          : ' A session figure appears after an account\'s 5h window resets once.'));
+    }
+    out.push(' ' + dim('A cycle counts only if maxpool ran for all of it and the account stayed enabled.'));
+    out.push(' ' + dim('~ = estimated from utilization; ≥ = at least this (window joined late); Δ = exact-by-difference; measured replaces both.'));
+    return out;
+  }
+
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
+      case 'capacity': {
+        const other = this.capacityWindow === 'wk' ? '5h session' : 'weekly (7d)';
+        return ` ${bold('w')} Show ${cyan(other)}  ${bold('Esc')} Back`;
+      }
       case 'updates': {
         const state = this._autoUpdateOn() ? green('on') : dim('off');
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
