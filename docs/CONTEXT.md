@@ -65,6 +65,18 @@ routing modes. Current version: **v1.7.1** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-08-24 · #22 — Activity timestamps render in the Mac's timezone
+
+**Context:** The native Activity page extracted the clock portion directly from
+the backend's ISO timestamp, so UTC values appeared unchanged even when the Mac
+used another timezone.
+**Decision:** Keep backend event timestamps canonical and convert them only in the
+SwiftUI presentation layer. Parse ISO timestamps with and without fractional
+seconds, apply `TimeZone.current`, and preserve the existing 24-hour `HH:mm:ss`
+row format.
+**Consequences:** Activity history follows timezone changes on the local Mac
+without changing backend events, API contracts, routing, or other clients.
+
 ### 2026-08-21 · #21 — Native quota notifications follow confirmed state transitions
 
 **Context:** Quota safety and reset timing were visible in the native Overview,

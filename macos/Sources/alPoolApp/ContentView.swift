@@ -345,17 +345,12 @@ private struct ActivityEventRow: View {
                 Text(event.message)
                     .font(.system(.body, design: .monospaced))
                     .textSelection(.enabled)
-                Text(timeLabel(event.timestamp))
+                Text(ActivityTimeFormatter.localTime(event.timestamp))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 3)
-    }
-
-    private func timeLabel(_ timestamp: String) -> String {
-        guard timestamp.count >= 19 else { return timestamp }
-        return String(timestamp.dropFirst(11).prefix(8))
     }
 }
 
