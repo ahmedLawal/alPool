@@ -86,3 +86,8 @@ test('generated app output and Swift build products stay out of git', () => {
   assert.match(ignore, /^dist\/$/m);
   assert.match(ignore, /^macos\/\.build\/$/m);
 });
+
+test('packaged app declares the principal macOS application class', () => {
+  const info = readFileSync(new URL('../macos/Resources/Info.plist', import.meta.url), 'utf8');
+  assert.match(info, /<key>NSPrincipalClass<\/key>\s*<string>NSApplication<\/string>/);
+});

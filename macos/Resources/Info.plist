@@ -20,6 +20,8 @@
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © 2026 Ahmed Lawal</string>
 </dict>
