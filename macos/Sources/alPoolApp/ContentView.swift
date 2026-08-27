@@ -5,6 +5,7 @@ import alPoolCore
 private enum AppSection: String, CaseIterable, Identifiable {
     case overview = "Overview"
     case activity = "Activity"
+    case capacity = "Capacity"
     case accounts = "Accounts"
     case routing = "Routing"
     case notifications = "Notifications"
@@ -14,6 +15,7 @@ private enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview: "gauge.with.dots.needle.67percent"
         case .activity: "waveform.path.ecg"
+        case .capacity: "fuelpump"
         case .accounts: "person.2"
         case .routing: "arrow.triangle.branch"
         case .notifications: "bell"
@@ -39,6 +41,7 @@ struct ContentView: View {
                     switch selection ?? .overview {
                     case .overview: OverviewView(snapshot: snapshot)
                     case .activity: ActivityView(snapshot: snapshot)
+                    case .capacity: CapacityView(snapshot: snapshot)
                     case .accounts: AccountsView(snapshot: snapshot)
                     case .routing: RoutingView(snapshot: snapshot)
                     case .notifications: NotificationsView(coordinator: model.notifications)
@@ -359,16 +362,152 @@ private func durationLabel(_ milliseconds: Double) -> String {
     return String(format: "%.1f s", milliseconds / 1_000)
 }
 
+private enum CapacityWindow: String {
+    case session
+    case weekly
+}
+
+private struct CapacityView: View {
+    let snapshot: ControlSnapshot
+    @AppStorage("capacityWindow") private var windowValue = CapacityWindow.session.rawValue
+
+    private var window: CapacityWindow {
+        CapacityWindow(rawValue: windowValue) ?? .session
+    }
+
+    private var enabledAccounts: [AccountStatus] {
+        snapshot.accounts.filter(\.enabled)
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Picker("Capacity window", selection: $windowValue) {
+                    Text("5 hour").tag(CapacityWindow.session.rawValue)
+                    Text("Weekly").tag(CapacityWindow.weekly.rawValue)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            Section("Enabled accounts") {
+                ForEach(enabledAccounts) { account in
+                    CapacityAccountRow(account: account, window: window)
+                }
+            }
+
+            Section {
+                Text("Capacity is estimated in tokens from observed usage: tokens delivered divided by how full the provider reported the window. Completed windows become measured samples; low-confidence readings are withheld.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("Capacity")
+    }
+}
+
+private struct CapacityAccountRow: View {
+    let account: AccountStatus
+    let window: CapacityWindow
+
+    private var info: CapacityWindowInfo? {
+        switch window {
+        case .session: account.capacity?.session
+        case .weekly: account.capacity?.weekly
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(account.name).font(.headline)
+                Text("· \(account.providerLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if info?.derived == true {
+                    Label("Derived", systemImage: "function")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if hasCapacityData {
+                Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 6) {
+                    GridRow {
+                        CapacityMetric(label: info?.derived == true ? "Estimated" : "Current", value: tokenCountLabel(info?.current), lowerBound: info?.current != nil && info?.lowerBound == true)
+                        CapacityMetric(label: "Latest measured", value: tokenCountLabel(info?.latest))
+                        CapacityMetric(label: "Measured average", value: tokenCountLabel(info?.average))
+                        CapacityMetric(label: "Samples", value: "\(info?.samples ?? 0)")
+                    }
+                }
+                if info?.derived == true {
+                    Text("No weekly limit · estimated from measured 5-hour capacity × 33.6")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let usage = info?.usage {
+                    Text("Current window \(usage.formatted(.percent.precision(.fractionLength(0)))) full")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(emptyMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var hasCapacityData: Bool {
+        info?.current != nil || info?.latest != nil || info?.average != nil
+    }
+
+    private var emptyMessage: String {
+        if window == .weekly, account.quota.weeklyAbsent == true {
+            return "Collecting complete 5-hour samples for the weekly estimate"
+        }
+        return "Collecting usage and completed-window samples"
+    }
+}
+
+private struct CapacityMetric: View {
+    let label: String
+    let value: String
+    var lowerBound = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text("\(lowerBound ? "≥" : "")\(value)")
+                .font(.body.weight(.semibold))
+                .monospacedDigit()
+        }
+    }
+}
+
+private func tokenCountLabel(_ value: Double?) -> String {
+    guard let value, value >= 0 else { return "—" }
+    if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+    if value >= 1_000 { return String(format: "%.0fK", value / 1_000) }
+    return String(format: "%.0f", value)
+}
+
 private struct AccountsView: View {
     @EnvironmentObject private var model: AppModel
     let snapshot: ControlSnapshot
     @State private var renameTarget: AccountStatus?
     @State private var renameValue = ""
     @State private var deleteTarget: AccountStatus?
+    @State private var capTarget: AccountStatus?
 
     var body: some View {
         List(snapshot.accounts) { account in
-            AccountCard(account: account, showsControls: true) {
+            AccountCard(
+                account: account,
+                showsControls: true,
+                canSetCap: snapshot.control.capabilities.setAccountCap == true,
+                capAction: { capTarget = account }
+            ) {
                 Task {
                     await model.send(.init(
                         type: "set-account-enabled",
@@ -406,6 +545,17 @@ private struct AccountsView: View {
             .padding(24)
             .frame(width: 420)
         }
+        .sheet(item: $capTarget) { account in
+            UsageCapEditor(account: account) { cap in
+                Task {
+                    await model.send(.init(
+                        type: "set-account-cap",
+                        payload: .init(name: account.name, capUtilization: cap)
+                    ))
+                }
+                capTarget = nil
+            }
+        }
         .confirmationDialog(
             "Delete \(deleteTarget?.name ?? "account")?",
             isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }),
@@ -421,6 +571,49 @@ private struct AccountsView: View {
         } message: {
             Text("This removes the account from alPool configuration. Provider secrets in GCP are left alone.")
         }
+    }
+}
+
+private struct UsageCapEditor: View {
+    let account: AccountStatus
+    let onSave: (Double?) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var enabled: Bool
+    @State private var percent: Int
+
+    init(account: AccountStatus, onSave: @escaping (Double?) -> Void) {
+        self.account = account
+        self.onSave = onSave
+        let existing = account.capUtilization
+        _enabled = State(initialValue: existing != nil)
+        _percent = State(initialValue: max(1, min(99, Int((existing ?? 0.50) * 100))))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Usage cap").font(.title2.bold())
+            Text(account.name).foregroundStyle(.secondary)
+
+            Toggle("Reserve capacity on this account", isOn: $enabled)
+            if enabled {
+                Stepper("Stop routing at \(percent)%", value: $percent, in: 1...99)
+                ProgressView(value: Double(percent), total: 100)
+            }
+            Text(enabled
+                 ? "alPool stops placing new requests on this account when either its 5-hour or weekly usage reaches \(percent)%."
+                 : "No account-specific cap. Normal routing thresholds apply.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Save") { onSave(enabled ? Double(percent) / 100 : nil) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
     }
 }
 
@@ -567,6 +760,8 @@ private struct AccountCard: View {
     var density = OverviewAccountDensity.detailed
     var hidesRoutineStatus = false
     var showsControls = false
+    var canSetCap = false
+    var capAction: (() -> Void)?
     var toggle: (() -> Void)?
 
     private var visibleStatus: String? {
@@ -597,6 +792,9 @@ private struct AccountCard: View {
                         .background(Color.green.opacity(0.14), in: Capsule())
                         .accessibilityLabel("\(account.inFlight) requests in flight")
                 }
+                if showsControls, canSetCap, let capAction {
+                    Button(capLabel, action: capAction)
+                }
                 if showsControls, let toggle {
                     Button(account.enabled ? "Disable" : "Enable", action: toggle)
                 }
@@ -625,6 +823,11 @@ private struct AccountCard: View {
                 .stroke(account.inFlight > 0 ? Color.green.opacity(0.75) : Color.clear, lineWidth: 1.5)
         }
         .opacity(account.enabled ? 1 : 0.65)
+    }
+
+    private var capLabel: String {
+        guard let cap = account.capUtilization else { return "Set cap" }
+        return "Cap \(Int((cap * 100).rounded()))%"
     }
 }
 

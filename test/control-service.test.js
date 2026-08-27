@@ -4,8 +4,8 @@ import { ControlError, ControlService } from '../src/control-service.js';
 
 function fixture() {
   const accounts = [
-    { name: 'claude', type: 'oauth', enabled: true, accountUuid: 'u1', inFlight: 0 },
-    { name: 'glm', type: 'provider', provider: 'zai', enabled: true, inFlight: 0 },
+    { name: 'claude', type: 'oauth', enabled: true, accountUuid: 'u1', capUtilization: null, inFlight: 0 },
+    { name: 'glm', type: 'provider', provider: 'zai', enabled: true, capUtilization: null, inFlight: 0 },
   ];
   const am = {
     accounts,
@@ -53,6 +53,7 @@ test('snapshot exposes safe control metadata', () => {
   const snapshot = service.snapshot();
   assert.equal(snapshot.control.automaticUpdates, false);
   assert.equal(snapshot.control.capabilities.addAccounts, false);
+  assert.equal(snapshot.control.capabilities.setAccountCap, true);
   assert.equal(typeof snapshot.control.backendPid, 'number');
   assert.equal(snapshot.upstreamSync.state, 'failed');
   assert.equal(snapshot.upstreamSync.installedVersion, '1.6.1');
@@ -95,4 +96,20 @@ test('automatic update command controls the complete update chain', async () => 
   assert.equal(config.updateCheck, true);
   assert.equal(config.autoUpdate, true);
   assert.equal(config.autoApply, true);
+});
+
+test('account cap command persists configured accounts and updates runtime state', async () => {
+  const { service, am, config } = fixture();
+  await service.execute({ type: 'set-account-cap', payload: { name: 'claude', capUtilization: 0.5 } });
+  assert.equal(config.accounts[0].capUtilization, 0.5);
+  assert.equal(am.accounts[0].capUtilization, 0.5);
+
+  await service.execute({ type: 'set-account-cap', payload: { name: 'claude', capUtilization: null } });
+  assert.equal('capUtilization' in config.accounts[0], false);
+  assert.equal(am.accounts[0].capUtilization, null);
+
+  await assert.rejects(
+    service.execute({ type: 'set-account-cap', payload: { name: 'claude', capUtilization: 1 } }),
+    error => error instanceof ControlError && error.code === 'invalid_command',
+  );
 });

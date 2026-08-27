@@ -65,6 +65,7 @@ export class ControlService {
           setRoutingMode: true,
           preferAccount: true,
           manageAccounts: true,
+          setAccountCap: true,
           addAccounts: false,
           syncAccounts: true,
           manageUpdates: true,
@@ -93,6 +94,8 @@ export class ControlService {
         return this._setProviderFallback(payload.provider, payload.policy);
       case 'set-account-enabled':
         return this._setAccountEnabled(payload.name, payload.enabled);
+      case 'set-account-cap':
+        return this._setAccountCap(payload.name, payload.capUtilization);
       case 'rename-account':
         return this._renameAccount(payload.name, payload.newName);
       case 'delete-account':
@@ -208,6 +211,35 @@ export class ControlService {
       throw error;
     }
     return this._success(`${enabled ? 'Enabled' : 'Disabled'} "${account.name}"`);
+  }
+
+  async _setAccountCap(name, value) {
+    const { account } = this._findAccount(String(name));
+    let cap = null;
+    if (value != null) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value >= 1) {
+        throw new ControlError('capUtilization must be a decimal greater than 0 and less than 1, or null to remove it.');
+      }
+      cap = value;
+    }
+
+    const location = this._configLocation(account);
+    const previous = account.capUtilization ?? null;
+    if (location) {
+      if (cap == null) delete this.config[location.array][location.index].capUtilization;
+      else this.config[location.array][location.index].capUtilization = cap;
+      try {
+        await this.persistConfig();
+      } catch (error) {
+        if (previous == null) delete this.config[location.array][location.index].capUtilization;
+        else this.config[location.array][location.index].capUtilization = previous;
+        throw error;
+      }
+    }
+    account.capUtilization = cap;
+    return this._success(cap == null
+      ? `Usage cap removed for "${account.name}"`
+      : `Usage cap set to ${Math.round(cap * 100)}% for "${account.name}"`);
   }
 
   async _renameAccount(name, newName) {

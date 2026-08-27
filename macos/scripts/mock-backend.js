@@ -14,7 +14,14 @@ const accounts = [
 
 function account(name, type, provider, session, weekly, status) {
   return {
-    name, type, provider, enabled: true, runtime: type === 'provider', status,
+    name, type, provider, enabled: true, capUtilization: null,
+    capacity: {
+      session: { current: 1_250_000, latest: 1_180_000, average: 1_210_000, samples: 4, usage: session, source: 'live', lowerBound: false, fresh: true, derived: false },
+      weekly: provider === 'kimi'
+        ? { current: 40_656_000, latest: null, average: null, samples: 4, usage: null, source: 'derived', lowerBound: false, fresh: null, derived: true }
+        : { current: 8_400_000, latest: 8_100_000, average: 8_250_000, samples: 3, usage: weekly, source: 'live', lowerBound: false, fresh: true, derived: false },
+    },
+    runtime: type === 'provider', status,
     refreshDead: false, inFlight: name.startsWith('glm') ? 1 : 0,
     completedRequests: 42, failedRequests: 1, lastStatus: 200, lastResponseMs: 890,
     lastError: null, cooldownUntil: null, rateLimitedUntil: null,
@@ -63,7 +70,7 @@ function snapshot() {
     control: {
       generatedAt: new Date().toISOString(), backendPid: process.pid, automaticUpdates,
       capabilities: {
-        setRoutingMode: true, preferAccount: true, manageAccounts: true, addAccounts: false,
+        setRoutingMode: true, preferAccount: true, manageAccounts: true, setAccountCap: true, addAccounts: false,
         syncAccounts: true, manageUpdates: true, restart: true, stop: true,
       },
     },
@@ -82,6 +89,10 @@ const server = http.createServer(async (req, res) => {
   if (command.type === 'set-account-enabled') {
     const target = accounts.find(item => item.name === command.payload.name);
     if (target) target.enabled = command.payload.enabled;
+  }
+  if (command.type === 'set-account-cap') {
+    const target = accounts.find(item => item.name === command.payload.name);
+    if (target) target.capUtilization = command.payload.capUtilization ?? null;
   }
   return json(res, 200, { ok: true, message: `Mock accepted ${command.type}` });
 });

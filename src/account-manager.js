@@ -3367,6 +3367,43 @@ export class AccountManager {
     };
   }
 
+  /** Safe, presentation-ready capacity summary for status/control clients. Capacity
+   *  remains token-based so Claude, GLM and Kimi can be compared on one axis. */
+  capacitySnapshot(accountIndex, window) {
+    const account = this.accounts[accountIndex];
+    if (!account) return null;
+
+    if (window === 'wk' && account.type === 'provider' && account.quota?.weeklyAbsent) {
+      const sessionTank = this.capacity.tankStats(account.name, 'ses');
+      return {
+        current: sessionTank?.n > 0 ? Math.round(sessionTank.avg * (7 * 24) / 5) : null,
+        latest: null,
+        average: null,
+        samples: sessionTank?.n ?? 0,
+        usage: null,
+        source: 'derived',
+        lowerBound: Boolean(sessionTank?.lowerBound),
+        fresh: null,
+        derived: true,
+      };
+    }
+
+    const measured = this.capacity.tankStats(account.name, window);
+    const live = this.capacityEstimate(accountIndex, window);
+    const liveUsable = live && live.utilization >= TANK_MIN_UTIL && live.fresh !== false;
+    return {
+      current: liveUsable ? live.tokens : null,
+      latest: measured?.last ?? null,
+      average: measured?.avg ?? null,
+      samples: measured?.n ?? 0,
+      usage: this._windowUtilization(account, window),
+      source: liveUsable ? 'live' : measured ? 'cycles' : null,
+      lowerBound: Boolean((liveUsable ? live.lowerBound : null) ?? measured?.lowerBound),
+      fresh: live ? Boolean(live.fresh) : null,
+      derived: false,
+    };
+  }
+
   accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
@@ -4126,6 +4163,10 @@ export class AccountManager {
         profiles: a.profiles,
         priority: a.priority,
         capUtilization: a.capUtilization ?? null,
+        capacity: {
+          session: this.capacitySnapshot(a.index, 'ses'),
+          weekly: this.capacitySnapshot(a.index, 'wk'),
+        },
         runtime: a.runtime,
         status: a.status,
         refreshDead: Boolean(a.refreshDead),

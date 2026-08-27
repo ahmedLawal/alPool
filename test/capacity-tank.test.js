@@ -264,3 +264,16 @@ test('T8b: the floor uses ALL complete windows, including reading-less ones', ()
   assert.ok(t, 'the contaminated reading still yields a tank');
   assert.equal(t.avg, 1_530_000, 'clamped to the physical floor: the 1.53M delivery');
 });
+
+test('T9: status exposes measured tank capacity for native clients', () => {
+  const m = new AccountManager([{
+    name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r',
+    expiresAt: Date.now() + 3600_000,
+  }]);
+  m.capacity = ledgerWithCycle({ tokens: 800_000, util: 0.8 });
+  const capacity = m.getStatus().accounts[0].capacity.session;
+  assert.equal(capacity.latest, 1_000_000);
+  assert.equal(capacity.average, 1_000_000);
+  assert.equal(capacity.samples, 1);
+  assert.equal(capacity.derived, false);
+});

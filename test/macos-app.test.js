@@ -53,6 +53,19 @@ test('macOS app restores the live TUI activity feed', () => {
   assert.match(content, /Request bodies and credentials are never shown/);
 });
 
+test('macOS app exposes tank capacity and per-account usage caps', () => {
+  const content = readFileSync(new URL('../macos/Sources/alPoolApp/ContentView.swift', import.meta.url), 'utf8');
+  const models = readFileSync(new URL('../macos/Sources/alPoolCore/Models.swift', import.meta.url), 'utf8');
+  assert.match(content, /case capacity = "Capacity"/);
+  assert.match(content, /private struct CapacityView/);
+  assert.match(content, /Latest measured/);
+  assert.match(content, /Measured average/);
+  assert.match(content, /private struct UsageCapEditor/);
+  assert.match(content, /type: "set-account-cap"/);
+  assert.match(models, /public let capacity: AccountCapacityInfo\?/);
+  assert.match(models, /public var capUtilization: Double\?/);
+});
+
 test('backend LaunchAgent installer is guarded and valid', () => {
   const script = new URL('../scripts/install-backend-agent.sh', import.meta.url);
   accessSync(script, constants.X_OK);

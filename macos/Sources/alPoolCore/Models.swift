@@ -109,6 +109,7 @@ public struct Capabilities: Decodable, Sendable {
     public let setRoutingMode: Bool
     public let preferAccount: Bool
     public let manageAccounts: Bool
+    public let setAccountCap: Bool?
     public let addAccounts: Bool
     public let syncAccounts: Bool
     public let manageUpdates: Bool
@@ -122,6 +123,8 @@ public struct AccountStatus: Decodable, Identifiable, Sendable {
     public let type: String
     public let provider: String?
     public let enabled: Bool
+    public let capUtilization: Double?
+    public let capacity: AccountCapacityInfo?
     public let runtime: Bool?
     public let status: String
     public let refreshDead: Bool
@@ -150,6 +153,23 @@ public struct AccountStatus: Decodable, Identifiable, Sendable {
         if refreshDead { return "Needs login" }
         return status.capitalized
     }
+}
+
+public struct AccountCapacityInfo: Decodable, Sendable {
+    public let session: CapacityWindowInfo?
+    public let weekly: CapacityWindowInfo?
+}
+
+public struct CapacityWindowInfo: Decodable, Sendable {
+    public let current: Double?
+    public let latest: Double?
+    public let average: Double?
+    public let samples: Int
+    public let usage: Double?
+    public let source: String?
+    public let lowerBound: Bool
+    public let fresh: Bool?
+    public let derived: Bool
 }
 
 public struct QuotaInfo: Decodable, Sendable {
@@ -202,6 +222,7 @@ public struct ControlCommand: Encodable, Sendable {
         public var enabled: Bool?
         public var provider: String?
         public var policy: String?
+        public var capUtilization: Double?
 
         public init(
             mode: String? = nil,
@@ -209,7 +230,8 @@ public struct ControlCommand: Encodable, Sendable {
             newName: String? = nil,
             enabled: Bool? = nil,
             provider: String? = nil,
-            policy: String? = nil
+            policy: String? = nil,
+            capUtilization: Double? = nil
         ) {
             self.mode = mode
             self.name = name
@@ -217,6 +239,7 @@ public struct ControlCommand: Encodable, Sendable {
             self.enabled = enabled
             self.provider = provider
             self.policy = policy
+            self.capUtilization = capUtilization
         }
     }
 

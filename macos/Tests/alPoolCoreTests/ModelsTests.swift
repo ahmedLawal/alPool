@@ -21,6 +21,20 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual((object?["payload"] as? [String: Any])?["mode"] as? String, "prefer-zai")
     }
 
+    func testDecodesAccountCapacityAndUsageCap() throws {
+        let data = Data(#"{"name":"glm","type":"provider","provider":"zai","enabled":true,"capUtilization":0.5,"capacity":{"session":{"current":1200000,"latest":1100000,"average":1150000,"samples":3,"usage":0.42,"source":"live","lowerBound":false,"fresh":true,"derived":false},"weekly":null},"runtime":true,"status":"active","refreshDead":false,"inFlight":0,"completedRequests":4,"failedRequests":0,"lastStatus":200,"lastResponseMs":900,"lastError":null,"cooldownUntil":null,"quota":{"unified5h":null,"unified5hReset":null,"unified7d":null,"unified7dReset":null,"providerSes":0.42,"providerSesReset":1770000000000,"providerWk":null,"providerWkReset":null,"weeklyAbsent":true},"weekly":{"state":"normal","rawState":"normal","effectiveUsage":null,"paceState":"normal"},"usage":{"totalInputTokens":10,"totalOutputTokens":5,"totalRequests":1},"rateLimitedUntil":null}"#.utf8)
+        let account = try JSONDecoder().decode(AccountStatus.self, from: data)
+        XCTAssertEqual(account.capUtilization, 0.5)
+        XCTAssertEqual(account.capacity?.session?.current, 1_200_000)
+        XCTAssertEqual(account.capacity?.session?.samples, 3)
+    }
+
+    func testCommandEncodesAccountCap() throws {
+        let command = ControlCommand(type: "set-account-cap", payload: .init(name: "glm", capUtilization: 0.75))
+        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(command)) as? [String: Any]
+        XCTAssertEqual((object?["payload"] as? [String: Any])?["capUtilization"] as? Double, 0.75)
+    }
+
     func testFinderSafeInvocationUsesNodeBesideAlPool() throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
