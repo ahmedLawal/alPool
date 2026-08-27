@@ -139,6 +139,18 @@ function formatMs(ms) {
   return `${min}m${String(rem).padStart(2, '0')}s`;
 }
 
+/** Coarse human duration for AGE and NEXT-REFRESH text: "45s", "12m", "2h".
+ *  Deliberately not formatMs — "quota 12m03s old" spends precision on a number
+ *  nobody reads to the second, and the extra digits are what made the old cell
+ *  look like machine output. */
+function formatAge(ms) {
+  if (ms == null || isNaN(ms) || ms < 0) return '';
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
+}
+
 function statusColor(status) {
   if (status == null) return '-';
   if (status >= 200 && status < 300) return green(String(status));
@@ -162,28 +174,89 @@ function countdown(ts) {
   return `${Math.ceil(ms / 86_400_000)}d`;
 }
 
+/** ACTIVITY cell — "is this account working, and is it healthy?" in plain words.
+ *  Rewritten twice on owner feedback (2026-08-27): first to symbols ("▶2 · 17/h ·
+ *  8.5s"), which read as secret code; now to words. Average latency is GONE —
+ *  "how long each request takes" is not something the owner acts on. An idle
+ *  account renders NOTHING.
+ *
+ *    2 live · 17 req/hr · 1 failed
+ *    17 req/hr                 working, idle this second
+ *    (blank)                   resting — nothing to say
+ */
 function loadText(load) {
-  const cur = load?.current || {};
-  const m15 = load?.last15m || {};
-  const h1 = load?.last1h || {};
-  // "Now" = what this account is handling right THIS moment: N in-flight requests
-  // (and their combined weight ~ payload size, the scheduler's load input). Kept
-  // distinct from the "15m"/"1h" THROUGHPUT counts that follow, which the old
-  // "Load X/Y" label collided with.
-  const inflight = cur.inFlight || 0;
-  const weight = cur.activeWeight || 0;
-  const now = weight > 0 ? `Now ${inflight} (${weight}w)` : `Now ${inflight}`;
-  const recent = `${m15.requests || 0}r`;
-  const recentAvg = m15.avgMs != null ? ` ${formatMs(m15.avgMs)}` : '';
-  const hour = `${h1.requests || 0}r`;
-  const fails = (m15.failed || 0) > 0 ? ` ${red(`${m15.failed}f`)}` : '';
-  return `${now}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
+  const inflight = load?.current?.inFlight || 0;
+  const hourReq = load?.last1h?.requests || 0;
+  const failed = load?.last15m?.failed || 0;
+  if (!inflight && !hourReq && !failed) return '';
+  const parts = [];
+  if (inflight) parts.push(`${inflight} live`);
+  if (hourReq) parts.push(`${hourReq} req/hr`);
+  if (failed) parts.push(red(`${failed} failed`));
+  return parts.join(' · ');
 }
 
-function weeklyPolicyText(am, account) {
+/** The usage CAP is an account PROPERTY, not a state — so it renders whenever one
+ *  is set, on every account type, whatever the account is doing. It previously
+ *  lived inline in the provider branch only, so the OAuth account the feature was
+ *  built for (max@gomokka.com) showed no cap anywhere: reported 2026-08-27, "I need
+ *  to be able to see whether an account has a cap or not." Yellow while the cap is
+ *  actively holding traffic back, dim otherwise. */
+function capText(a, benched) {
+  if (a?.capUtilization == null) return '';
+  const t = `cap ${Math.round(a.capUtilization * 100)}%`;
+  return benched ? yellow(t) : dim(t);
+}
+
+/** PER-ACCOUNT SETTINGS the user set by hand — the last column's whole job
+ *  (owner, 2026-08-27: "the last column should contain any and all settings that
+ *  are custom per account"). Fleet-wide settings (routing mode, peak policy) stay
+ *  in the top header where they already live; only what is scoped to THIS account
+ *  belongs on THIS row.
+ *    preferred   this account is the manual routing pin (the 'p' key)
+ *    cap NN%     its reserved-capacity ceiling (the 'c' key)
+ *  Deliberately NOT here: automatic routing policies (peak, fast-refill) — those
+ *  are the system's behaviour, not the user's settings; they keep their own tags.
+ */
+function settingsTags(am, a) {
+  const tags = [];
+  if (am?.routingMode === 'preferred' && a?.name === am.preferredAccountName) {
+    tags.push(cyan('preferred'));
+  }
+  const capTag = capText(a, capBenched(am, a));
+  if (capTag) tags.push(capTag);
+  return tags;
+}
+
+/** True when the reservation is what is currently keeping traffic off this account
+ *  — either window at or past the cap. Reads the manager's own predicate so the
+ *  label can never disagree with routing. */
+function capBenched(am, a) {
+  if (a?.capUtilization == null) return false;
+  const q = a.quota || {};
+  const ses = a.type === 'provider' ? q.providerSes : q.unified5h;
+  const wk = a.type === 'provider' ? q.providerWk : q.unified7d;
+  return !!(am?._capped?.(a, ses) || am?._capped?.(a, wk));
+}
+
+export function weeklyPolicyText(am, account) {
   if (!am?._weeklyState || !account || account.type === 'provider') return '';
   const state = am._weeklyState(account);
+  // USAGE CAP: the reservation outranks every tier label — a capped account is NOT
+  // exhausted, it's deliberately held, and labelling it "Wk exhausted 50%" (red team)
+  // while the bar shows half-full misstates the owner's own setting.
+  if (state === 'capped') {
+    return yellow(`Cap ${Math.round((account.capUtilization || 0) * 100)}%`);
+  }
   if (!state || state === 'unknown' || state === 'normal') return '';
+  // SAY IT ONCE (2026-08-27). An account Anthropic is rejecting outright already
+  // says so twice on this row: the Wk bar reads 100%, and the Status column reads
+  // "exhausted". A third "Wk exhausted 100%" tag was pure repetition, and it pushed
+  // the genuinely-informative tags (Cap, a per-model sub-limit) off to the right.
+  // Dropped ONLY when the Status column carries the same fact — a soft/reserve/
+  // critical row, or an exhausted-by-threshold row the status column shows as
+  // "active", still needs the tag.
+  if (am._isAccountWideRejected?.(account)) return '';
   const rawState = am._weeklyRawState?.(account) || state;
   const used = Number(account.quota?.unified7d);
   const pct = Number.isFinite(used)
@@ -191,7 +264,19 @@ function weeklyPolicyText(am, account) {
     : '';
   const paceOnly = state !== rawState && rawState !== 'exhausted';
   const label = paceOnly ? `Pace ${state}` : `Wk ${state}`;
-  const text = paceOnly ? label : `${label}${pct}`;
+  let text = paceOnly ? label : `${label}${pct}`;
+  // Critical-unlock visibility (2026-08-24): a red "Wk critical 96%" row that is
+  // ACTIVELY ROUTING must say why, or the user watches a benched-looking account
+  // hoover traffic with no explanation (the peak-shipped-invisible lesson).
+  if (state === 'critical') {
+    const u = am.criticalUnlockSummary?.(account);
+    if (u) {
+      const eta = u.etaMs != null ? ` ${(u.etaMs / 60000).toFixed(0)}m` : '';
+      text += u.reason === 'prereset'
+        ? ` ·drain${eta}`
+        : u.reason === 'pressure' ? ' ·relief' : ' ·peak-relief';
+    }
+  }
   if (state === 'critical' || state === 'exhausted') return state !== rawState ? yellow(text) : red(text);
   if (state === 'reserve') return yellow(text);
   return cyan(text);
@@ -642,6 +727,11 @@ export class TUI {
       this._startSelection('rename');
     } else if (k === 't' && this.am.accounts.length > 0) {
       this._startSelection('toggle');
+    } else if (k === 'u' && this.am.accounts.length > 0) {
+      // USAGE CAP (owner-directed 2026-08-26): reserve capacity — the proxy benches
+      // this account at the chosen % of both the 5h and weekly windows, keeping the
+      // rest for personal use. Enter 1-99 to set; enter 0 to remove (fully utilized).
+      this._startSelection('cap');
     } else if (k === 'd' && this.am.accounts.length > 0) {
       this._startSelection('delete');
     } else if (k === 'esc' || k === 'q') {
@@ -1031,6 +1121,15 @@ export class TUI {
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doRename(targetIdx, String(value || '').trim());
+      } else if (this.selAction === 'cap') {
+        const targetIdx = this.selIdx;
+        const current = account.name;
+        const existing = this.am.accounts[targetIdx]?.capUtilization;
+        this.mode = 'input';
+        this.inputPrompt = `Usage cap % for "${current}" (1-99, 0 = off, now ${existing ? Math.round(existing * 100) + '%' : 'off'})`;
+        this.inputBuf = '';
+        this.inputSensitive = false;
+        this.inputCb = value => this._doSetCap(targetIdx, String(value || '').trim());
       }
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
@@ -1206,6 +1305,49 @@ export class TUI {
   }
 
   // Rename an account in config and in the running manager.
+  /**
+   * USAGE CAP setter — persists to config (rollback on write failure) and applies
+   * live. `0` / `off` / `100` REMOVE the cap (fully utilized); 1-99 set it. Runtime
+   * providers (not in config) keep the cap in memory like their `enabled` flag —
+   * it rides state.json across restarts and must also survive `cc all` header
+   * re-upserts (the upsert guard in account-manager).
+   */
+  async _doSetCap(idx, raw) {
+    const account = this.am.accounts[idx];
+    if (!account) { this._addLog('Account no longer exists'); return; }
+    const v = String(raw || '').trim().toLowerCase();
+    const off = v === '' || v === '0' || v === 'off' || v === '100';
+    let pct = null;
+    if (!off) {
+      pct = parseInt(v, 10);
+      if (!Number.isInteger(pct) || pct < 1 || pct > 99) {
+        this._addLog(`Usage cap must be 1-99 (or 0 to remove) — got "${raw}"`);
+        return;
+      }
+    }
+    const cap = off ? null : pct / 100;
+
+    const loc = this._configLocation(account);
+    if (loc) {
+      const prev = this.config[loc.array][loc.index].capUtilization ?? null;
+      if (cap == null) delete this.config[loc.array][loc.index].capUtilization;
+      else this.config[loc.array][loc.index].capUtilization = cap;
+      try {
+        await this.saveConfig(this.config);
+      } catch (error) {
+        // rollback both config and (below) skip the live apply
+        if (prev == null) delete this.config[loc.array][loc.index].capUtilization;
+        else this.config[loc.array][loc.index].capUtilization = prev;
+        throw error;
+      }
+    }
+    // No loc: a runtime provider — in-memory + state.json persistence (same as enabled).
+    account.capUtilization = cap;
+    this._addLog(cap == null
+      ? `Usage cap removed for "${account.name}" — fully utilized`
+      : `Usage cap ${pct}% set for "${account.name}" — the proxy stops routing to it at ${pct}% of the 5h and weekly windows`);
+  }
+
   async _doRename(idx, newName) {
     const account = this.am.accounts[idx];
     if (this.control && account) {
@@ -1712,11 +1854,11 @@ export class TUI {
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
       }
-      // Glossary FOOTER (expands the abbreviations the header + inline labels can't
-      // spell out). Below the rows so it never breaks the header↔column alignment.
-      if (W >= 88) {
-        lines.push(' ' + dim('Legend  Ses = 5h · Wk = 7d · Now = in-flight (weight) · 15m/1h = served (avg · f = fails)'));
-      }
+      // The glossary FOOTER is gone (owner, 2026-08-27). A legend is a symptom: it
+      // exists to decode a row that could not be read on its own. Every cell now
+      // says what it means in words ("2 live · 17 req/hr", "quota 12m old ·
+      // refreshing in 45s"), so there is nothing left to decode — and one fewer
+      // line of chrome between the operator and the data.
     }
 
     // ── Activity header
@@ -1836,13 +1978,16 @@ export class TUI {
     if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
       effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
     }
-    // "blocked" = Anthropic is rejecting the WHOLE account (a 'rejected' unified
-    // status corroborated by an exhausted unified bucket). A per-model cap (Fable)
-    // is NOT account-wide — it shows as the separate "… maxed" tag, leaving the
-    // status column truthful. Keys on a.status (not effectiveStatus) so a genuine
-    // block wins even inside an upstream-throttle window.
+    // Anthropic is rejecting the WHOLE account (a 'rejected' unified status
+    // corroborated by an exhausted unified bucket). A per-model cap (Fable) is NOT
+    // account-wide — it shows as the separate "… maxed" tag, leaving the status
+    // column truthful. Keys on a.status (not effectiveStatus) so a genuine block
+    // wins even inside an upstream-throttle window.
+    // Named "exhausted", not "blocked" (2026-08-27): the row's own quota bar and
+    // every other surface call this state exhausted, and two words for one state
+    // read as two different problems.
     if (a.enabled !== false && a.status === 'active' && this.am._isAccountWideRejected?.(a)) {
-      effectiveStatus = 'blocked';
+      effectiveStatus = 'exhausted';
     }
     // A dead refresh token surfaces as "reauth" (re-login needed) rather than a
     // generic "error", so the user knows the fix. Display-only — account.status
@@ -1856,7 +2001,7 @@ export class TUI {
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'reauth':    status = yellow('reauth'); break;
-      case 'blocked':   status = red('blocked'); break;
+      case 'blocked':   status = red('exhausted'); break;
       case 'probing':   status = green('probing'); break;
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
@@ -1913,6 +2058,15 @@ export class TUI {
     }
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
+    // Per-account SETTINGS (preferred pin, usage cap), whatever the account is
+    // doing. weeklyPolicyText renders "Cap 50%" only while the cap is the ACTIVE
+    // weekly state; these are the standing properties, so a capped account that is
+    // exhausted, throttled or idle still says so. The cap is suppressed when the
+    // weekly tag already IS the Cap label (no double tag).
+    for (const tag of settingsTags(this.am, a)) {
+      if (weekly.includes('Cap ') && tag.includes('cap ')) continue;
+      line += `  ${tag}`;
+    }
     // Per-model weekly caps (e.g. Fable, while the unified weekly still has
     // headroom). Show the ACTUAL utilization — "Fable 90%" (yellow) while high but
     // still usable, "Fable maxed" (red) ONLY at genuine exhaustion. This is the
@@ -1935,7 +2089,8 @@ export class TUI {
     // cause (e.g. rate-limited) when a probe failure is on record — rather than imply
     // the last-known value is current.
     line += this._probeHealthNote(a);
-    line += `  ${dim(loadText(this._accountLoad(a)))}`;
+    const act = loadText(this._accountLoad(a));
+    if (act) line += `  ${dim(act)}`;
     return line;
   }
 
@@ -1967,10 +2122,35 @@ export class TUI {
       const headerFresh = q.lastHeaderQuotaAt && (Date.now() - q.lastHeaderQuotaAt) <= Math.max(3 * interval, 180_000);
       if (headerFresh) return '';
     }
-    const s = q.lastProbeErrorStatus;
-    if (s === 429) return `  ${yellow('stale·probe throttled')}`;
-    if (s) return `  ${yellow('stale·probe ' + s)}`;
-    return `  ${dim('stale')}`;
+    // SAY WHAT HAPPENS NEXT (owner, 2026-08-27): "stale" / "stale·probe throttled"
+    // named an internal mechanism and left the user with nothing to do. Nothing IS
+    // the correct action — the prober retries on its own schedule and backs off
+    // automatically when Anthropic rate-limits it — so the cell now states how old
+    // the numbers are AND when they refresh, in that order.
+    const age = q.lastProbeOkAt ? formatAge(Date.now() - q.lastProbeOkAt) : null;
+    const ageText = age ? `quota ${age} old` : 'quota not read yet';
+    const next = this._probeNextText();
+    const throttled = q.lastProbeErrorStatus === 429;
+    // Throttled is the ONE case worth colouring: it is why the refresh is late, and
+    // it self-clears. Everything else is a plain dim statement of fact.
+    const body = throttled
+      ? `${ageText} · rate-limited, retrying ${next}`
+      : `${ageText} · refreshing ${next}`;
+    return `  ${throttled ? yellow(body) : dim(body)}`;
+  }
+
+  /** "now" while a sweep is in flight, else "in 45s" from the prober's next-tick
+   *  stamp. Falls back to the configured interval when no sweep has completed yet
+   *  (fresh boot), and to a bare "shortly" when the probe is manual/off. */
+  _probeNextText() {
+    if (this.am.quotaProbeSweeping) return 'now';
+    const at = this.am.quotaProbeNextSweepAt;
+    if (at) {
+      const ms = at - Date.now();
+      return ms > 0 ? `in ${formatAge(ms)}` : 'now';
+    }
+    const interval = this.am.quotaProbeIntervalMs;
+    return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
   }
 
   _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
@@ -2001,6 +2181,13 @@ export class TUI {
         if (tier === 2) note += `  ${yellow(`peak·capped ${Math.round((wu ?? 0) * 100)}%`)}`;
         else if (tier === 1) note += wu == null ? `  ${dim('peak·cap n/a')}` : `  ${yellow('peak')}`;
       }
+      // FAST-REFILL tag (2026-08-25): mirrors the router's own _fastRefillMultiplier —
+      // the label cannot disagree with routing because it reads the same predicate.
+      // Only shown when a discount is actually applied (< 1).
+      if (a.quota?.weeklyAbsent && this.am._fastRefillMultiplier) {
+        const m = this.am._fastRefillMultiplier(a);
+        if (m < 1) note += `  ${cyan(`fast·refill ×${m.toFixed(2)}`)}`;
+      }
     } else if (q.providerQuotaSource === 'console-only') {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);
@@ -2012,15 +2199,26 @@ export class TUI {
       sesCell = emptyBar('probing', bw);
       wkCell = emptyBar('probing', bw);
     }
+    // Settings ride OUTSIDE the quota-readable branch: an account with an
+    // unreadable or not-yet-probed quota still HAS its reservation, and hiding the
+    // setting whenever the probe is quiet is how a shipped feature reads as absent.
+    for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
     let line = ` ${sel}${cur} ${name} ${type} ${status} Ses ${sesCell}`;
     if (showBoth) line += `  Wk  ${wkCell}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),
     // plus a compact Last <status> <ms> — the one signal that matters for a
-    // rarely-hit fallback (loadText reads 0r when idle).
-    line += `  ${dim(loadText(this._accountLoad(a)))}`;
-    if (a.lastStatus) line += `  ${dim('Last')} ${statusColor(a.lastStatus)} ${dim(formatMs(a.lastResponseMs))}`;
+    // rarely-hit fallback. loadText renders empty when fully idle.
+    const act = loadText(this._accountLoad(a));
+    if (act) line += `  ${dim(act)}`;
+    // "Last 200 6.4s" next to a live "17/h · 6.4s" said the same thing twice. Keep it
+    // for the two cases where it is the ONLY thing that speaks: a non-2xx last result
+    // (always worth seeing), or an idle row whose activity cell is blank.
+    const lastOk = a.lastStatus >= 200 && a.lastStatus < 300;
+    if (a.lastStatus && (!lastOk || !act)) {
+      line += `  ${dim('Last')} ${statusColor(a.lastStatus)} ${dim(formatMs(a.lastResponseMs))}`;
+    }
     // Header-derived generic rate-limit (distinct from the monitor-endpoint quota),
     // if the provider upstream returns x-ratelimit-* headers — only when present.
     if (q.genericLimit != null && q.genericRemaining != null) {
@@ -2066,89 +2264,81 @@ export class TUI {
     const win = this.capacityWindow === 'wk' ? 'wk' : 'ses';
     const ledger = this.am.capacity;
     const title = win === 'wk' ? 'Weekly (7d) capacity' : 'Session (5h) capacity';
+    const windowLabel = win === 'wk' ? '7d windows' : '5h windows';
     out.push('');
-    out.push(` ${bold(title)}  ${dim('— tokens delivered per completed cycle, per account')}`);
+    out.push(` ${bold(title)}  ${dim(`— tokens per ${windowLabel}, from completed cycles`)}`);
     out.push('');
 
     if (!ledger) { out.push(yellow('  Capacity ledger unavailable on this worker.')); return out; }
 
-    // Narrow terminals: drop trailing columns rather than let fitLine chop a number
-    // mid-digit (at W=80 the full 6-column row is 82+ chars — every row silently lost
-    // its last two cells). The dropped ones are the aggregates, not the observations.
-    const ALL_COLS = ['Last', 'Prev', 'Prev-1', 'Avg 3', 'Avg 10', 'All time'];
-    const CW = 9;
+    // Owner-specified table (2026-08-26): the same shape for BOTH views —
+    //   Current cycle (tokens + % used) · Prev cycle · Avg across all cycles · N cycles.
+    // Current is the live window (estimate while it runs; frozen into the columns at
+    // close). Prev/Avg/N are the completed-cycle history. The no-weekly account's
+    // weekly view approximates capacity as avg session tank × 33.6 (7×24/5h windows).
+    const ALL_COLS = ['Current', 'Prev', 'Avg', 'N'];
+    const CW = 11;
     const nameW = 12;
     let COLS = ALL_COLS;
     while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 14) > W) {
       COLS = COLS.slice(0, -1);
     }
     const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
-      + COLS.map(c => c.padStart(CW)).join('') + '  Cycles';
+      + COLS.map(c => c.padStart(CW)).join('');
     out.push(dimUnderline(fitLine(header, W)));
 
-    let anyData = false;
     for (const i of this._displayOrder()) {
       const a = this.am.accounts[i];
       if (!a) continue;
       if (this.hideDisabled && a.enabled === false) continue;
-      const noWeekly = win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent;
       const name = truncate(a.name, nameW).padEnd(nameW);
       const prov = gray(providerLabel(a).padEnd(PROVIDER_W));
-      if (noWeekly) {
-        // No weekly limit — the favourite legacy plan. There is no cycle to complete,
-        // so a capacity number would be a fiction. Show what it actually DID move.
-        const t = ledger.rollingThroughput(a.name, 7);
-        anyData = anyData || t.tokens > 0;
-        const vol = t.tokens > 0 ? formatTokens(t.tokens) : '--';
-        // Always disclose the window's age boundary: today is unfinished, so the 7d
-        // figure grows through the day; a genuinely partial day adds the ≤-observed floor.
-        const note = t.partial
-          ? ' (≤ observed — maxpool was down part of the window; includes today, in progress)'
-          : ' (includes today, in progress)';
+
+      // The no-weekly plan has NO weekly window to complete — its weekly "capacity" is
+      // derived: avg session tank × 33.6 (the number of 5h windows in 7 days). Shown as
+      // ≈ to mark the derivation; N is the count of session cycles it rests on.
+      if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
+        const sesTank = this.am.capacityTank?.(i, 'ses');
+        const approx = sesTank && sesTank.n > 0
+          ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
+        const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         out.push('  ' + name + ' ' + prov + ' '
-          + cyan(`no weekly limit · 7d volume ${vol}`) + dim(note));
+          + COLS.map(c => cellsByName[c].padStart(CW)).join('')
+          + dim('  no weekly limit · avg 5h × 33.6'));
         continue;
       }
+
+      const tank = this.am.capacityTank?.(i, win);
+      // A reading we cannot prove is from THIS window may describe the previous one —
+      // keep the number but never mark it live; it becomes a proper column at close.
+      const unprovenLive = tank?.source === 'live' && tank.fresh === false;
+      const util = this.am._windowUtilization?.(a, win);
+      const nowOpen = ledger.openCycle(a.name, win);
+
+      // Current = the live window: capacity estimate so far, tagged with how full the
+      // vendor says it is. `~` estimate-from-open-window, `≥` lower bound (joined late).
+      let cur = '--';
+      if (tank && !(tank.source === 'live' && unprovenLive)) {
+        cur = formatTokens(tank.avg);
+      } else if (nowOpen?.tokensSoFar > 0 && util > 0) {
+        cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
+      }
+      const curPct = util != null && cur !== '--' ? dim(`@${Math.round(util * 100)}%`) : '';
       const st = ledger.windowStats(a.name, win);
-      if (!st) {
-        // No completed cycle yet — but the vendor's own fullness reading still yields
-        // an ESTIMATE (tokens seen ÷ utilization): useful from minute one, honest about
-        // being an estimate. `~` marks it; a measured column replaces it after the first
-        // full window. A stale-util caveat only when we cannot prove same-window.
-        const est = this.am.capacityEstimate?.(i, win);
-        if (est) {
-          anyData = true;
-          const caveat = est.fresh ? '' : ' (utilization reading may be from the previous window)';
-          // ≥ = absolute method on a window we joined late: the true tank is at least
-          // this. No ≥ when the delta method fired — it is join-independent, or the
-          // window was observed from its start.
-          const op = est.lowerBound ? '≥' : '~';
-          const via = est.method === 'delta'
-            ? `Δ ${(est.utilization * 100).toFixed(0)}% full` : `${(est.utilization * 100).toFixed(0)}% full`;
-          out.push('  ' + name + ' ' + prov + ' ' + cyan(op + formatTokens(est.tokens).padStart(CW - 1))
-            + dim(` est from ${via}${caveat} — measured after this window completes`));
-        } else {
-          out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet'));
-        }
-        continue;
-      }
-      anyData = true;
-      const all = { Last: st.last, Prev: st.prev, 'Prev-1': st.prev1, 'Avg 3': st.avg3, 'Avg 10': st.avg10, 'All time': st.allTime };
-      const cells = COLS.map(c => formatTokens(all[c]).padStart(CW)).join('');
-      out.push('  ' + name + ' ' + prov + ' ' + cells + '  ' + dim(String(st.cycles)));
+      const cellsByName = {
+        Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
+        Prev: (st?.prev != null ? formatTokens(st.prev) : '--'),
+        Avg: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
+        N: (st ? String(st.cycles) : '--'),
+      };
+      const row = '  ' + name + ' ' + prov + ' '
+        + COLS.map(c => cellsByName[c].padStart(CW)).join('');
+      out.push(row + (curPct ? ' ' + curPct : ''));
     }
 
     out.push('');
-    if (!anyData) {
-      // Fresh install: the page is honest about WHY it is empty and WHEN it fills,
-      // instead of showing zeros that read like an account delivering nothing.
-      out.push(' ' + yellow('No completed cycles yet.') + dim(
-        win === 'wk'
-          ? ' A weekly figure appears after an account\'s 7d window resets once.'
-          : ' A session figure appears after an account\'s 5h window resets once.'));
-    }
-    out.push(' ' + dim('A cycle counts only if maxpool ran for all of it and the account stayed enabled.'));
-    out.push(' ' + dim('~ = estimated from utilization; ≥ = at least this (window joined late); Δ = exact-by-difference; measured replaces both.'));
+    out.push(' ' + dim('Capacity = tokens ÷ how full the provider said the window was, at close.'));
+    out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
     return out;
   }
 

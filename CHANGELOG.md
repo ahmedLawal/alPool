@@ -5,6 +5,90 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-08-27
+
+### Changed
+
+- Plain-words account rows — settings column, self-explaining staleness, no legend
+
+## [1.16.0] - 2026-08-27
+
+### Changed
+
+- Account-row cleanup — cap visible everywhere, exhausted vocabulary, quiet-when-idle activity cell
+
+## [1.15.0] - 2026-08-26
+
+### Added
+
+- Per-account usage cap — reserve capacity, never exhaust the account
+
+### Fixed
+
+- Capacity table — numbers only, % lives with Current
+
+## [1.14.0] - 2026-08-26
+
+### Added
+
+- Capacity page rebuilt to the owner's table spec
+
+## [1.13.2] - 2026-08-26
+
+### Fixed
+
+- Physical floor — a tank can never be smaller than a past delivery
+
+## [1.13.1] - 2026-08-25
+
+### Fixed
+
+- Share the rounding floor + render restored readings
+
+## [1.13.0] - 2026-08-25
+
+### Added
+
+- TANK — tokens ÷ utilization is the limit, not delivered tokens
+
+### Changed
+
+- 5 unused-var fixes (1 new, 4 pre-existing) — CI green for the first time since v1.11.1
+
+### Fixed
+
+- Relative import — the absolute home path made CI fail on every run (20 consecutive reds since v1.11.1, invisible locally)
+
+## [1.12.0] - 2026-08-25
+
+### Added
+
+- Fast-refill discount for no-weekly-limit plans
+
+## [1.11.1] - 2026-08-25
+
+### Added
+
+- Live now-column on the capacity page — '▸ 118k' ticks with every request
+
+## [1.11.0] - 2026-08-24
+
+### Added
+
+- Situational critical unlock — dying capacity drains, congested fleets get relief, peak is available behind a flag
+
+## [1.10.4] - 2026-08-24
+
+### Added
+
+- Weekly view for no-weekly plans — session-derived ceiling + retire the dead wk cycle
+
+## [1.10.3] - 2026-08-24
+
+### Fixed
+
+- Read-time junk floor — a sub-window 'complete' cycle never reaches the columns
+
 ## [1.10.2] - 2026-08-24
 
 ### Fixed

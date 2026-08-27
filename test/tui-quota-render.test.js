@@ -59,23 +59,167 @@ test('an inactive scoped cap shows no tag (matches the routing gate)', () => {
   assert.doesNotMatch(line, /Fable/);
 });
 
+// ── cap VISIBILITY (2026-08-27): "I need to be able to see whether an account
+//    has a cap or not" — the tag must render on ANY account type in ANY state.
+
+test('a capped OAuth account shows its cap even while upstream-exhausted', () => {
+  // The exact shape of the reported miss: max@gomokka.com at 7d=1.00 'rejected'
+  // renders via the exhausted paths, and the cap tag lived only in the provider
+  // branch — so the account the feature was BUILT for showed no cap anywhere.
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.quota.unified5h = 0;
+  a.quota.unified7d = 1.0;
+  a.quota.unifiedStatus = 'rejected';
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/, 'the reservation is visible');
+  assert.doesNotMatch(line, /blocked/, 'and the status says exhausted, the shared vocabulary');
+  assert.match(line, /exhausted/);
+  // and while the cap is what is holding traffic back, the tag is YELLOW (alarm),
+  // not dim — pinned on the raw ANSI so a color swap can't slip through strip().
+  assert.match(tui._renderAcct(0, 11, true), /\x1b\[33mcap 50%/);
+});
+
+test('a capped account below its cap shows the cap dim, not alarming', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.quota.unified5h = 0.1;
+  a.quota.unified7d = 0.2;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/);
+});
+
+// ── the last column = PER-ACCOUNT SETTINGS only (owner, 2026-08-27) ──────────
+
+test('the manually-preferred account is labelled on its own row', () => {
+  // "where this stuff applies to a specific account, it should be shown there per
+  // account" — the preference was only visible in the top header, so the row that
+  // is actually pinned looked identical to every other row.
+  const am = oauthAM();
+  am.routingMode = 'preferred';
+  am.preferredAccountName = 'a1';
+  const tui = new TUI({ accountManager: am });
+  assert.match(strip(tui._renderAcct(0, 11, true)), /preferred/, 'the pinned row says so');
+  assert.doesNotMatch(strip(tui._renderAcct(1, 11, true)), /preferred/, 'and no other row does');
+});
+
+test('no preference set → no row claims to be preferred', () => {
+  const am = oauthAM();
+  am.routingMode = 'automatic';
+  am.preferredAccountName = 'a1';   // stale name, mode is automatic
+  const tui = new TUI({ accountManager: am });
+  assert.doesNotMatch(strip(tui._renderAcct(0, 11, true)), /preferred/,
+    'the tag follows the MODE, not a leftover name');
+});
+
+test('both settings render together on one account', () => {
+  const am = oauthAM();
+  am.routingMode = 'preferred';
+  am.preferredAccountName = 'a1';
+  am.accounts[0].capUtilization = 0.5;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /preferred/);
+  assert.match(line, /cap 50%/);
+});
+
+// ── staleness says WHAT HAPPENS NEXT (owner, 2026-08-27) ─────────────────────
+
+test('an in-flight sweep reads "refreshing now", not a countdown', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.accounts[0].quota.unified5h = 0.4;
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
+  am.quotaProbeSweeping = true;                       // the prober publishes this
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /refreshing now/, 'a running sweep is the answer to "what next"');
+});
+
+test('a quiet prober names the concrete next refresh time', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.accounts[0].quota.unified5h = 0.4;
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
+  am.quotaProbeSweeping = false;
+  am.quotaProbeNextSweepAt = Date.now() + 45_000;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /refreshing in 45s/, 'a time the user can wait out');
+  assert.doesNotMatch(line, /stale/, 'never the old bare jargon');
+});
+
+test('the age is a real elapsed reading, not a fixed string', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.accounts[0].quota.unified5h = 0.4;
+  am.quotaProbeNextSweepAt = Date.now() + 30_000;
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 12 * 60_000;
+  assert.match(strip(new TUI({ accountManager: am })._renderAcct(0, 11, true)), /quota 12m old/);
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 2 * 3600_000;
+  assert.match(strip(new TUI({ accountManager: am })._renderAcct(0, 11, true)), /quota 2h old/);
+});
+
+test('an uncapped account shows no cap tag', () => {
+  const am = oauthAM();
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.doesNotMatch(line, /cap \d/);
+});
+
+test('a capped provider whose quota has not been read STILL shows the cap', () => {
+  // The provider branch gated the tag on quota readability — an unprobed account
+  // kept its reservation invisible.
+  const am = new AccountManager([
+    { name: 'p', type: 'provider', provider: 'zai', authToken: 'zt', upstream: 'https://z', capUtilization: 0.5 },
+  ], 0.90);
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/);
+});
+
+// ── SAY IT ONCE (2026-08-27): "if an account is exhausted I already see this in
+//    the relevant quota column" — drop the third repetition of that fact.
+
+test('an upstream-rejected account drops the redundant "Wk exhausted" tag', () => {
+  const am = oauthAM();
+  am.accounts[0].quota.unified5h = 0.3;
+  am.accounts[0].quota.unified7d = 1.0;
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.doesNotMatch(line, /Wk exhausted/, 'status column + bar already say it');
+  assert.match(line, /exhausted/, 'the status column DOES say it');
+});
+
+test('a soft-tier account keeps its weekly tag — only true repetition is dropped', () => {
+  const am = oauthAM();
+  am.accounts[0].quota.unified5h = 0.3;
+  am.accounts[0].quota.unified7d = 0.70;   // above the 0.65 soft threshold
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /Wk soft 70%/);
+});
+
 // ── staleness marker answers "how do you know it's refreshed?" ────────────────
 
-test('a stale probe marks the scoped tag "stale"; a fresh one does not', () => {
+test('an aged probe says how old the quota is and when it refreshes; a fresh one says nothing', () => {
   const am = oauthAM();
   am.quotaProbeIntervalMs = 60_000;
   am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.90, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
   const tui = new TUI({ accountManager: am });
 
   // Fresh (just applied) → no stale marker.
-  assert.doesNotMatch(strip(tui._renderAcct(0, 11, true)), /stale/);
+  assert.doesNotMatch(strip(tui._renderAcct(0, 11, true)), /quota .* old/);
 
   // Age the last successful probe past 2x the interval.
   am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
-  assert.match(strip(tui._renderAcct(0, 11, true)), /stale/, 'aged probe → explicit stale marker');
+  assert.match(strip(tui._renderAcct(0, 11, true)), /quota \d+m old · refreshing/,
+    'aged probe → says how old the numbers are AND when they refresh');
 });
 
-test('a refreshDead (reauth) account suppresses the redundant stale·probe echo', () => {
+test('a refreshDead (reauth) account suppresses the redundant probe-age echo', () => {
   const am = oauthAM();
   am.quotaProbeIntervalMs = 60_000;
   am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.11, severity: 'normal', isActive: true, resetAt: Date.now() + 3 * DAY } } });
@@ -85,7 +229,7 @@ test('a refreshDead (reauth) account suppresses the redundant stale·probe echo'
   am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
   am.accounts[0].refreshDead = true;
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.doesNotMatch(line, /stale/, 'the "reauth" status already tells the story — no stale·probe echo');
+  assert.doesNotMatch(line, /quota .* old/, 'the "reauth" status already tells the story — no probe-age echo');
 });
 
 test('a LIVE account still surfaces a real failing-probe signal (not over-suppressed)', () => {
@@ -97,7 +241,7 @@ test('a LIVE account still surfaces a real failing-probe signal (not over-suppre
   // NOT refreshDead, NOT disabled, no live response-header traffic → a self-throttling
   // probe is a real signal (this is the idle / no-recent-header case).
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.match(line, /stale·probe throttled/, 'a live account keeps its actionable probe signal');
+  assert.match(line, /rate-limited, retrying/, 'a live account keeps the signal — and says it self-heals');
 });
 
 test('a busy OAuth account (bars fresh from response headers) is NOT flagged stale when only its background probe is 429-throttled', () => {
@@ -109,7 +253,7 @@ test('a busy OAuth account (bars fresh from response headers) is NOT flagged sta
   am.accounts[0].quota.lastProbeErrorStatus = 429;
   am.accounts[0].quota.lastHeaderQuotaAt = Date.now();           // live traffic just refreshed the bars
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.doesNotMatch(line, /stale/, 'header-fresh bars + no probe-only scoped cap → no misleading stale marker');
+  assert.doesNotMatch(line, /quota .* old/, 'header-fresh bars + no probe-only scoped cap → no misleading age marker');
 });
 
 test('a probe-only scoped cap still reads stale on a stale probe even when the unified bars are header-fresh', () => {
@@ -120,7 +264,7 @@ test('a probe-only scoped cap still reads stale on a stale probe even when the u
   am.accounts[0].quota.lastProbeErrorStatus = 429;
   am.accounts[0].quota.lastHeaderQuotaAt = Date.now();           // unified bars fresh, but Fable% is probe-ONLY
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.match(line, /stale·probe throttled/, 'a displayed scoped cap is probe-only → still warn');
+  assert.match(line, /rate-limited, retrying/, 'a displayed scoped cap is probe-only → still warn');
 });
 
 test('automatic mode marks accounts SERVING right now (inFlight>0) with ►, not the last-routed idle one', () => {
@@ -199,7 +343,7 @@ test('a provider account stays probe-only — a stale probe still reads stale, h
   am.accounts[1].quota.lastProbeErrorStatus = 429;
   am.accounts[1].quota.lastHeaderQuotaAt = Date.now();           // must be IGNORED for a provider (bars are probe-only)
   const line = strip(new TUI({ accountManager: am })._renderAcct(1, 11, true));
-  assert.match(line, /stale·probe throttled/, 'provider bars are probe-only → header stamp must not suppress');
+  assert.match(line, /rate-limited, retrying/, 'provider bars are probe-only → header stamp must not suppress');
 });
 
 // ── Ask A: providers show Ses/Wk like the rest ────────────────────────────────
@@ -400,16 +544,11 @@ test('the abbreviation glossary is a FOOTER below the rows, never between the he
   const flat = strip(out);
   const iHeader = flat.indexOf('Account');
   const iRow = flat.indexOf('a1');          // first account row
-  const iGlossary = flat.indexOf('Legend'); // the DISTINCTIVE legend label (not a bare row bar label)
-  assert.ok(iHeader >= 0 && iRow >= 0 && iGlossary >= 0, 'header, a row, and the legend all render');
+  assert.ok(iHeader >= 0 && iRow >= 0, 'header and a row render');
   assert.ok(iHeader < iRow, 'header sits above the rows');
-  assert.ok(iRow < iGlossary, 'the legend is a FOOTER below the rows — never between header and data');
-  // Explicitly labeled + spells out each abbreviation, so it doesn't read as an orphan sentence.
-  const legend = flat.slice(iGlossary);
-  assert.match(legend, /Ses = 5h/);
-  assert.match(legend, /Wk = 7d/);
-  assert.match(legend, /Now = in-flight \(weight\)/);
-  assert.match(legend, /15m\/1h = served \(avg · f = fails\)/);
+  // The legend is DELETED (owner, 2026-08-27): every cell now reads in plain words,
+  // so a decoder ring is dead chrome. Pinned so it can't creep back.
+  assert.doesNotMatch(flat, /Legend/, 'no glossary footer — the rows explain themselves');
 });
 
 test('an extreme-narrow header clips WITHOUT bleeding the underline into later lines', () => {

@@ -373,25 +373,39 @@ test('countdown shows seconds under a minute, coarser above, empty once elapsed'
   assert.equal(__tuiTest.countdown(new Date(Date.now() + 30_000).toISOString()), '30s');
 });
 
-test('load label reads "Now N (Ww)" — distinct from the 15m/1h throughput counts', () => {
+// ACTIVITY cell (2026-08-27, owner feedback): an idle account renders NOTHING —
+// "Now 0  15m 0r  1h 0r" on every resting row was a column of noise. A working
+// account renders "▶N · req/h · avg", failures appended.
+test('activity cell reads in plain words — "N live · N req/hr", no latency', () => {
   const text = __tuiTest.strip(__tuiTest.loadText({
-    current: { inFlight: 1, activeWeight: 26 },
-    last15m: { requests: 41, avgMs: 13000 },
+    current: { inFlight: 2, activeWeight: 26 },
+    last15m: { requests: 41, avgMs: 8500 },
     last1h: { requests: 53 },
   }));
-  assert.match(text, /Now 1 \(26w\)/);
-  assert.doesNotMatch(text, /Load /);   // the old cryptic label is gone
-  assert.match(text, /15m 41r/);
-  assert.match(text, /1h 53r/);
+  assert.equal(text, '2 live · 53 req/hr');
+  assert.doesNotMatch(text, /Now |15m |▶/, 'no symbols, no jargon');
+  // Average latency is deliberately DROPPED (owner: "is it how long each request
+  // takes? I don't care. This is just noise.") — pinned so it can't creep back.
+  assert.doesNotMatch(text, /8\.5s|ms\b/, 'latency is not shown');
 });
 
-test('load label omits the weight parenthetical when idle', () => {
+test('activity cell renders empty on a fully idle account — no zero-noise', () => {
   const text = __tuiTest.strip(__tuiTest.loadText({
     current: { inFlight: 0, activeWeight: 0 },
     last15m: {}, last1h: {},
   }));
-  assert.match(text, /Now 0\b/);
-  assert.doesNotMatch(text, /\(/);
+  assert.equal(text, '');
+});
+
+test('activity cell keeps no-inflight but recent-hour work, and names failures', () => {
+  const idleNow = __tuiTest.strip(__tuiTest.loadText({
+    current: {}, last15m: { requests: 5, avgMs: 4000 }, last1h: { requests: 17 },
+  }));
+  assert.equal(idleNow, '17 req/hr');
+  const failing = __tuiTest.strip(__tuiTest.loadText({
+    current: {}, last15m: { requests: 9, failed: 2 }, last1h: { requests: 30 },
+  }));
+  assert.match(failing, /2 failed/, 'spelled out, not "2f"');
 });
 
 test('countdown stays single-unit <=3 chars even for multi-hour throttles (no column overflow)', () => {

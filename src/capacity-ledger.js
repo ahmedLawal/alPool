@@ -31,6 +31,18 @@ const SCHEMA_VERSION = 3;
 // Two closes this far apart are the SAME boundary observed twice (a clock-close and a
 // stamp-advance racing across the boundary second), not two windows.
 const SAME_BOUNDARY_MS = 5_000;
+
+// The minimum span of a COMPLETE cycle per window (80% of nominal): a real one is
+// flagged partial by the writer, so a complete cycle below this is corrupt history.
+const READ_FLOOR_MS = { ses: 4 * 3600_000, wk: 5 * 86400_000 };
+
+// TANK floor. tank = tokens ÷ utilization, and vendors report WHOLE percents — so at
+// 1% full, one percentage point of rounding swings the answer by 100% (measured live
+// 2026-08-25: a 1%-full window read "≥45M"). Below this the reading is rounding noise,
+// not a measurement. Exported because BOTH the closed-cycle average and the live
+// in-window estimate must apply the same floor; one guarding without the other is how
+// the absurd number reached the screen in the first place.
+export const TANK_MIN_UTIL = 0.05;
 const MAX_CYCLES_PER_WINDOW = 50;
 const MAX_DAY_BUCKETS = 10;
 
@@ -54,6 +66,9 @@ export class CapacityLedger {
     // Cleared per account+window once that window's first boundary is behind us.
     this._joinedMidWindow = false;
     this._utilObservedAt = 0;   // last utilization-reading arrival (see estimateFromUtilization)
+    // Test seam ONLY: real-window fixtures are laborious for every close-cycle test,
+    // so tests may zero the read floor. Production never touches this.
+    this._readFloorOverride = null;
   }
 
   /** Restore from a serialized payload (state.json). Tolerant: unknown schemaVersion →
@@ -140,10 +155,10 @@ export class CapacityLedger {
    *  M3 in the pre-mortem — Anthropic interim deltas are CUMULATIVE, so the SSE seam
    *  passes the running max, and this adds it exactly once per request).
    *  count_tokens requests are the CALLER's job to skip (M4) — they never reach here. */
-  accrue(name, { input, output }, at = this._now()) {
+  accrue(name, { input, output }, at = this._now(), windows = ['ses', 'wk']) {
     if (!(input > 0) && !(output > 0)) return;
     const rec = this._rec(name);
-    for (const w of ['ses', 'wk']) {
+    for (const w of windows) {
       // Open the window lazily if nothing is open (a mid-cycle boot or a window whose
       // reset stamp was never learned). startedAt is the accrual time then — the cycle
       // will be flagged partial by the caller if the boot gap warrants it (B1/B2).
@@ -192,8 +207,15 @@ export class CapacityLedger {
 
   /** Close the open cycle for a window (M5: clock-authoritative — the close is keyed
    *  on `endedAt`, which the caller derives from the reset stamp or the clock, and the
-   *  cycle keeps its own book regardless of probe health). No-op if none open. */
-  closeCycle(name, window, endedAt = this._now(), { resetAt = null } = {}) {
+   *  cycle keeps its own book regardless of probe health). No-op if none open.
+   *
+   *  TANK (2026-08-25, owner-directed): the closed row records `finalUtilization` —
+   *  the vendor's own fullness reading for the window at close. tank = tokens ÷ util
+   *  is the CAPACITY of the plan, as distinct from the tokens we happened to deliver.
+   *  Delivery measures demand; tank measures the plan. Both are recorded; the UI
+   *  decides which to show. Recording happens on a best-effort basis here (the ledger
+   *  keeps its own book — the caller passes the reading in, it does not poll). */
+  closeCycle(name, window, endedAt = this._now(), { resetAt = null, finalUtilization = null } = {}) {
     const rec = this._accounts.get(name);
     if (!rec || !rec[window]?.open) return null;
     const open = rec[window].open;
@@ -214,7 +236,10 @@ export class CapacityLedger {
       // Fold ONLY a complete tail: folding a partial/disabled tail would flip the
       // flags on the prior legitimate observation and ERASE it from the averages
       // (round 3, RT3-2) — strictly worse than leaving a tiny excluded cycle.
+      // The fold ALSO takes the tail's tank reading if the prior row lacks one —
+      // same boundary, same window, so the later reading is simply fresher.
       prev.tokens += open.tokensSoFar;
+      if (prev.finalUtilization == null && finalUtilization != null) prev.finalUtilization = finalUtilization;
       rec[window].open = null;
       return prev;
     }
@@ -225,6 +250,12 @@ export class CapacityLedger {
       complete: open.complete,
       disabledDuring: open.disabledDuring,
       ...(open.partialReason ? { partialReason: open.partialReason } : {}),
+      ...(finalUtilization != null ? { finalUtilization } : {}),
+      // Carried onto the closed row because tankStats needs it: a cycle observed from
+      // its window START yields an EXACT tank; one we joined late yields a lower bound
+      // (we only counted the tokens that flowed through maxpool, while the vendor's
+      // percentage counts everything). Dropping it here made every tank read "bounded".
+      ...(open.windowStartedAt != null ? { windowStartedAt: open.windowStartedAt } : {}),
       resetAt,
     });
     if (rec[window].closed.length > MAX_CYCLES_PER_WINDOW) rec[window].closed.shift();
@@ -324,7 +355,20 @@ export class CapacityLedger {
    *  are observations, not capacity). */
   windowStats(name, window) {
     const rec = this._accounts.get(name);
-    const closed = (rec?.[window]?.closed || []).filter(c => c.complete && !c.disabledDuring);
+    // READ-TIME FLOOR. A cycle marked complete + never-disabled but spanning far less
+    // than its window is junk from a writer bug — the live ledger held a 0.5-second /
+    // 588-token "cycle" (clock-close and stamp-advance racing at one boundary, the fold
+    // refused on an endedAt mismatch) and it dragged this account's Avg3 down ~188k.
+    // Unlike the WRITE-time floor I tried first (reverted: it punished accounts that
+    // were merely idle early in their window), at read time a genuinely short cycle is
+    // already flagged complete:false by the writer — so a complete sub-floor cycle is
+    // definitionally corrupt, never a real observation.
+    const floor = (this._readFloorOverride ?? READ_FLOOR_MS)[window] ?? 0;
+    // >= floor, with a 1s tolerance for the accrue-vs-close clock race (an accrue can
+    // stamp Date.now() a tick AFTER the close computed its boundary, making a 0-span
+    // cycle read as -1ms — found by debugging a D2 failure that only reproduced in-file).
+    const closed = (rec?.[window]?.closed || []).filter(c =>
+      c.complete && !c.disabledDuring && (c.endedAt - c.startedAt) >= floor - 1_000);
     if (!closed.length) return null;
     const avg = (arr) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null;
     const tokens = closed.map(c => c.tokens);
@@ -346,6 +390,62 @@ export class CapacityLedger {
    *  ABSENCE (present in dayKeys, absent from days) — and with MAX_DAY_BUCKETS=10 an
    *  idle day no longer even evicts; only real activity ages out. `partial` is true
    *  when any bucket in the window is flagged partial — the figure is ≤ observed. */
+  /** TANK STATS — the CAPACITY of the plan, from the owner's own formula:
+   *  tank = tokens delivered ÷ utilization at close, per cycle, averaged across
+   *  cycles (2026-08-25, owner-directed). This measures the plan, not the demand:
+   *  a cycle that delivered 812k at 96% and one that delivered 51k at 6% both say
+   *  "~846k tank". Delivered-only averages (windowStats) measure demand and stay
+   *  available separately.
+   *
+   *  Guards, because the raw formula lies in two ways:
+   *  - We only count tokens that flowed THROUGH maxpool; a cycle whose vendor util
+   *    includes spend we never saw (joined mid-window, or usage outside the proxy)
+   *    yields a tank ≥ the truth but not equal to it. Only a cycle observed from its
+   *    window start is exact; later ones are marked `lowerBound`.
+   *  - Vendors report whole percents. At 3% full, 1pp of rounding = 33% error, so a
+   *    reading below MIN_UTIL is excluded (rounding-dominated) rather than folded
+   *    into the average as fake precision.
+   *  Returns { avg, exact, n, bounded, last } or null when no usable readings. */
+  tankStats(name, window) {
+    const rec = this._accounts.get(name);
+    const floor = (this._readFloorOverride ?? READ_FLOOR_MS)[window] ?? 0;
+    const closed = (rec?.[window]?.closed || []).filter(c =>
+      c.complete && !c.disabledDuring && (c.endedAt - c.startedAt) >= floor - 1_000);
+    // PHYSICAL FLOOR: a tank can never be smaller than the most tokens ever
+    // delivered in one complete window — every token we count is a vendor token
+    // (C ≤ V ≤ tank), so maxDelivered ≤ tank is an invariant, not a heuristic.
+    // A reading implying a smaller tank is contaminated: the vendor % counted
+    // spend maxpool never saw (usage outside the proxy — an account also used
+    // directly), or the reading was stale. Measured live 2026-08-26: a window
+    // that delivered 497k at a reported "95% full" implied a 523k tank while an
+    // earlier window of the SAME account had delivered 1.53M — impossible, and
+    // the understated reading silently dragged the average down 3.6x.
+    // CLAMP, never discard: the contaminated reading is still a real lower bound
+    // (the tank is at least the tokens we saw), so it joins the average AT the
+    // floor rather than being thrown away — discarding left an account whose
+    // every reading was contaminated with NOTHING to show. After a plan
+    // downgrade the floor over-states until old cycles age out — conservative.
+    const maxDelivered = closed.reduce((m, c) => Math.max(m, c.tokens), 0);
+    const usable = closed.filter(c =>
+      Number.isFinite(c.finalUtilization) && c.finalUtilization >= TANK_MIN_UTIL);
+    if (!usable.length) return null;
+    let sum = 0, exact = 0, bounded = 0;
+    for (const c of usable) {
+      const observedFromStart = c.startedAt != null && c.windowStartedAt != null
+        && c.startedAt <= c.windowStartedAt + 60_000;
+      sum += Math.max(c.tokens / c.finalUtilization, maxDelivered);
+      if (observedFromStart) exact++; else bounded++;
+    }
+    const last = usable[usable.length - 1];
+    return {
+      avg: Math.round(sum / usable.length),
+      exact, bounded,
+      n: usable.length,
+      last: Math.round(last.tokens / last.finalUtilization),
+      lowerBound: bounded > 0 && exact === 0,
+    };
+  }
+
   rollingThroughput(name, days = 7) {
     const rec = this._accounts.get(name);
     if (!rec) return { tokens: 0, partial: false };
