@@ -1,0 +1,185 @@
+// The thread gate: hand the client the signal it already knows, never rebuild a transcript.
+//
+// Driver 2026-09-10. Claude Code >= 2.1.265 leaves the conversation on Anthropic's
+// servers and sends only the tail plus a thread reference — removing the self-containment
+// maxpool's routing rests on. Measured: 10 of 12 live requests carry it; a non-owner
+// Anthropic account 404s and GLM rejects the truncated transcript with [1214].
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { ThreadOwners, readThreadIntent, threadRefusalBody, THREAD_UNSUPPORTED_CODE, isThreadlessAccount }
+  from '../src/thread-gate.js';
+
+const B = (o) => Buffer.from(JSON.stringify(o));
+const cont = B({ model: 'm', thread: { type: 'continue', previous_message_id: 'msg_1' }, messages: [] });
+const create = B({ model: 'm', thread: { type: 'create' }, messages: [] });
+const plain = B({ model: 'm', messages: [] });
+
+test('the refusal body is byte-shaped for the CLIENT\'s classifier', () => {
+  // The client reads e.error.details.error_code; anything else and it shows a hard error
+  // to the user instead of resending stateless. This is PRE-MORTEM #1.
+  const b = threadRefusalBody('glm max@gomokka.com');
+  assert.equal(b.error.details.error_code, THREAD_UNSUPPORTED_CODE);
+  assert.equal(THREAD_UNSUPPORTED_CODE, 'thread_unsupported_request');
+  assert.equal(b.type, 'error');
+  assert.equal(b.error.type, 'invalid_request_error');
+  assert.ok(JSON.parse(JSON.stringify(b)).error.details.error_code, 'survives serialization');
+});
+
+test('reads the three thread intents, and shrugs at junk', () => {
+  assert.equal(readThreadIntent(cont).kind, 'continue');
+  assert.equal(readThreadIntent(create).kind, 'create');
+  assert.equal(readThreadIntent(plain).kind, 'none');
+  assert.equal(readThreadIntent(Buffer.from('not json')).kind, 'none');
+  assert.equal(readThreadIntent(B({ thread: 'nonsense' })).kind, 'none');
+  // previous_message_id alone, in diagnostics, is not a thread continuation
+  assert.equal(readThreadIntent(B({ diagnostics: { previous_message_id: 'x' } })).kind, 'none');
+});
+
+test('a continue routed to a NON-owner is refused', () => {
+  const o = new ThreadOwners();
+  o.noteServed('s1', 'max@gomokka.com', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('s1', 'glm glm1@gomokka.com', readThreadIntent(cont)), true);
+  assert.equal(o.shouldRefuse('s1', 'mk@dubner.io', readThreadIntent(cont)), true);
+});
+
+test('a continue routed to the OWNER is forwarded — the saving is taken', () => {
+  const o = new ThreadOwners();
+  o.noteServed('s1', 'max@gomokka.com', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('s1', 'max@gomokka.com', readThreadIntent(cont)), false);
+});
+
+test('a CREATE is never refused — it carries the full transcript', () => {
+  const o = new ThreadOwners();
+  o.noteServed('s1', 'max@gomokka.com', readThreadIntent(create));
+  for (const a of ['glm glm1@gomokka.com', 'kimi max@gomokka.com', 'anyone']) {
+    assert.equal(o.shouldRefuse('s1', a, readThreadIntent(create)), false, a);
+  }
+});
+
+test('a request with no thread is never refused — the existing path is untouched', () => {
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('s1', 'anyone', readThreadIntent(plain)), false);
+});
+
+test('refusals are bounded — a client that does not downgrade is not looped forever', () => {
+  // PRE-MORTEM #2: refusing every turn would double request volume and read as a hang.
+  const o = new ThreadOwners({ maxRefusals: 2 });
+  const i = readThreadIntent(cont);
+  o.noteServed('s1', 'owner', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('s1', 'other', i), true);  o.noteRefused('s1');
+  assert.equal(o.shouldRefuse('s1', 'other', i), true);  o.noteRefused('s1');
+  assert.equal(o.shouldRefuse('s1', 'other', i), false, 'bounded fail-open after the cap');
+});
+
+test('serving resets the refusal streak', () => {
+  const o = new ThreadOwners({ maxRefusals: 2 });
+  const i = readThreadIntent(cont);
+  o.noteServed('s1', 'owner', readThreadIntent(create));
+  o.noteRefused('s1'); o.noteRefused('s1');
+  assert.equal(o.shouldRefuse('s1', 'other', i), false);
+  o.noteServed('s1', 'other', i);                       // 'other' now holds it
+  assert.equal(o.shouldRefuse('s1', 'third', i), true, 'streak cleared, gate armed again');
+});
+
+test('an unknown session refuses — the safe direction', () => {
+  // No record (maxpool restarted mid-conversation) means we cannot know the owner.
+  // Refusing costs one round-trip; forwarding could 404/1214 in the user's face.
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('never-seen', 'anyone', readThreadIntent(cont)), true);
+});
+
+test('a request with NO session header is still refused — the majority of traffic', () => {
+  // Measured 2026-09-11: 14 of 20 consecutive /v1/messages log lines carried no
+  // `[sess …]`. Skipping those left threaded turns reaching GLM and failing exactly as
+  // before the gate existed. We cannot know the owner, so refuse (the safe direction).
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('', 'glm max@gomokka.com', readThreadIntent(cont)), true);
+  assert.equal(o.shouldRefuse(undefined, 'glm max@gomokka.com', readThreadIntent(cont)), true);
+});
+
+test('session-less refusals are still bounded, per account', () => {
+  // Without a session id the refusal count buckets per account, so the storm bound
+  // (PRE-MORTEM #2) still applies rather than being bypassed by the missing header.
+  const o = new ThreadOwners({ maxRefusals: 2 });
+  const i = readThreadIntent(cont);
+  assert.equal(o.shouldRefuse('', 'acct-a', i), true); o.noteRefused('', 'acct-a');
+  assert.equal(o.shouldRefuse('', 'acct-a', i), true); o.noteRefused('', 'acct-a');
+  assert.equal(o.shouldRefuse('', 'acct-a', i), false, 'bounded');
+  // a different account has its own budget
+  assert.equal(o.shouldRefuse('', 'acct-b', i), true, 'per-account bucket');
+});
+
+test('a session-less served turn claims no ownership', () => {
+  // There is no conversation to attribute, so it must only clear the refusal streak —
+  // never record an owner that a later real session could match against.
+  const o = new ThreadOwners();
+  o.noteServed('', 'acct-a', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('', 'acct-a', readThreadIntent(cont)), true,
+    'still refuses — no owner was claimed');
+});
+
+test('a missing account never refuses', () => {
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('s', '', readThreadIntent(cont)), false);
+});
+
+test('the owner map is bounded and LRU-evicts', () => {
+  const o = new ThreadOwners({ maxSessions: 10 });
+  for (let i = 0; i < 50; i++) o.noteServed(`s${i}`, 'acct', readThreadIntent(create));
+  assert.equal(o.size, 10, 'ceiling holds');
+  // the newest survive, the oldest are gone
+  assert.equal(o.shouldRefuse('s49', 'acct', readThreadIntent(cont)), false, 'newest retained');
+  assert.equal(o.shouldRefuse('s0', 'acct', readThreadIntent(cont)), true, 'oldest evicted');
+});
+
+test('with the gate disabled every branch is a no-op', () => {
+  // server.js passes `{kind:'none'}` when MAXPOOL_THREAD_GATE=0 rather than guarding
+  // each call site. Pin that this actually neutralises both entry points.
+  const o = new ThreadOwners();
+  const off = { kind: 'none' };
+  assert.equal(o.shouldRefuse('s1', 'anyone', off), false);
+  o.noteServed('s1', 'someacct', off);
+  assert.equal(o.size, 0, 'a disabled gate records nothing');
+});
+
+// 2026-09-13: provider accounts can never hold an Anthropic-side thread, so a
+// `continue` routed to GLM/Kimi is refused unconditionally — no ownership, no bound.
+// Driver: 118/118 provider-routed continues 400'd, and a standalone-valid slice tail
+// got ANSWERED from a ~2-message orphan context (the "amnesia" bug). The vendor
+// classifier turns our 400 into a permanent session-wide stateless downgrade.
+test('provider: refuses a continue on a cold map with no prior state', () => {
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(cont), true), true);
+});
+
+test('provider: never disarms — refused after served and after many refusals', () => {
+  const o = new ThreadOwners();
+  o.noteServed('s1', 'glm max', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(cont), true), true,
+    'owner record must not disarm a provider');
+  for (let i = 0; i < 10; i++) o.noteRefused('s1', 'glm max');
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(cont), true), true,
+    'the refusal bound must not disarm a provider');
+});
+
+test('provider: a `create` still goes through (it carries the full transcript)', () => {
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(create), true), false);
+});
+
+test('anthropic: owner logic intact — thread saving preserved', () => {
+  const o = new ThreadOwners();
+  o.noteServed('s1', 'mk@gomokka', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('s1', 'mk@gomokka', readThreadIntent(cont)), false);
+  assert.equal(o.shouldRefuse('s1', 'max@dubner.io', readThreadIntent(cont)), true);
+});
+
+// The call site passes isThreadlessAccount(account); pin the classification itself so
+// production and the tests cannot disagree about what "provider" means (a mutant that
+// unwires the call site otherwise survives every unit test).
+test('isThreadlessAccount: providers yes, anthropic accounts no', () => {
+  assert.equal(isThreadlessAccount({ type: 'provider', name: 'glm max' }), true);
+  assert.equal(isThreadlessAccount({ type: 'oauth', name: 'mk@gomokka' }), false);
+  assert.equal(isThreadlessAccount({ name: 'no-type' }), false);
+  assert.equal(isThreadlessAccount(null), false);
+});

@@ -5,6 +5,74 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.7] - 2026-09-13
+
+### Fixed
+
+- Rewrite Anthropic-only tool_reference blocks for providers — ends the [1210] retries
+
+## [1.19.6] - 2026-09-13
+
+### Added
+
+- Opt-in capture of a failing provider request body
+- Transcript model-id migration — stop session-restore warnings on history
+
+### Fixed
+
+- Stop paging on ordinary sub-second event-loop stalls
+- Page ONCE per stall burst, not on every event after the threshold
+- Route the v1-compat /v1/sessions API direct — identity, not pool
+- Refuse every thread continue routed to a provider — ends the 'amnesia' answers
+
+## [1.19.5] - 2026-09-11
+
+### Changed
+
+- Drop the unused field and the triple gate check
+
+### Fixed
+
+- Cover session-less threaded turns; persist provider disable + hide-disabled
+
+## [1.19.4] - 2026-09-11
+
+### Added
+
+- Let the client fall back to stateless when a turn is routed off-thread
+
+### Changed
+
+- Revert "fix(routing): keep server-side-thread and oversized requests off providers"
+
+### Fixed
+
+- Stop paging on system sleep — a suspend is not an event-loop stall
+- The sleep detector was inert — use the kernel's wake clock
+- Keep server-side-thread and oversized requests off providers
+
+## [1.19.3] - 2026-09-10
+
+### Added
+
+- Launchd supervision + test-seam CA pin; delete hand-rolled supervisor
+- Timestamp the gate log, detect loop stalls, probe both hops
+- Instrument the response leg — 'Connection lost mid-response' was invisible
+- Name the connection churn by host
+- Push the /rename name up as the Remote Control title
+- Wire title-sync in, fail-safe
+
+### Fixed
+
+- Stop fd leak that dropped Remote Control across all sessions
+- SSE streams off the keep-alive pool; socket-race retry for one-shot posts
+- Never replay ownership-claiming requests (close code 4090 loop)
+- Buffer direct-post bodies — 'stream has been aborted' on session create
+- Watcher no longer replays history or pages on healthy churn
+- Page on abort BURSTS, not single client interrupts
+- Route a z.ai parameter rejection to Claude instead of surfacing it
+- Make the rc-gate suite pass under `npm test`, not only by hand
+
 ## [1.19.2] - 2026-09-02
 
 ### Fixed
