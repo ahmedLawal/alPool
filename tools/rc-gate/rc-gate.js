@@ -22,10 +22,11 @@
 // Authorization is stripped before forwarding so the pool's per-account tokens
 // are the only credentials upstream sees.
 import net from 'node:net';
+import os from 'node:os';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
@@ -38,6 +39,58 @@ import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
 // each reconnect". Pooled agents reuse connections and bound the socket count.
 const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
 const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
+
+// NETWORK-CHANGE SOCKET EVACUATION (2026-09-14). When the machine changes network
+// (laptop moves: 192.168.10.x → 172.16.222.x → 172.16.0.x measured over two days),
+// every pooled/outbound socket stays bound to the OLD source address. The server
+// sends no keep-alive hint, so Node never expires them; they read ESTABLISHED but
+// are unsendable, and the next request the pool hands them fails with read
+// ETIMEDOUT — every RC session at once, then "Remote Control disconnected" after
+// the CLI burns its retry budget (root cause: bug-2026-09-14-rc-gate-socket-pool).
+// Fix: watch os.networkInterfaces(); on any change, destroy both agents (Node
+// transparently reconnects on the next request — no retry logic added, so the
+// 4090-eviction hazard of replayed /bridge registrations is untouched).
+// Watch only the IPv4 set: awdl0/utun churn and MAC-address reordering mutate the
+// full os.networkInterfaces() JSON constantly and would evacuate healthy pools
+// (measured 2026-09-14: a forced evacuation reset two IN-FLIGHT /v1/messages
+// responses). An evacuation is only warranted when a previously-sourced IPv4
+// address DISAPPEARS — the exact state that strands sockets. Additions (a new
+// VPN arriving, address added) never strand anything.
+function ipv4Set() {
+  const out = new Set();
+  for (const ifaces of Object.values(os.networkInterfaces()))
+    for (const i of ifaces || [])
+      if (i.family === 'IPv4' && i.internal === false) out.add(i.address);
+  return out;
+}
+let _netIPv4 = ipv4Set();
+function netEvacTick(sampleSet) {
+  const now = sampleSet === undefined ? ipv4Set() : sampleSet;
+  const lost = [..._netIPv4].filter(a => !now.has(a));
+  _netIPv4 = now;
+  if (!lost.length) return false;
+  console.log(`[net-evac] IPv4 source address(es) ${lost.join(', ')} disappeared — destroying pooled sockets`);
+  poolAgent.destroy();
+  directAgent.destroy();
+  return true;
+}
+setInterval(() => netEvacTick(), 5_000).unref();
+
+// LIVE-SOAK SEAM (2026-09-14): lets an operator prove the evacuation end-to-end
+// without waiting for a natural network move —
+//   touch /tmp/rc-gate-force-net-evac
+// Injects a snapshot missing one current address so the REAL "address
+// disappeared" predicate + destroy() path run on the REAL agents. Self-clears.
+const FORCE_EVAC_FLAG = '/tmp/rc-gate-force-net-evac';
+setInterval(() => {
+  try {
+    if (!existsSync(FORCE_EVAC_FLAG)) return;
+    rmSync(FORCE_EVAC_FLAG);
+    const dropped = [..._netIPv4];
+    if (dropped.length) dropped.pop();
+    netEvacTick(new Set(dropped));
+  } catch {}
+}, 5_000).unref();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATE_PORT = Number(process.env.RC_GATE_PORT || 3457);
@@ -135,6 +188,12 @@ const SECURE_CONTEXT = tls.createSecureContext({ cert, key });
 // 4090 — the same-day second regression). If a pooled socket went stale, the
 // request fails and the CLI retries it itself, which is correct: the CLI knows
 // which of its requests are idempotent; a transport shim does not.
+// In-flight INFERENCE responses only — the drain waits on these. Long-lived RC
+// streams (/worker/events/stream) never end by design, so counting raw agent
+// sockets made every drain burn its full timeout (measured 2026-09-14: exited
+// after 20.1s with 1 permanently-active stream socket).
+let inflightInference = 0;
+
 const mitmServer = http.createServer((creq, cres) => {
   const headers = { ...creq.headers };
   delete headers.authorization;           // pool accounts supply upstream auth
@@ -224,6 +283,10 @@ const mitmServer = http.createServer((creq, cres) => {
   // silent, so this stays readable at ~20 req/min.
   const t0 = Date.now();
   let bytes = 0, upstreamEnded = false, clientAborted = false;
+  inflightInference++;
+  let counted = true;
+  const settle = () => { if (counted) { counted = false; inflightInference--; } };
+  cres.on('close', settle);
   const up = http.request(opts, ures => {
     cres.writeHead(ures.statusCode, ures.headers);
     ures.on('data', c => { bytes += c.length; });
@@ -337,3 +400,31 @@ gate.listen(GATE_PORT, GATE_HOST, () => {
   console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool 127.0.0.1:${MAXPOOL_PORT} (profile: ${PROFILE})`);
   console.log(`  everything else: blind tunnel`);
 });
+
+// GRACEFUL SHUTDOWN (2026-09-14). launchd restarts the gate on deploys (`kickstart -k`
+// → SIGTERM, ExitTimeOut=5s) and the default Node behavior kills every open CONNECT tunnel
+// and in-flight MITM response instantly — surfacing in sessions as "API Error: Connection
+// lost mid-response". Measured: 12 of 12 all-time mid-response breaks coincide with a
+// proxy-layer restart (2 with maxpool's config reload, 10 with gate restarts); zero
+// spontaneous. On SIGTERM: stop accepting, close both servers, and wait (bounded 20s) for
+// the in-flight responses the [resp-break] tracker counts. com.mokka.rc-gate.plist
+// ExitTimeOut must stay ≥ 25s (checked at startup).
+const DRAIN_MS = 20_000;
+let draining = false;
+function drainAndExit(signal) {
+  if (draining) return;
+  draining = true;
+  gate.close();
+  try { mitmServer.close(); } catch {}
+  console.log(`[drain] ${signal} received — waiting up to ${DRAIN_MS / 1000}s for in-flight responses`);
+  const t0 = Date.now();
+  (function poll() {
+    if (inflightInference === 0 || Date.now() - t0 >= DRAIN_MS) {
+      console.log(`[drain] exiting after ${((Date.now() - t0) / 1000).toFixed(1)}s (in-flight inference responses: ${inflightInference})`);
+      process.exit(0);
+    }
+    setTimeout(poll, 250);
+  })();
+}
+process.on('SIGTERM', () => drainAndExit('SIGTERM'));
+process.on('SIGINT', () => drainAndExit('SIGINT'));
