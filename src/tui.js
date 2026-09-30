@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { fetchProfile, loginOAuth, tokenFingerprint } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -32,6 +32,8 @@ const vw = s => strip(s).length;
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
+const RESETS_W = 3;        // 'Rst' column — banked limit resets (cards/grants) the
+                           // pool can auto-redeem; '0' when none, count when some.
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 
 // Human provider name for the accounts-table "Provider" column. account.provider
@@ -60,6 +62,7 @@ function acctHeader(W) {
     + 'Account'.padEnd(NAME_W) + ' '
     + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
+    + 'Rst'.padEnd(RESETS_W) + ' '
     + quota;
 }
 
@@ -202,10 +205,40 @@ function loadText(load) {
  *  built for (max@gomokka.com) showed no cap anywhere: reported 2026-08-27, "I need
  *  to be able to see whether an account has a cap or not." Yellow while the cap is
  *  actively holding traffic back, dim otherwise. */
-function capText(a, benched) {
+function capText(a, benched, am) {
   if (a?.capUtilization == null) return '';
-  const t = `cap ${Math.round(a.capUtilization * 100)}%`;
+  const floorPct = Math.round(a.capUtilization * 100);
+  // DYNAMIC CAP (2026-09-24): the configured value is only a FLOOR — what routing
+  // actually holds the account to right now is the ramped effective cap, which climbs
+  // as the window nears its reset. Showing the floor alone would state a number the
+  // scheduler is not using. `cap 50%>67%` reads as "reserved 50%, currently allowing
+  // 67%"; the two collapse to one number while the cap sits at its floor, so an
+  // early-window dynamic account looks exactly like the fixed one it replaced.
+  // The WINDOW is named, not just the number. `cap 50%>75%` alone is ambiguous in the
+  // way that matters for the decision the row exists to support ("is it safe for me to
+  // use this account myself right now?"): a lift driven by the 5h window means reduced
+  // protection for minutes, the same number off the weekly means DAYS of it. Council
+  // finding 2026-09-24.
+  const eff = capEffectivePct(am, a);
+  const t = (eff != null && eff.pct !== floorPct)
+    ? `cap ${floorPct}%>${eff.pct}% ${eff.window}`
+    : `cap ${floorPct}%`;
   return benched ? yellow(t) : dim(t);
+}
+
+/** What routing is ACTUALLY enforcing on this account right now: the worse (lower) of
+ *  its two windows' effective caps — the one that benches first — AND WHICH window that
+ *  is. Returns {pct, window:'5h'|'wk'} or null for a fixed cap / when the manager cannot
+ *  compute one. The window label is load-bearing: the same percentage means "protection
+ *  is thin for the next few minutes" off the 5h window and "thin for days" off the weekly. */
+function capEffectivePct(am, a) {
+  if (!am?._effectiveCap || a?.capMode !== 'dynamic') return null;
+  const vals = [['ses', '5h'], ['wk', 'wk']]
+    .map(([w, label]) => ({ v: am._effectiveCap(a, w), window: label }))
+    .filter(e => typeof e.v === 'number' && Number.isFinite(e.v));
+  if (!vals.length) return null;
+  const worst = vals.reduce((lo, e) => (e.v < lo.v ? e : lo));
+  return { pct: Math.round(worst.v * 100), window: worst.window };
 }
 
 /** PER-ACCOUNT SETTINGS the user set by hand — the last column's whole job
@@ -223,8 +256,18 @@ function settingsTags(am, a) {
   if (am?.routingMode === 'preferred' && a?.name === am.preferredAccountName) {
     tags.push(cyan('preferred'));
   }
-  const capTag = capText(a, capBenched(am, a));
+  const capTag = capText(a, capBenched(am, a), am);
   if (capTag) tags.push(capTag);
+  // A switched-off account whose credentials ALSO died keeps "disabled" in the status
+  // column (so the disabled inventory stays readable at a glance) and carries the second
+  // problem here. Without this the row would hide the fact that re-enabling it later
+  // yields a broken account — the 2026-08-10 report that 8 disabled accounts were all
+  // sitting on dead credentials.
+  if (a?.enabled === false) {
+    if (a.refreshDead) tags.push(yellow('needs login'));
+    else if (a.subscriptionGone) tags.push(red('no sub'));
+    return tags;   // disabled: never show card inventory either (owner gate)
+  }
   return tags;
 }
 
@@ -236,7 +279,10 @@ function capBenched(am, a) {
   const q = a.quota || {};
   const ses = a.type === 'provider' ? q.providerSes : q.unified5h;
   const wk = a.type === 'provider' ? q.providerWk : q.unified7d;
-  return !!(am?._capped?.(a, ses) || am?._capped?.(a, wk));
+  // Each reading is judged against ITS OWN window's cap — under the dynamic cap the
+  // two differ (a 5h window nearly over is lifted while the weekly is still at its
+  // floor), so passing the default window for both would mislabel one of them.
+  return !!(am?._capped?.(a, ses, 'ses') || am?._capped?.(a, wk, 'wk'));
 }
 
 export function weeklyPolicyText(am, account) {
@@ -246,7 +292,10 @@ export function weeklyPolicyText(am, account) {
   // exhausted, it's deliberately held, and labelling it "Wk exhausted 50%" (red team)
   // while the bar shows half-full misstates the owner's own setting.
   if (state === 'capped') {
-    return yellow(`Cap ${Math.round((account.capUtilization || 0) * 100)}%`);
+    // The WEEKLY window's own effective cap — the number that actually benched it.
+    const eff = am._effectiveCap?.(account, 'wk');
+    const pct = Math.round((Number.isFinite(eff) ? eff : account.capUtilization || 0) * 100);
+    return yellow(`Cap ${pct}%`);
   }
   if (!state || state === 'unknown' || state === 'normal') return '';
   // SAY IT ONCE (2026-08-27). An account Anthropic is rejecting outright already
@@ -353,7 +402,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -984,6 +1033,11 @@ export class TUI {
       // mode — under balance/prefer-* the mode itself controls eligibility. Still
       // safe to set (it'll apply if you switch back to sticky).
       this._cycleProviderClaudeFallback(k === 'g' ? 'zai' : 'kimi');
+    } else if (k === 'w' || k === 'W') {
+      // WEEKLY-AWARE SCORING (2026-09-16): fold weekly utilization into the routing
+      // score, not just the 5h session. Without it, an account at 89% weekly with a
+      // fresh session window scores as cheap and keeps winning all day.
+      this._toggleWeeklyAware();
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
@@ -1080,6 +1134,32 @@ export class TUI {
         : `Peak cap: bench a GLM account once it passes ${Math.round(next * 100)}% of its weekly quota`);
   }
 
+  /** Toggle weekly-aware routing for the whole fleet. One scheduler flag — when OFF the
+   *  score sees only the 5h session (the pre-2026-09-16 behavior); when ON the weekly
+   *  number is folded in, so a nearly-exhausted account loses to a fresh one at ALL
+   *  hours, not just after its session window resets. */
+  async _toggleWeeklyAware() {
+    const next = this.am.scheduler.weeklyAwareScoring === false;
+    this.am.scheduler.weeklyAwareScoring = next;
+    const sched = { ...(this.config.scheduler || {}) };
+    sched.weeklyAwareScoring = next;
+    this.config.scheduler = sched;
+    try {
+      await this.saveConfig(this.config);
+    } catch (e) {
+      // Roll back both the live flag and the mirror so an unsaved toggle can't
+      // silently revert on the next reload — same pattern as the sibling
+      // _cycleProviderClaudeFallback (tui.js).
+      this.am.scheduler.weeklyAwareScoring = !next;
+      this.config.scheduler = sched.weeklyAwareScoring === next ? { ...sched, weeklyAwareScoring: !next } : sched;
+      this._addLog(`Could not save: ${e.message}`);
+      return;
+    }
+    this._addLog(next
+      ? 'Weekly-aware routing: ON — accounts near their weekly limit rank last, all day'
+      : 'Weekly-aware routing: OFF — score sees only the 5h session window again');
+  }
+
   async _cycleRoutingMode() {
     const modes = TUI.ROUTING_MODES;
     const cur = this.am.scheduler?.routingMode || 'sticky';
@@ -1153,9 +1233,14 @@ export class TUI {
       } else if (this.selAction === 'cap') {
         const targetIdx = this.selIdx;
         const current = account.name;
-        const existing = this.am.accounts[targetIdx]?.capUtilization;
+        const existingAcct = this.am.accounts[targetIdx];
+        const existing = existingAcct?.capUtilization;
+        const existingMode = existingAcct?.capMode;
+        const nowLabel = existing
+          ? `${Math.round(existing * 100)}%${existingMode === 'dynamic' ? ' dynamic' : ' fixed'}`
+          : 'off';
         this.mode = 'input';
-        this.inputPrompt = `Usage cap % for "${current}" (1-99, 0 = off, now ${existing ? Math.round(existing * 100) + '%' : 'off'})`;
+        this.inputPrompt = `Usage cap for "${current}" — NN = dynamic floor (rises near reset), fNN = fixed, 0 = off, now ${nowLabel}`;
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doSetCap(targetIdx, String(value || '').trim());
@@ -1326,7 +1411,11 @@ export class TUI {
         ? `\nRe-authenticated "${name}". Returning to alPool…\n`
         : `\nAdded new account "${name}". Returning to alPool…\n`);
     } catch (e) {
-      process.stdout.write(`\nLogin failed: ${e.message}\n`);
+      if (isLoginCancelled(e)) {
+        process.stdout.write('\nLogin cancelled.\n');
+      } else {
+        process.stdout.write(`\nLogin failed: ${e.message}\n`);
+      }
     } finally {
       setConsoleStdoutSuppressed(false);   // restore on every path (incl. the catch)
       if (wasRunning) this.start();
@@ -1346,35 +1435,50 @@ export class TUI {
     if (!account) { this._addLog('Account no longer exists'); return; }
     const v = String(raw || '').trim().toLowerCase();
     const off = v === '' || v === '0' || v === 'off' || v === '100';
+    // MODE PREFIX/SUFFIX: a bare number means the DYNAMIC cap (the default since
+    // 2026-09-24 — the floor that lifts as the window nears reset); `f` marks the
+    // fixed cap explicitly. `d` is accepted as the explicit dynamic spelling so the
+    // two modes are symmetric to type.
+    const explicitFixed = /^f/.test(v) || /f$/.test(v);
     let pct = null;
     if (!off) {
-      pct = parseInt(v, 10);
+      const digits = v.replace(/[fd]/g, '');
+      pct = parseInt(digits, 10);
       if (!Number.isInteger(pct) || pct < 1 || pct > 99) {
-        this._addLog(`Usage cap must be 1-99 (or 0 to remove) — got "${raw}"`);
+        this._addLog(`Usage cap must be 1-99, optionally f-prefixed for fixed (0 to remove) — got "${raw}"`);
         return;
       }
     }
     const cap = off ? null : pct / 100;
+    const mode = cap == null ? null : (explicitFixed ? 'fixed' : 'dynamic');
 
     const loc = this._configLocation(account);
     if (loc) {
       const prev = this.config[loc.array][loc.index].capUtilization ?? null;
+      const prevMode = this.config[loc.array][loc.index].capMode ?? null;
       if (cap == null) delete this.config[loc.array][loc.index].capUtilization;
       else this.config[loc.array][loc.index].capUtilization = cap;
+      if (mode == null) delete this.config[loc.array][loc.index].capMode;
+      else this.config[loc.array][loc.index].capMode = mode;
       try {
         await this.saveConfig(this.config);
       } catch (error) {
         // rollback both config and (below) skip the live apply
         if (prev == null) delete this.config[loc.array][loc.index].capUtilization;
         else this.config[loc.array][loc.index].capUtilization = prev;
+        if (prevMode == null) delete this.config[loc.array][loc.index].capMode;
+        else this.config[loc.array][loc.index].capMode = prevMode;
         throw error;
       }
     }
     // No loc: a runtime provider — in-memory + state.json persistence (same as enabled).
     account.capUtilization = cap;
+    account.capMode = mode;
     this._addLog(cap == null
       ? `Usage cap removed for "${account.name}" — fully utilized`
-      : `Usage cap ${pct}% set for "${account.name}" — the proxy stops routing to it at ${pct}% of the 5h and weekly windows`);
+      : mode === 'dynamic'
+        ? `Dynamic cap ${pct}% set for "${account.name}" — it keeps ${100 - pct}% free early in each window, then opens up as the window nears its reset so nothing is stranded`
+        : `Fixed cap ${pct}% set for "${account.name}" — the proxy stops routing to it at ${pct}% of the 5h and weekly windows`);
   }
 
   async _doRename(idx, newName) {
@@ -2043,6 +2147,11 @@ export class TUI {
     // broken account. Reported 2026-08-10 with all 8 disabled accounts sitting on dead
     // credentials (HTTP 401) and no way to see it.
     if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
+    // Subscription gone (org-disabled 403): a DISTINCT state from reauth — re-logging in
+    // will NOT fix it until the subscription is re-purchased. Says the actionable thing.
+    // Same precedence rule as reauth above: when the account is ALSO switched off,
+    // "disabled" stays the headline so the disabled inventory remains readable.
+    else if (a.subscriptionGone) effectiveStatus = a.enabled === false ? 'disabled-nosub' : 'no sub';
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'reauth':    status = yellow('reauth'); break;
@@ -2051,9 +2160,20 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
-      // Disabled AND needs re-login — both facts matter: it won't serve because you
-      // switched it off, and it CAN'T serve until you log in again.
-      case 'disabled-reauth': status = red('✕ reauth'); break;
+      // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
+      // The owner's question that drove this (2026-09-30): "when I disable the account
+      // and then the token expires, does it show disabled or reauth? It needs to
+      // continue to show disabled otherwise I'm confused as to which ones I have
+      // disabled." Showing only '✕ reauth' made a deliberately-off account
+      // indistinguishable from a live one with dead credentials, so the disabled
+      // inventory could not be read off the screen at all. So the STATUS column always
+      // says 'disabled' for an account you switched off, and the reason it ALSO cannot
+      // serve rides as its own tag ("needs login" / "no sub") — collapsing both into one
+      // '+' marker would lose the distinction between "log in again" (fixable) and
+      // "subscription gone" (not fixable by logging in).
+      case 'disabled-reauth':
+      case 'disabled-nosub':  status = red('✕ disabled'); break;
+      case 'no sub': status = red('✕ no sub'); break;
       case 'throttled': {
         // A transient auto-recovering cooldown — show the remaining time (from
         // rateLimitedUntil) so it reads as "recovering in Ns", not stuck.
@@ -2068,8 +2188,25 @@ export class TUI {
     // Widened from 10 to fit "throttled 59s" so the quota bars stay column-aligned.
     status = rpad(status, STATUS_W);
 
+    // Rst column — banked limit resets (owner request 2026-09-30: a separate
+    // column showing 0 or the count). z.ai cards + Claude cedar_ember grants,
+    // not-yet-expired, on ENABLED accounts only: a disabled account's resets are
+    // not ours to spend, and showing a count there would imply otherwise.
+    let resetsCell;
+    {
+      let n = 0;
+      if (a.enabled !== false) {
+        const rc = a.resetCards;
+        if (rc) n += (rc.fiveHour || []).filter(c => !c.expired).length
+                 + (rc.weekly || []).filter(c => !c.expired).length;
+        const rg = a.resetGrants;
+        if (rg?.eligible) n += (rg.grants || []).filter(g => g.usableNow && !g.expired).length;
+      }
+      resetsCell = rpad(n > 0 ? green(String(n)) : gray('0'), RESETS_W);
+    }
+
     if (a.type === 'provider') {
-      return this._renderProviderAcct(sel, cur, name, type, status, a, bw, showBoth);
+      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth);
     }
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
@@ -2092,7 +2229,7 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${name} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
@@ -2149,7 +2286,7 @@ export class TUI {
     // "stale·probe 401" here is just the perpetual echo of the 401 that killed it.
     // Only annotate probe-staleness for LIVE accounts, where a failing probe
     // (e.g. a 429) is a real, actionable signal.
-    if (a?.refreshDead || a?.enabled === false) return '';
+    if (a?.refreshDead || a?.subscriptionGone || a?.enabled === false) return '';
     if (!this.am._quotaProbeStale?.(a)) return '';   // probe fresh (or off) → nothing to flag; interval>0 after this
     // The background probe IS stale — but only flag it if something DISPLAYED is
     // actually stale. An OAuth account's Ses/Wk bars come from unified5h/7d, which
@@ -2400,7 +2537,7 @@ export class TUI {
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
       }
       case 'accounts':
-        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'addtype':
         return ` ${bold('1')}-${bold('4')} pick a type  ${bold('Esc')} Back`;
       case 'routing': {
@@ -2424,7 +2561,8 @@ export class TUI {
           const now = st?.inPeak ? red(' NOW') : '';
           const dep = ps.depreference ? yellow('GLM last') : cyan('normal');
           const cap = ps.cap >= 1 ? 'off' : ps.cap === 0 ? 'never' : `${Math.round(ps.cap * 100)}%`;
-          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}cap ${cyan(cap)}`;
+          const wk = this.am.scheduler.weeklyAwareScoring === false ? yellow('5h-only') : cyan('weekly');
+          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}cap ${cyan(cap)} ${bold(' w ')}score:${wk}`;
         }
         return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('p')} Preference  ${bold('Esc')} Back`;
       }

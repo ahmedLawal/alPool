@@ -479,7 +479,8 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.equal(narrow.indexOf('Account'), 4);
   assert.equal(narrow.indexOf('Status'), 35);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  assert.equal(narrow.indexOf('Quota'), 49);
+  // +4 for the new Rst column (Status 13 + 'Rst' 3 + space) before Quota
+  assert.equal(narrow.indexOf('Quota'), 53);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
@@ -560,4 +561,197 @@ test('an extreme-narrow header clips WITHOUT bleeding the underline into later l
   const fitted = __tuiTest.fitLine(headerLine, 42);
   assert.ok(__tuiTest.strip(fitted).length <= 42, 'truncated to the terminal width');
   assert.ok(fitted.endsWith(RESET), 'RESET still terminates the underline after truncation');
+});
+
+// ── DYNAMIC CAP visibility (owner, 2026-09-24: "It should also be visible in the TUI") ──
+// The configured number is only a FLOOR; routing holds the account to the RAMPED cap.
+// Rendering the floor alone would state a number the scheduler is not using.
+
+test('a dynamic cap early in its window renders as one number (indistinguishable from fixed)', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 5 * 3600_000;   // 0% elapsed
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/, 'the reserve is visible');
+  assert.doesNotMatch(line, /cap 50%>/, 'and while it sits at the floor there is no second number to show');
+});
+
+test('a dynamic cap that has ramped shows floor>effective, so the row states what routing enforces', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  // Weekly 90% elapsed → ramped well above the floor; session window fresh so the
+  // WEEKLY is not the minimum — give both a late position so the min is the ramped one.
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 0.2 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.1 * 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%>\d\d%/, `expected a ramped two-number cap tag, got: ${line}`);
+  const shown = Number(/cap 50%>(\d+)%/.exec(line)[1]);
+  assert.ok(shown > 50 && shown <= 90, `effective must be between the floor and the ceiling, got ${shown}`);
+});
+
+test('the rendered effective cap is the number routing actually enforces (the lower window)', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 5 * 3600_000;    // fresh → floor
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.05 * 7 * DAY;  // nearly over → high
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  // The session window is still at the floor, so the MINIMUM is 50% and the row must
+  // not advertise the weekly's generous ramp as if traffic could use it.
+  assert.match(line, /cap 50%/);
+  assert.doesNotMatch(line, /cap 50%>/, 'the stricter window governs, so no lift is claimed');
+});
+
+test('a fixed cap still renders exactly as before — one number, no ramp', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'fixed';
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.05 * 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/);
+  assert.doesNotMatch(line, />/, 'fixed mode has nothing to ramp to');
+});
+
+test('the weekly policy label quotes the EFFECTIVE weekly cap, never the stale floor', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified7d = 0.8;                                  // above the ramped cap → benched
+  a.quota.unified7dReset = Date.now() + 0.25 * 7 * DAY;     // 75% elapsed → cap ~0.70
+  assert.equal(am._weeklyRawState(a), 'capped', 'precondition: the dynamic cap benches it');
+  const label = strip(__tuiTest.weeklyPolicyText(am, a));
+  const pct = Number(/Cap (\d+)%/.exec(label)[1]);
+  assert.ok(pct > 50, `the label must show the cap that actually benched it, got "${label}"`);
+});
+
+test('the cap tag turns yellow exactly when the dynamic cap is what benches the account', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified7d = 0.85;                                 // over the ramped cap
+  a.quota.unified7dReset = Date.now() + 7 * DAY;            // fresh window → cap at the floor
+  // Either spelling is correct: when the WEEKLY policy tag claims the cap (`Cap 50%`)
+  // the settings column drops its lowercase twin by the existing say-it-once rule. What
+  // must hold is that the cap is stated, in the alarm colour, with the effective number.
+  assert.match(new TUI({ accountManager: am })._renderAcct(0, 11, true), /\x1b\[33m[Cc]ap 50%/,
+    'benched by the cap → alarm colour, same contract as the fixed cap');
+});
+
+test('the ramped cap names WHICH window is governing — 50%>75% means nothing without it', () => {
+  // Council finding 2026-09-24: the same percentage means "thin for minutes" off the 5h
+  // window and "thin for days" off the weekly, and the row exists to answer "is it safe
+  // for me to use this account right now?". Computed against ONE frozen clock for both
+  // the fixture and the render: capEffectivePct reads Date.now() internally, so a fresh
+  // Date.now() per line would make the assert race the ramp on a slow runner.
+  const t0 = Date.now();
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  // 5h window nearly over (ramps high), weekly fresh (floor) → the WEEKLY governs.
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = t0 + 0.02 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = t0 + 7 * DAY;
+  assert.doesNotMatch(strip(new TUI({ accountManager: am })._renderAcct(0, 11, true)), /cap 50%>/,
+    'weekly at the floor governs, so there is no lift to advertise');
+
+  // Now the weekly is nearly over and the session is fresh → the SESSION governs.
+  // The margins are chosen so the verdict survives run time: even if the render's
+  // Date.now() trails t0 by several seconds, the 5h window (15 min left) stays near
+  // its floor and the weekly (8.4h left) stays near its ceiling, so the 5h cap is
+  // strictly lower and the label cannot flip.
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = t0 + 0.05 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = t0 + 0.05 * 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  const m = /cap 50%>(\d+)% (5h|wk)/.exec(line);
+  assert.ok(m, `expected a window-labelled ramped cap, got: ${line}`);
+  // The named window must BE the governing (lower) one — assert against the source of
+  // truth rather than a hard-coded '5h', which makes the test brittle to clock skew.
+  const eff = __tuiTest.capEffectivePct(am, a);
+  assert.equal(m[2], eff.window,
+    `the label must name the governing window: tag says ${m[2]}, governing is ${eff.window}`);
+});
+
+// ── a DISABLED account must keep saying "disabled" when its token also dies ───
+// Owner, 2026-09-30: "when I disable the account and then the authentication token
+// expires, does it show disabled or reauth? It needs to continue to show disabled
+// otherwise I'm confused as to which ones I have disabled." Before this, refreshDead
+// REPLACED the status with "✕ reauth", so a deliberately-off account was
+// indistinguishable from a live one needing a login, and the disabled inventory
+// could not be read off the screen.
+
+test('disabled + dead refresh token still reads "disabled" (reason rides as a tag)', () => {
+  const am = oauthAM();
+  am.accounts[0].enabled = false;
+  am.accounts[0].refreshDead = true;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /disabled/, 'the switched-off fact stays in the status column');
+  assert.match(line, /needs login/, 'and the dead credential is still surfaced');
+  assert.doesNotMatch(line, /✕ reauth/, '"reauth" must not REPLACE "disabled"');
+});
+
+test('disabled + subscription gone still reads "disabled", tagged distinctly', () => {
+  const am = oauthAM();
+  am.accounts[0].enabled = false;
+  am.accounts[0].subscriptionGone = true;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /disabled/, 'switched-off stays primary');
+  assert.match(line, /no sub/, 'subscription-gone keeps its own word');
+  // The two reasons must stay tellable apart: logging in fixes one, not the other.
+  assert.doesNotMatch(line, /needs login/, 'no-sub is not a login problem');
+});
+
+test('an ENABLED account with a dead token still reads "reauth" (unchanged)', () => {
+  const am = oauthAM();
+  am.accounts[0].refreshDead = true;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /reauth/, 'the live-account path is untouched');
+  assert.doesNotMatch(line, /disabled/, 'nothing was switched off');
+});
+
+// ── Rst column: banked limit resets, owner request 2026-09-30 ────────────────
+
+test('Rst column shows 0 when no cards/grants, aligned under the header', () => {
+  const am = oauthAM();
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  const col = hdr.indexOf('Rst');
+  assert.ok(col > 0);
+  assert.equal(row.slice(col, col + 1), '0', 'shows plain 0');
+});
+
+test('Rst column counts live cards + grants (expired excluded)', () => {
+  const am = oauthAM();
+  am.accounts[0].resetCards = { fiveHour: [], weekly: [
+    { recordId: 1, expiresAt: Date.now() + 3600e3, expired: false },
+    { recordId: 2, expiresAt: Date.now() - 1000, expired: true },
+  ], checkedAt: Date.now() };
+  am.accounts[0].resetGrants = { grants: [], eligible: true, checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.equal(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), '1');
+});
+
+test('Rst column shows 0 on a DISABLED account even with cards present', () => {
+  const am = oauthAM();
+  am.accounts[0].enabled = false;
+  am.accounts[0].resetCards = { fiveHour: [{ recordId: 9, expiresAt: Date.now() + 3600e3, expired: false }], weekly: [], checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.equal(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), '0',
+    "disabled accounts' resets are not ours — the column must not advertise them");
 });

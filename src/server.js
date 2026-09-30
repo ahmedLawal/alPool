@@ -1125,6 +1125,20 @@ async function forwardRequest(
           // '^srvtoolu_…'`. Repairable by converting the pair to text (verified 200 OK) —
           // it used to fall through to a PERMANENT provider pin.
           || /server_tool_use\.id: String should match pattern/i.test(errorBody));
+      // ORDERING REJECTION (2026-09-23): a mid-conversation `system` message sitting where
+      // the API no longer accepts it. Anthropic has now stated the rule twice, differently:
+      //   Aug: "must precede an 'assistant' message or end the array"
+      //   Sep: "must follow a 'user' message or an 'assistant' message ending in a server
+      //         tool result; the directive-only form (content: []) is accepted at any position"
+      // The CLI legitimately emits mid-conversation system messages (mid-conversation-system
+      // beta: compaction boundaries, injected reminders) at messages.NNN deep in history, so
+      // this fires on ordinary long sessions. Repairable WITHOUT dropping anything: convert
+      // the offending system to the directive-only form the API accepts at any position
+      // (content: [], text moved into output_config) — a shape-preserving transformation,
+      // not the orphaning re-anchor.
+      const isOrderingRejection = account.type !== 'provider'
+        && upstreamRes.status === 400
+        && /role 'system' must (follow|precede)/i.test(errorBody);
       // LOG THE ACTUAL REASON. Previously a 4xx recorded only "HTTP 400" and the upstream
       // message was never written anywhere, so a whole class of failures (e.g. a rejected
       // effort level breaking every web search) was invisible in the log — you could not
@@ -1134,6 +1148,16 @@ async function forwardRequest(
           try { return JSON.parse(errorBody)?.error?.message || errorBody; } catch { return errorBody; }
         })();
         console.log(`[alPool] ${upstreamRes.status} from "${account.name}": ${String(why).slice(0, 300)}`);
+        // ORG-DISABLED SUBSCRIPTION (2026-09-20): "OAuth authentication is currently not
+        // allowed for this organization" means the plan is GONE server-side (canceled
+        // subscription lapsed). Fail-over handles this request, but without a latch every
+        // later request would pick the account again. recordProbeError latches
+        // subscriptionGone on 3 strikes — the request path strikes once per hit, so this
+        // converges after three routed attempts and benches it exactly like the probe path.
+        if (account.type !== 'provider' && upstreamRes.status === 403
+          && /not allowed for this organization|organization has disabled/i.test(String(why))) {
+          accountManager.recordProbeError?.(account.index, String(why).slice(0, 160), 403);
+        }
         // Providers answer with a code and no field name, so record what WE sent.
         if (account.type === 'provider') {
           console.log(`[alPool]   request shape: ${describeBodyShape(upstreamBody || body).slice(0, 600)}`);
@@ -1244,6 +1268,61 @@ async function forwardRequest(
       // rewrite it saves nothing; it just guarantees the 400 surfaces. Reported
       // 2026-08-10: "history too large to rewrite automatically" on a session the strip
       // would have fixed in 20ms. The retry it schedules re-checks the SHRUNK size.
+      // ORDERING RECOVERY (2026-09-23): convert the offending system message(s) to the
+      // directive-only form and retry on the SAME account — the request is now valid by
+      // the API's own stated rule, so no failover is needed and the user never sees the
+      // 400. One-shot per request via its own flag so a second ordering 400 (a rule we
+      // have not modeled) still surfaces honestly instead of looping.
+      // THE REPAIR'S OWN REJECTION (2026-09-25): some accounts' validators 400 the
+      // output_config FIELD ITSELF ("Extra inputs are not permitted") even though the
+      // ordering rule's own error text names it as the accepted form — a gradual
+      // rollout on Anthropic's side (max@dubner.io and mk@gomokka rejected it same-day
+      // while max@gomokka.com accepted the identical repaired body). When that happens,
+      // fall back to position-preserving re-anchoring instead of surfacing the 400.
+      const isDirectiveFormRejection = account.type !== 'provider'
+        && upstreamRes.status === 400
+        && /output_config[^:]*: *Extra inputs are not permitted/i.test(errorBody);
+      if (isDirectiveFormRejection && requestInfo.orderingRepaired && !requestInfo.orderingFallback && canRepairBody) {
+        // Rewrite every directive-only system (the repair's own output) as a PLAIN
+        // assistant turn carrying the directives text — ordinary history, accepted by
+        // every validator, nothing dropped. A system ENDING the array stays legal
+        // everywhere, so it is left alone.
+        const json = JSON.parse(body.toString('utf8'));
+        let folded = 0;
+        json.messages = (json.messages ?? []).map((m, i, arr) => {
+          if (m?.role !== 'system' || !('output_config' in m)) return m;
+          if (i === arr.length - 1) return m;   // end-of-array system is legal universally
+          folded++;
+          const text = String(m.output_config?.directives ?? '');
+          return { role: 'assistant', content: text ? [{ type: 'text', text }] : [{ type: 'text', text: '(system directive)' }] };
+        });
+        if (folded > 0) {
+          const fixedBody = Buffer.from(JSON.stringify(json));
+          console.log(`[Maxpool] Account rejects the directive-only form — folded ${folded} system directive(s) into plain turns`);
+          return forwardRequest(
+            req, res, fixedBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, orderingFallback: true, repairCount: repairCount + 1 },
+            fixedBody.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
+      if (isOrderingRejection && !requestInfo.orderingRepaired && canRepairBody) {
+        const coord = /messages\.(\d+)/.exec(errorBody);
+        const { messages: fixedMessages, converted } = directiveOnlySystemMessages(
+          JSON.parse(body.toString('utf8')).messages ?? [],
+          coord ? Number(coord[1]) : -1);
+        if (converted > 0) {
+          const json = JSON.parse(body.toString('utf8'));
+          json.messages = fixedMessages;
+          const fixedBody = Buffer.from(JSON.stringify(json));
+          console.log(`[Maxpool] Recovering session on Claude: converted ${converted} mis-positioned system message(s) to directive-only form`);
+          return forwardRequest(
+            req, res, fixedBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, orderingRepaired: true, repairCount: repairCount + 1 },
+            fixedBody.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
       if (isSignatureRejection && !requestInfo.thinkingStripped && canRepairBody) {
         console.log(`[alPool] Anthropic rejected a block: ${describeRejectedBlock(body, errorBody)}`);
         const { body: cleanBody, removed, converted } = stripForeignThinkingBlocks(body);
@@ -1879,7 +1958,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2153,6 +2232,48 @@ function describeRejectedBlock(body, errorBody) {
  *  Idempotent: a second run finds no violation, so the latched re-strip cannot grow the
  *  transcript turn after turn.
  */
+/** ORDERING REPAIR (2026-09-23): convert an illegally-positioned mid-conversation
+ *  system message into the directive-only form the API accepts ANYWHERE — content: []
+ *  with the original text preserved in output_config. Shape-preserving (nothing dropped,
+ *  nothing orphaned), idempotent (a directive-only system is already legal), and driven
+ *  by the upstream's own coordinate when it names one, else all violating systems.
+ *  Returns { messages, converted }.
+ */
+function directiveOnlySystemMessages(messages, coordIndex = -1) {
+  let converted = 0;
+  // Under the Sep rule, a system is legal when preceded by nothing (start), by a user
+  // message, or by an assistant ENDING IN a server tool result; and always when it is
+  // already directive-only. Everything else is a violation.
+  const violates = (i) => {
+    const m = messages[i];
+    if (m?.role !== 'system') return false;
+    if (Array.isArray(m.content) && m.content.length === 0) return false; // directive-only
+    if (i === 0) return false; // start-of-array — governed by first-message rules, not this
+    const prev = messages[i - 1];
+    if (prev?.role === 'user') return false;
+    if (prev?.role === 'assistant' && Array.isArray(prev.content) && prev.content.length
+      && prev.content[prev.content.length - 1]?.type === 'server_tool_result') return false;
+    return true;
+  };
+  const out = messages.map((m, i) => {
+    if (coordIndex >= 0 ? i !== coordIndex : !violates(i)) return m;
+    // Content arrives BOTH ways: array-of-blocks (compaction boundaries) and a plain
+    // STRING (injected reminders — the common CLI shape). Reading only the array form
+    // silently DISCARDED every string system message's text: the directive went out
+    // empty AND some accounts 400 the emptied shape (measured 2026-09-25: directives ""
+    // -> "messages.6.output_config: Extra inputs are not permitted").
+    const text = typeof m.content === 'string'
+      ? m.content
+      : (Array.isArray(m.content) ? m.content : [])
+          .map(b => (typeof b?.text === 'string' ? b.text : ''))
+          .filter(Boolean).join('\n');
+    converted++;
+    // output_config shape per the API's own 400 text: directive-only system.
+    return { role: 'system', content: [], output_config: { directives: text } };
+  });
+  return { messages: out, converted };
+}
+
 function reanchorOrphanedSystemMessages(messages) {
   let inserted = 0;
   const out = [];
@@ -3336,8 +3457,13 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         modelEchoBuffer = modelEchoBuffer ? [...modelEchoBuffer, value] : [value];
         const s = decoder.decode(concatUint8(modelEchoBuffer));
         if (s.includes('"model"') && s.includes('\n\n')) {
+          // \s* — providers serialize SSE JSON with spaces ("model": "glm-5.3"),
+          // Anthropic compact ("model":"…"). The tight form shipped 2026-08-31 and never
+          // matched a single real z.ai byte (all 1,546 glm rows in this very session
+          // leaked through it; fixture JSON was hand-written compact, so tests stayed
+          // green while production leaked. 2026-09-23.
           const normalized = s.replace(
-            /("model":")[^"]+(")/,
+            /("model"\s*:\s*")[^"]+(")/,
             `$1${requestInfo.model.replace(/["\\]/g, '\\$&')}$2`,
           );
           out = Buffer.from(normalized, 'utf8');

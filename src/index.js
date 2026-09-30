@@ -29,7 +29,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { ControlError, ControlService } from './control-service.js';
@@ -1148,13 +1148,16 @@ async function serverWorkerCommand() {
       mode: config.routing?.mode || 'automatic',
       preferredAccount: config.routing?.preferredAccount || null,
     };
-    if (config.scheduler?.crossProviderFallbackPolicy || config.scheduler?.providers || config.scheduler?.routingMode) {
+    if (config.scheduler?.crossProviderFallbackPolicy || config.scheduler?.providers
+      || config.scheduler?.routingMode || config.scheduler?.weeklyAwareScoring !== undefined) {
       diskConfig.scheduler = {
         ...diskConfig.scheduler,
         ...(config.scheduler.crossProviderFallbackPolicy
           ? { crossProviderFallbackPolicy: config.scheduler.crossProviderFallbackPolicy } : {}),
         ...(config.scheduler.providers ? { providers: config.scheduler.providers } : {}),
         ...(config.scheduler.routingMode ? { routingMode: config.scheduler.routingMode } : {}),
+        ...(config.scheduler.weeklyAwareScoring !== undefined
+          ? { weeklyAwareScoring: config.scheduler.weeklyAwareScoring } : {}),
       };
       if (!config.scheduler.crossProviderFallbackPolicy) delete diskConfig.scheduler.crossProviderFallbackPolicy;
     }
@@ -1670,6 +1673,10 @@ async function loginOAuthCommand() {
   try {
     creds = await loginOAuth();
   } catch (err) {
+    if (isLoginCancelled(err)) {
+      console.error('Login cancelled.');
+      process.exit(0);
+    }
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');
@@ -2156,9 +2163,26 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     // this a config-edit cap is stale until the next full reload).
     const diskCap = Number.isFinite(diskAcct.capUtilization) && diskAcct.capUtilization > 0 && diskAcct.capUtilization < 1
       ? diskAcct.capUtilization : null;
-    if (mgr.capUtilization !== diskCap) {
+    // The MODE and the two per-account OVERRIDES ride along with the cap: a hand
+    // edit to any of them must not sit stale until a restart (the staleness class
+    // this whole block exists to fix). a hand-edited config that adds/changes a cap
+    // without naming a mode gets the dynamic default, exactly as a fresh load would —
+    // otherwise a hot edit would silently produce a capped account with no mode, whose
+    // effective cap is the floor forever (a fixed cap wearing the new feature's name).
+    // Same validation as boot (_capMode): a typo'd capMode must not fail open in
+    // silence on the hot path either — the boot path logs, so this does too.
+    if (diskCap != null && diskAcct.capMode != null && diskAcct.capMode !== 'fixed' && diskAcct.capMode !== 'dynamic') {
+      console.log(`[Maxpool] Ignoring unknown capMode ${JSON.stringify(diskAcct.capMode)} for "${mgr.name}" on hot sync — expected "fixed" or "dynamic"; using dynamic`);
+    }
+    const diskMode = diskCap == null ? null : (diskAcct.capMode === 'fixed' ? 'fixed' : 'dynamic');
+    if (mgr.capUtilization !== diskCap || mgr.capMode !== diskMode) {
       mgr.capUtilization = diskCap;
-      console.log(`[alPool] Usage cap for "${mgr.name}" ${diskCap ? `set to ${Math.round(diskCap * 100)}%` : 'removed'} from config`);
+      mgr.capMode = diskMode;
+      const dCeil = Number.isFinite(diskAcct.capCeiling) && diskAcct.capCeiling > 0 && diskAcct.capCeiling < 1 ? diskAcct.capCeiling : null;
+      const dRamp = Number.isFinite(diskAcct.capRampStart) && diskAcct.capRampStart >= 0 && diskAcct.capRampStart < 1 ? diskAcct.capRampStart : null;
+      mgr.capCeiling = dCeil;
+      mgr.capRampStart = dRamp;
+      console.log(`[alPool] Usage cap for "${mgr.name}" ${diskCap ? `set to ${Math.round(diskCap * 100)}% (${diskMode})` : 'removed'} from config`);
     }
     memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
 

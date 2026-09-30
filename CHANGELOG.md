@@ -5,6 +5,137 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.1] - 2026-09-30
+
+### Changed
+
+- Rst column — banked limit resets as a count (owner request)
+
+## [1.24.0] - 2026-09-30
+
+### Added
+
+- Auto-redeem limit resets (Claude cedar_ember + z.ai cards), on by default
+
+### Changed
+
+- Transcript model-id normalizer — fixes glm-5.3 resume warning + opus-5 restore
+- Recursive walk, [1m] pairing, auto-detected target; alias rejected
+- Single machine updater — ends the 'Auto-update failed' banner
+
+### Fixed
+
+- A successful version bump is success, not failure
+
+## [1.23.0] - 2026-09-26
+
+### Added
+
+- A no-weekly account becomes the default route until its session window is nearly full
+
+### Fixed
+
+- Remote Control "server unreachable" was direct-pool saturation + a stall timer that never disarmed
+
+## [1.22.3] - 2026-09-25
+
+### Fixed
+
+- Ordering repair dropped string-form system text, and had no fallback for accounts that reject output_config itself
+
+## [1.22.2] - 2026-09-24
+
+### Fixed
+
+- Architect council findings — session-oracle ramp crossing, comment overclaim, hot-sync gaps, dead serialization
+
+## [1.22.1] - 2026-09-24
+
+### Fixed
+
+- Name the governing window in the TUI cap tag
+
+## [1.22.0] - 2026-09-24
+
+### Added
+
+- Dynamic usage cap — the reserve shrinks as the window nears reset, instead of expiring unused
+
+### Fixed
+
+- Close the pre-mortem findings on the dynamic cap
+
+## [1.21.4] - 2026-09-23
+
+### Fixed
+
+- Model-echo rewrite never matched real z.ai wire bytes — regex required compact "model":"id", z.ai emits "model": "id"
+
+## [1.21.3] - 2026-09-23
+
+### Fixed
+
+- Recover the Sep-2026 mid-conversation-system ordering 400
+
+## [1.21.2] - 2026-09-22
+
+### Fixed
+
+- List the 'u' usage-cap key on the Accounts footer
+
+## [1.21.1] - 2026-09-20
+
+### Fixed
+
+- The OAuth login prompt gets an escape hatch
+
+## [1.21.0] - 2026-09-20
+
+### Added
+
+- SubscriptionGone latch — maxpool knows when a plan is dead
+
+### Fixed
+
+- Headers-phase stall timeout on the direct path
+- Stall timeout only on short-RPC paths — long-poll exempt (v2)
+- Exempt /client/presence from the stall timer (held-open beacon)
+- Evict pooled direct sockets when a session-create stalls
+
+### Removed
+
+- Revert working-tree to HEAD (bad headers-timeout reverted live via launchd restart; rollback already deployed)
+
+## [1.20.4] - 2026-09-17
+
+### Fixed
+
+- Title-sync suite gets the same fixture-skip guard
+
+## [1.20.3] - 2026-09-17
+
+### Fixed
+
+- Rc-gate suite skips without local fixtures; startGate kills on timeout
+
+## [1.20.2] - 2026-09-16
+
+### Fixed
+
+- Persist weeklyAwareScoring in the production saveConfig merge
+
+## [1.20.1] - 2026-09-16
+
+### Fixed
+
+- Red-team round 1 on v1.20.0
+
+## [1.20.0] - 2026-09-16
+
+### Added
+
+- Weekly-aware scoring + peak de-preference off
+
 ## [1.19.8] - 2026-09-15
 
 ### Added
