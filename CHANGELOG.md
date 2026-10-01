@@ -5,6 +5,28 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.4] - 2026-10-01
+
+### Fixed
+
+- Z.ai card timestamps are Beijing time (UTC+8), not UTC
+
+## [1.24.3] - 2026-10-01
+
+### Changed
+
+- Rst expiry always visible when a reset exists (owner rule)
+
+## [1.24.2] - 2026-10-01
+
+### Changed
+
+- Half-open socket reaper + RC reconnect watchdog
+- Install the RC reconnect watchdog as a LaunchAgent
+- Drop the notification watchdog — owner: no more notifications, RC status is already visible in-session
+- Drop watchdog script with the agent
+- Rst column shows expiry when it matters (1~2d / 1~10h)
+
 ## [1.24.1] - 2026-09-30
 
 ### Changed
