@@ -258,11 +258,49 @@ const mitmServer = http.createServer((creq, cres) => {
     // session CRUD, settings — all <64KB typical); buffer fully and send with explicit length.
     // headers-phase timeout for SHORT-RPC direct paths (see the arm site below).
     const DIRECT_STALL_MS = Number(process.env.RC_GATE_DIRECT_STALL_MS || 30_000);
+    // PRE-RESPONSE RETRY (2026-10-03). The CLI's Remote Control anti-flap budget
+    // ("kept dropping after each reconnect": 3 drops in 1h -> session disconnects,
+    // measured in the 2.1.288 binary: ro=3/no=3600000) charges a DROP whenever a
+    // direct request errors. Every Wi-Fi/LAN/hotspot switch used to 502 all
+    // in-flight heartbeats/events at once (AggregateError bursts in gate.log,
+    // 7 net-evacs on 2026-10-03 alone) -> every session disconnected by design.
+    // The CLI's socket to the gate is loopback and survives a network switch; only
+    // the gate->upstream socket dies. So RETRY transparently on a fresh socket:
+    // the CLI never sees an error, never charges the budget, and a <60s switch is
+    // invisible. Only before any response byte (idempotent-safe for heartbeats,
+    // events-registers and session CRUD; POST /v1/code/sessions creates are
+    // retried too — an upstream that got the create returns the session, and the
+    // CLI dedupes by id; measured 2026-10-03 no duplicate sessions across 3
+    // create-retries after net-evac). Long-poll /events streams that DIE MID-STREAM
+    // are not retried: response headers already went out, bytes may be duplicated.
+    const DIRECT_RETRY_MAX = Number(process.env.RC_GATE_DIRECT_RETRY_MAX || 6);
+    const DIRECT_RETRY_BACKOFF_MS = Number(process.env.RC_GATE_DIRECT_RETRY_BACKOFF_MS || 500);
+    let retryN = 0;
+    // ORPHANED-LONG-POLL REAPER (2026-10-04). Long-poll requests (/worker/events,
+    // /heartbeat, presence) hold an upstream socket for the request's whole life and
+    // have no stall timer by design. When the CLI side dies first (session banner,
+    // disconnect, quit), nothing destroyed `dir` — the upstream long-poll stayed
+    // open forever, and the 2026-10-04 morning outage left ~500 of them: pool pinned
+    // at 512/512 from 07:40Z, every new session queued ("no socket in 10s") and the
+    // CLI reported "Session creation failed". cres 'close' now aborts the in-flight
+    // upstream request AND the pending retry timer. (TCP keepalive cannot reap these:
+    // the upstream peer ACKs probes because the long-poll is genuinely open.)
+    let curDir = null, retryTimer = null;
+    cres.on('close', () => {
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      if (curDir) { try { curDir.destroy(); } catch {} }
+    });
+    // Body is buffered ONCE, outside dirSend: a retry re-runs the upstream request,
+    // but creq's 'data'/'end' events only fire the first time. Waiting for them again
+    // inside dirSend would hang every retry forever with a silently-empty body.
+    const bodyBufs = [];
+    let bodyDone = false;
+    creq.on('data', c => bodyBufs.push(c));
+    creq.on('end', () => { bodyDone = true; });
     const dirSend = () => {
-      const bodyBufs = [];
-      creq.on('data', c => bodyBufs.push(c));
-      creq.on('end', () => {
-        const body = Buffer.concat(bodyBufs);
+      const wait = bodyDone ? Promise.resolve(Buffer.concat(bodyBufs))
+        : new Promise(res => creq.on('end', () => res(Buffer.concat(bodyBufs))));
+      wait.then(body => {
         const hdrs = { ...dirHeaders };
         delete hdrs['transfer-encoding'];
         if (body.length || creq.method !== 'GET') hdrs['content-length'] = String(body.length);
@@ -319,7 +357,34 @@ const mitmServer = http.createServer((creq, cres) => {
       cres.writeHead(ures.statusCode, ures.headers);
       ures.pipe(cres);
     });
+        curDir = dir;
         dir.on('error', err => {
+          if (tStall) { clearTimeout(tStall); tStall = null; }
+          if (cres.headersSent) return;               // mid-stream: never duplicate bytes
+          // REPLAY SAFETY (2026-10-05, corrects 29b58e7). A replayed /bridge or bare
+          // /worker registration makes the server evict the live connection (close
+          // 4090 — the header comment above; pinned by rc-gate.test.js "4090
+          // regression"), and a replayed session CREATE can double-create. So:
+          //  - a CONNECT-PHASE failure (request never left this machine) is safe to
+          //    retry for ANY path — that is the network-switch case this exists for;
+          //  - after the request may have reached the server, retry ONLY the
+          //    idempotent long-polls/telemetry (heartbeat, events, presence, batches);
+          //  - our own stall-destroy is never retried (it must settle — pinned by the
+          //    session-create stall test).
+          const msg = String(err?.message || err);
+          const connectPhase = err?.name === 'AggregateError' || msg.includes('AggregateError')
+            || ['ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EAI_AGAIN'].includes(err?.code);
+          const idempotent = /\/worker\/heartbeat|\/worker\/events|\/client\/presence|\/api\/event_logging/.test(creq.url);
+          const ownStall = msg.startsWith('rc-gate: no response headers');
+          const replaySafe = !ownStall && (connectPhase || idempotent);
+          if (replaySafe && retryN < DIRECT_RETRY_MAX) {
+            retryN++;
+            const wait = DIRECT_RETRY_BACKOFF_MS * Math.min(retryN, 8);
+            console.log('[direct-retry]', creq.url, `attempt ${retryN}/${DIRECT_RETRY_MAX} after`, String(err?.message || err), `— waiting ${wait}ms`);
+            for (const sock of Object.values(directAgent.freeSockets).flat()) sock.destroy();  // never reuse a socket from the dead network
+            retryTimer = setTimeout(() => { retryTimer = null; if (!cres.destroyed && !cres.headersSent) dirSend(); }, wait);
+            return;
+          }
           console.log('[direct-error]', creq.url, String(err?.message || err));
           try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
           cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
@@ -365,7 +430,7 @@ const mitmServer = http.createServer((creq, cres) => {
         }
         dir.on('error', () => { if (tStall) clearTimeout(tStall); });
         dir.end(body);
-      });
+      }).catch(e => { console.log('[direct-error]', creq.url, 'body-buffer', String(e)); try { cres.writeHead(400); } catch {} cres.end(); });
     };
     dirSend();
     return;
