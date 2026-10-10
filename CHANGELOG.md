@@ -5,6 +5,74 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.16] - 2026-10-09
+
+### Added
+
+- Pick up rotated provider keys from Secret Manager every 30 min
+
+## [1.24.15] - 2026-10-09
+
+### Fixed
+
+- Net-evac requires the address gone 2 consecutive samples
+
+## [1.24.14] - 2026-10-09
+
+### Changed
+
+- Re-pin hold-window tests to the CLI stream ceiling
+
+### Fixed
+
+- Cap EVERY streaming hold below the CLI's 30-min stream ceiling
+
+## [1.24.13] - 2026-10-09
+
+### Fixed
+
+- Cedar_ember claim read organizations (plural) — personal accounts return organization (singular)
+
+## [1.24.12] - 2026-10-08
+
+### Fixed
+
+- Raise Node's 250ms dual-stack attempt timeout — it aborted IPv4 fallback on degraded-IPv6 networks
+
+## [1.24.11] - 2026-10-08
+
+### Documentation
+
+- Provider keys resolve over IPv4 REST — gcloud CLI hangs on IPv6-broken networks
+
+### Fixed
+
+- Blind-tunnel dual-stack race — IPv6-black-holed networks killed every non-Anthropic tunnel
+
+## [1.24.10] - 2026-10-08
+
+### Documentation
+
+- Never hand-signal the live worker — release.sh + auto-updater only
+
+### Fixed
+
+- Fetch provider keys over IPv4 REST — the gcloud CLI hangs on IPv6
+- One time budget per key lookup; a definitive REST answer skips the CLI
+
+## [1.24.9] - 2026-10-08
+
+### Fixed
+
+- False 'no sub' latch + reset-aware account preference
+- Latched account's first recheck waits a full window
+
+## [1.24.8] - 2026-10-07
+
+### Fixed
+
+- Cap network holds below Claude Code's 30-min absolute stream ceiling
+
 ## [1.24.7] - 2026-10-06
 
 ### Changed
