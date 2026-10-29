@@ -271,6 +271,28 @@ function settingsTags(am, a) {
   return tags;
 }
 
+/** The session (5h) window is what keeps traffic off this account: a pure mirror of
+ *  the router's _isSessionQuotaUnavailable, without its expiry-clearing write.
+ *  Which readings expire on their reset is the ROUTER's rule, copied here: it clears
+ *  the Claude 5h reading and the API-key limits when their reset passes, but NEVER
+ *  a provider's (GLM/Kimi) providerSes — that stays until the next usage probe, so a
+ *  provider past its reset stamp is still refused and must not read "active". */
+function sessionFull(am, a) {
+  const q = a?.quota || {};
+  const now = Date.now();
+  const bench = am?._sessionBenchThreshold?.(a, now);
+  if (!Number.isFinite(bench)) return false;
+  const expired = reset => reset != null && now >= reset;
+  if (q.unified5h != null && !expired(q.unified5hReset) && q.unified5h >= bench) return true;
+  const apiLive = !(q.resetsAt && now >= new Date(q.resetsAt).getTime());
+  if (apiLive && q.tokensLimit != null && q.tokensRemaining != null
+      && 1 - q.tokensRemaining / q.tokensLimit >= bench) return true;
+  if (apiLive && q.requestsLimit != null && q.requestsRemaining != null
+      && 1 - q.requestsRemaining / q.requestsLimit >= bench) return true;
+  if (q.providerSes != null && q.providerSes >= bench) return true;
+  return false;
+}
+
 /** True when the reservation is what is currently keeping traffic off this account
  *  — either window at or past the cap. Reads the manager's own predicate so the
  *  label can never disagree with routing. */
@@ -282,7 +304,13 @@ function capBenched(am, a) {
   // Each reading is judged against ITS OWN window's cap — under the dynamic cap the
   // two differ (a 5h window nearly over is lifted while the weekly is still at its
   // floor), so passing the default window for both would mislabel one of them.
-  return !!(am?._capped?.(a, ses, 'ses') || am?._capped?.(a, wk, 'wk'));
+  if (am?._capped?.(a, ses, 'ses') || am?._capped?.(a, wk, 'wk')) return true;
+  // Providers: the router's weekly gate judges max(5h, weekly) against the WEEKLY
+  // cap (_weeklyRawState), so a 5h reading over the weekly cap benches it too.
+  if (a.type === 'provider' && (ses != null || wk != null)) {
+    return !!am?._capped?.(a, Math.max(ses ?? 0, wk ?? 0), 'wk');
+  }
+  return false;
 }
 
 export function weeklyPolicyText(am, account) {
@@ -495,7 +523,7 @@ export class TUI {
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
-    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null });
+    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null, caller: info.caller || null });
     this.render();
   }
 
@@ -509,6 +537,9 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
+    // Named-caller attribution (team pools): prefix the log line with the person
+    // whose pool key authenticated the request. Null on legacy/local setups.
+    const who = info.caller || r?.caller ? `${info.caller || r?.caller} · ` : '';
     // Tag PROVIDER-routed requests with the maxpool session id so provider traffic
     // (when-exhausted overflow, or an incompatible-session pin) is traceable back to
     // the session that caused it: grep the event log for `→ glm-fallback … [sess X]`,
@@ -516,7 +547,7 @@ export class TUI {
     // guard — a header-less request has sessionKey '' (server.js headerValue) → no tag.
     const isProvider = this.am.accounts.find(a => a.name === acct)?.type === 'provider';
     const tag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tag}`);
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tag}`);
   }
 
   _addLog(msg) {
@@ -1007,10 +1038,12 @@ export class TUI {
 
 
   _keyRouting(k) {
-    if (k === 'a') {
+    if (k === 'a' && this.am.routingMode !== 'preferred') {
+      this._addLog('No account is pinned — routing is already automatic');
+    } else if (k === 'a') {
       this._confirm(
-        'Use automatic routing?',
-        'Spread new requests across healthy accounts using load, quota, and recent errors.',
+        'Unpin and use automatic routing?',
+        'Removes the pinned account. New requests are spread across all healthy accounts again.',
         () => this._setAutomaticRouting(),
       );
     } else if (k === 'p' && this.am.accounts.some(account => account.type !== 'provider')) {
@@ -1240,7 +1273,14 @@ export class TUI {
           ? `${Math.round(existing * 100)}%${existingMode === 'dynamic' ? ' dynamic' : ' fixed'}`
           : 'off';
         this.mode = 'input';
-        this.inputPrompt = `Usage cap for "${current}" — NN = dynamic floor (rises near reset), fNN = fixed, 0 = off, now ${nowLabel}`;
+        // Plain-English prompt (owner 2026-10-13: "I'm not sure how does this work.
+        // I want to keep the dynamic floor, but I also want to raise the basic cap").
+        // Type just a number = the dynamic cap's STARTING level: routing USES the
+        // account up to NN% of each window, and the allowance rises toward the
+        // switch threshold as the window nears its reset (by elapsed time —
+        // _effectiveCap), so unused capacity isn't stranded. fNN = fixed stop at NN%.
+        // 0 / off = no cap. Kept short: the typed value must stay on an 80-col line.
+        this.inputPrompt = `Cap ${current}, now ${nowLabel}. 75=use to 75%+rises near reset f75=hard 0=off`;
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doSetCap(targetIdx, String(value || '').trim());
@@ -2051,10 +2091,20 @@ export class TUI {
     // 2 = separator + footer; confirm adds its detail line; updates adds its detail block.
     const footerH = this.mode === 'confirm' ? 3
       : this.mode === 'updates' ? 2 + this._renderUpdatesDetail().length
+      : this.mode === 'routing' ? 2 + this._renderRoutingDetail().length
       : 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
       lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
+    }
+
+    // The footer is the screen's controls — it must never be pushed off. On a short
+    // terminal cut the BODY from the bottom, and say so.
+    if (lines.length > H - footerH) {
+      const keep = Math.max(0, H - footerH - 1);
+      const hidden = lines.length - keep;
+      lines.length = keep;
+      lines.push(` ${dim(`… ${hidden} more row${hidden === 1 ? '' : 's'} — make the window taller to see them`)}`);
     }
 
     // Pad to fill
@@ -2067,6 +2117,7 @@ export class TUI {
     // very bottom of a busy screen, which reads as "nothing happened" (reported twice).
     // Every other mode draws something visible; this one must too.
     if (this.mode === 'updates') lines.push(...this._renderUpdatesDetail());
+    if (this.mode === 'routing') lines.push(...this._renderRoutingDetail());
     lines.push(this._renderFooter());
 
     this._writeScreen(lines, W, H);
@@ -2146,6 +2197,20 @@ export class TUI {
     // credentials were fine or long dead, so re-enabling it later silently produced a
     // broken account. Reported 2026-08-10 with all 8 disabled accounts sitting on dead
     // credentials (HTTP 401) and no way to see it.
+    // HELD BY ITS OWN LIMITS (2026-10-13). An account the router refuses must not read
+    // "active": 16 requests sat parked for 35 minutes while two rows said "active" next
+    // to an account held at its usage cap and another whose 5h window was full. Only
+    // relabels an otherwise-active row; exhausted / throttled / auth states keep their
+    // own (more specific) word. "capped" = the owner's usage cap is holding it;
+    // "5h full" = its session window is used up until the reset shown on the row.
+    // Pure predicates on purpose: _weeklyRawState/_isSessionQuotaUnavailable call
+    // _clearExpiredQuotas, which MUTATES the quota (nulls an expired window), so calling
+    // them here blanked this row's own bars mid-render. (_render already runs the
+    // manager's expiry refresh once per frame, before any row is drawn.)
+    if (a.enabled !== false && effectiveStatus === 'active') {
+      if (capBenched(this.am, a)) effectiveStatus = 'capped';
+      else if (sessionFull(this.am, a)) effectiveStatus = '5h full';
+    }
     if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
     // Subscription gone (org-disabled 403): a DISTINCT state from reauth — re-logging in
     // will NOT fix it until the subscription is re-purchased. Says the actionable thing.
@@ -2182,6 +2247,8 @@ export class TUI {
         break;
       }
       case 'exhausted': status = red('exhausted'); break;
+      case 'capped':    status = yellow('capped'); break;
+      case '5h full':   status = yellow('5h full'); break;
       case 'error':     status = red('error'); break;
       default:          status = a.status || 'ready';
     }
@@ -2376,6 +2443,10 @@ export class TUI {
       wkCell = q.providerWk != null ? bar(q.providerWk, bw, q.providerWkReset)
         : emptyBar(q.weeklyAbsent ? 'none' : '—', bw);
       note = this._probeHealthNote(a);
+      // OUTSIDE-USAGE tag (2026-10-27): someone else is spending this account's quota
+      // with the same key. Red and first, because it explains every other symptom on
+      // the row (wall hit too fast, cards vanishing) and the fix is a key rotation.
+      if (a.outsideUsage?.outside) note += `  ${red(`key used outside pool ×${Math.max(1, Math.round(a.outsideUsage.zaiCalls / Math.max(1, a.outsideUsage.poolCalls)))}`)}`;
       // PEAK row tag (SC9): mirrors the router's own predicates — hard-barred = off,
       // tier 2 = over cap, tier 1 = peak (or "cap n/a" when the weekly is unreadable,
       // so the soft cap is inert). The label can never disagree with routing because
@@ -2501,8 +2572,9 @@ export class TUI {
       const prov = gray(providerLabel(a).padEnd(PROVIDER_W));
 
       // The no-weekly plan has NO weekly window to complete — its weekly "capacity" is
-      // derived: avg session tank × 33.6 (the number of 5h windows in 7 days). Shown as
-      // ≈ to mark the derivation; N is the count of session cycles it rests on.
+      // derived: avg session tank × 33.6 (the number of 5h windows in 7 days). Shown
+      // without a marker (owner 2026-08-26: the row's text states the derivation);
+      // N is the count of session cycles it rests on.
       if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
@@ -2530,12 +2602,14 @@ export class TUI {
         cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
       }
       const curPct = util != null && cur !== '--' ? dim(`@${Math.round(util * 100)}%`) : '';
-      const st = ledger.windowStats(a.name, win);
+      // Every history column is a TANK number (tokens ÷ closing %). Prev/N used to
+      // come from windowStats — delivered tokens and a different cycle set — so one
+      // row mixed units (2026-10-13 owner report; see tankStats' reading-set note).
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
-        Prev: (st?.prev != null ? formatTokens(st.prev) : '--'),
+        Prev: (tank?.source === 'cycles' && tank.prev != null ? formatTokens(tank.prev) : '--'),
         Avg: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
-        N: (st ? String(st.cycles) : '--'),
+        N: (tank?.source === 'cycles' ? String(tank.n) : '--'),
       };
       const row = '  ' + name + ' ' + prov + ' '
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');
@@ -2545,6 +2619,37 @@ export class TUI {
     out.push('');
     out.push(' ' + dim('Capacity = tokens ÷ how full the provider said the window was, at close.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
+    return out;
+  }
+
+  /**
+   * Routing DETAIL — what each key on this screen controls and how to undo it.
+   * (2026-10-13: "the cap setting only changes GLM", "I pinned an account and have no
+   * idea how to switch it back", "where is the cap for individual accounts?")
+   */
+  _renderRoutingDetail() {
+    // Every line fits 80 columns: a truncated explanation is no explanation.
+    const out = [];
+    const pinned = this.am.routingMode === 'preferred' && this.am.preferredAccountName;
+    // The manual pin: state, what it does, and the way out — always visible.
+    if (pinned) {
+      out.push(` ${yellow(`Pinned to ${this.am.preferredAccountName}`)}  ${bold('a')} Unpin  ${bold('p')} Change`);
+      out.push(` ${dim('It gets every request it can take; the others only cover for it.')}`);
+    } else {
+      out.push(` ${bold('p')} Pin one Claude account ${dim('(undo:')} ${bold('a')}${dim(')')}`);
+      out.push(` ${dim('Sends everything to it first; the others only cover for it.')}`);
+    }
+    const hasPeak = this.am.accounts.some(a => a.type === 'provider'
+      && (this.am._peakSettingsFor?.(a.provider)?.windows || []).length > 0);
+    if (hasPeak) {
+      out.push(` ${bold('c')} GLM peak cap ${dim('— GLM accounts only, in GLM peak hours. Not Claude.')}`);
+    }
+    // Where the per-account cap actually is.
+    out.push(` ${dim('Usage cap for ONE account:')} ${bold('Esc')} ${dim('then')} ${bold('a')} ${dim('→')} ${bold('u')} ${dim('(Claude or GLM)')}`);
+    const capped = this.am.accounts.filter(a => a.capUtilization != null && a.enabled !== false);
+    if (capped.length) {
+      out.push(` ${dim('Caps set:')} ${capped.map(a => `${a.name} ${Math.round(a.capUtilization * 100)}%`).join(', ')}`);
+    }
     return out;
   }
 
@@ -2586,9 +2691,13 @@ export class TUI {
           const dep = ps.depreference ? yellow('GLM last') : cyan('normal');
           const cap = ps.cap >= 1 ? 'off' : ps.cap === 0 ? 'never' : `${Math.round(ps.cap * 100)}%`;
           const wk = this.am.scheduler.weeklyAwareScoring === false ? yellow('5h-only') : cyan('weekly');
-          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}cap ${cyan(cap)} ${bold(' w ')}score:${wk}`;
+          // "cap" alone read as THE usage cap for every account (2026-10-13). It is not:
+          // it only limits GLM accounts, only during GLM's peak hours. Say so.
+          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}GLM peak cap ${cyan(cap)} ${bold(' w ')}score:${wk}`;
         }
-        return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('p')} Preference  ${bold('Esc')} Back`;
+        // The pin and the account-cap pointer live in the DETAIL block above this line
+        // (_renderRoutingDetail) — one footer line cannot carry them without truncating.
+        return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('Esc')} Back`;
       }
       case 'select': {
         const act = this.selAction === 'prefer'
@@ -2600,8 +2709,23 @@ export class TUI {
               : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
-      case 'input':
-        return ` ${this.inputPrompt}: ${this.inputSensitive ? '•'.repeat(this.inputBuf.length) : this.inputBuf}█`;
+      case 'input': {
+        // The typed value and the cursor are the whole point of this line — they are
+        // NEVER truncated. On a narrow terminal the PROMPT gives way instead, keeping
+        // its last words (nearest the value). Red-team 2026-10-13: the long cap
+        // prompt pushed the input off a 200-column terminal entirely.
+        const shown = this.inputSensitive ? '•'.repeat(this.inputBuf.length) : this.inputBuf;
+        const full = ` ${this.inputPrompt}: ${shown}█`;
+        const visible = full.replace(ANSI_RE, '');
+        const budget = (process.stdout.columns || 80) - 2;
+        if (visible.length <= budget) return full;
+        const keep = Math.max(0, budget - (shown.length + 2)); // ' …' + value + cursor
+        const cut = visible.length - budget;
+        const trimmed = this.inputPrompt.length > cut + 1
+          ? this.inputPrompt.slice(0, Math.max(1, keep - 1)) + '…'
+          : this.inputPrompt;
+        return ` ${trimmed}: ${shown}█`;
+      }
       case 'confirm':
         return ` ${bold(this.confirmTitle)}  ${bold('y')} Yes  ${bold('n')} No`;
       default:

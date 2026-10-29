@@ -1,4 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
 
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
@@ -327,6 +328,10 @@ const PERSISTED_QUOTA_FIELDS = [
   'providerQuotaSource', 'lastProbeOkAt',
 ];
 
+const PROVIDER_429_MIN_BENCH_SEC = 60;
+const PROVIDER_429_MAX_BENCH_SEC = 15 * 60;
+const PROVIDER_429_STREAK_FORGET_MS = 60 * 60 * 1000;
+
 function clampRetryAfterSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 60;
@@ -460,6 +465,10 @@ export class AccountManager {
       else this.scheduler.routingMode = 'sticky';
     }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
+    // Named-caller request attribution (team pools): callerName → requests served.
+    // Server-side (not TUI-side) so headless pools feed the web screen too.
+    this.callerCounts = new Map();
+    this.poolUpSince = Date.now();
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -781,6 +790,19 @@ export class AccountManager {
     }));
   }
 
+  /** OUTSIDE-USAGE (2026-10-27): count every request the pool sends on a provider
+   *  account, per UTC hour — the pool half of the outside-usage comparison. The
+   *  map is bounded (last 25 hours) and in-memory only. */
+  notePoolSend(account, at = Date.now()) {
+    if (!account || account.type !== 'provider') return;
+    account.poolHourly ||= new Map();
+    const h = hourFloor(at);
+    account.poolHourly.set(h, (account.poolHourly.get(h) || 0) + 1);
+    if (account.poolHourly.size > 25) {
+      for (const k of [...account.poolHourly.keys()].sort().slice(0, account.poolHourly.size - 25)) account.poolHourly.delete(k);
+    }
+  }
+
   acquireAccount(requestInfo = {}, excludedIndexes = new Set()) {
     this._noteRequestPolicy(requestInfo);
     // Capture the session's prior account BEFORE selection, so the caller can tell
@@ -802,6 +824,7 @@ export class AccountManager {
     account.inFlight++;
     account.activeWeight += weight;
     account.lastUsedAt = Date.now();
+    this.notePoolSend(account);
     // Non-null only when this acquire moved the session off its prior account.
     const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
     return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName };
@@ -818,6 +841,13 @@ export class AccountManager {
     if (!binding) return;
     binding.currentName = name;
     this.sessionBindings.set(sessionKey, binding);
+  }
+
+  // Named-caller attribution: one bump per CLIENT request (server calls this
+  // right after auth, so retries/reroutes never double-count).
+  countRequest(callerName) {
+    if (!callerName) return;
+    this.callerCounts.set(callerName, (this.callerCounts.get(callerName) || 0) + 1);
   }
 
   releaseAccount(lease, outcome = {}) {
@@ -845,6 +875,7 @@ export class AccountManager {
     if (outcome.success) {
       account.completedRequests++;
       account.consecutiveFailures = 0;
+      account.providerRateLimitStreak = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
       if (account.provisionalUpstreamFingerprint) {
@@ -3728,7 +3759,7 @@ export class AccountManager {
     spannedDays.add(new Date(now).toISOString().slice(0, 10));
     for (const name of this.capacity.accounts()) {
       if (this.capacity.openCycle(name, 'ses') || this.capacity.openCycle(name, 'wk')) {
-        this.capacity.markPartial(name);
+        this.capacity.markPartial(name, { reason: 'maxpool-downtime' });
       }
       for (const day of spannedDays) this.capacity.markDayPartial(name, day);
     }
@@ -3964,8 +3995,31 @@ export class AccountManager {
       return;
     }
 
+    // Provider "slow down" backoff (2026-10-21): z.ai answers a GLM 429 with a 3-12s
+    // hint, and honouring it re-selected the account seconds later — ~200 refusals on
+    // max+1 over 2026-10-16/17, then a z.ai usage-risk notice. Bench a provider 429
+    // for at least 60s, doubling per back-to-back 429 up to 15 min; a success resets
+    // the streak (releaseAccount). Claude accounts keep the exact retry-after.
+    // A parallel 429 landing while the account is already benched is the SAME refusal
+    // burst — it keeps the bench and does not escalate (red-team 2026-10-21: up to 50
+    // in-flight requests per account turned one burst into the 15-min cap). The streak
+    // also forgets after an hour with no refusals.
+    let benchSeconds = retryAfter;
+    if (account.type === 'provider' && (options.status || 429) === 429) {
+      const now = Date.now();
+      if (account.status === 'throttled' && account.rateLimitedUntil > now) {
+        benchSeconds = Math.max(retryAfter, Math.ceil((account.rateLimitedUntil - now) / 1000));
+      } else {
+        if (now - (account.providerRateLimitAt || 0) > PROVIDER_429_STREAK_FORGET_MS) account.providerRateLimitStreak = 0;
+        const streak = account.providerRateLimitStreak || 0;
+        benchSeconds = Math.max(retryAfter, Math.min(PROVIDER_429_MAX_BENCH_SEC, PROVIDER_429_MIN_BENCH_SEC * 2 ** streak));
+        account.providerRateLimitStreak = streak + 1;
+      }
+      account.providerRateLimitAt = now;
+    }
+
     account.status = 'throttled';
-    account.rateLimitedUntil = Date.now() + (retryAfter * 1000);
+    account.rateLimitedUntil = Date.now() + (benchSeconds * 1000);
     account.lastStatus = options.status || 429;
     account.lastError = 'rate_limited';
     account.lastErrorAt = Date.now();
@@ -3974,7 +4028,7 @@ export class AccountManager {
       account.failedRequests++;
       account.consecutiveFailures++;
     }
-    console.log(`[alPool] Account "${account.name}" rate limited for ${retryAfter}s`);
+    console.log(`[alPool] Account "${account.name}" rate limited for ${benchSeconds}s${benchSeconds > retryAfter ? ` (provider asked ${retryAfter}s; backing off)` : ''}`);
   }
 
   markAuthFailed(accountIndex, status = 403, reason = 'auth_failed') {
@@ -4412,8 +4466,12 @@ export class AccountManager {
     const configTokens = new Set(
       entries.map(e => e.token).filter(Boolean),
     );
+    // Same rule for a provider KIND config already covers: a header-derived fallback
+    // of that kind is a duplicate login even when its token differs (a pre-rotation key).
+    const configKinds = new Set(entries.filter(e => e.token).map(e => e.provider).filter(Boolean));
     for (const a of [...this.accounts]) {
-      if (!a.configSourced && a.type === 'provider' && a.credential && configTokens.has(a.credential)) {
+      if (!a.configSourced && a.type === 'provider' && a.credential
+          && (configTokens.has(a.credential) || (a.runtime && configKinds.has(a.provider)))) {
         const idx = this.accounts.indexOf(a);
         if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);
       }
@@ -4504,7 +4562,12 @@ export class AccountManager {
     return this.accounts.map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      return { accountUuid: a.accountUuid, name: a.name, quota };
+      const out = { accountUuid: a.accountUuid, name: a.name, quota };
+      // OUTSIDE-USAGE flag survives restart (red-team R1.2): a restart is exactly
+      // when a leak's cards are most at risk — remediation rotates keys and
+      // restarts the pool, and the in-memory flag would vanish mid-remediation.
+      if (a.outsideUsage?.outside) out.outsideUsage = { ...a.outsideUsage };
+      return out;
     });
   }
 
@@ -4538,6 +4601,12 @@ export class AccountManager {
       }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
+      // OUTSIDE-USAGE restored: keep holding R7 and force the next sweep to
+      // re-verify immediately (fresh poolHourly can only re-prove the leak).
+      if (match.outsideUsage?.outside) {
+        account.outsideUsage = { ...match.outsideUsage, stale: true };
+        account._outsideCheckedAt = 0;
+      }
     }
   }
 
@@ -4602,6 +4671,7 @@ export class AccountManager {
           ? new Date(Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)).toISOString()
           : null,
         quota: { ...a.quota },
+        outsideUsage: a.outsideUsage ? { ...a.outsideUsage } : null,
         weekly: {
           state: this._weeklyState(a),
           rawState: this._weeklyRawState(a),
@@ -4659,6 +4729,7 @@ export class AccountManager {
           ? Math.max(0, now - this.queueState.waiting[0].queuedAt)
           : 0,
       },
+      callers: Object.fromEntries([...this.callerCounts.entries()].map(([n, c]) => [n, { requests: c }])),
       sessions: {
         stickyBindings: this.sessionBindings.size,
         thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,

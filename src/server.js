@@ -1,6 +1,8 @@
 import http from 'node:http';
+import { appendEventLog } from './event-log.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { modelFamily } from './oauth.js';
 
@@ -39,6 +41,15 @@ const isNetworkCode = c => Boolean(c) && NETWORK_ERROR_CODES.has(c);
 const NETWORK_SOAK_NONSTREAM_MS = Math.max(5_000,
   Number(process.env.MAXPOOL_NETWORK_SOAK_NONSTREAM_MS) || 45_000);
 const QUEUE_KEEPALIVE = 'event: ping\ndata: {}\n\n';
+// Account screen shell (served keyless at /maxpool/screen; the page itself prompts
+// for a pool key and reads the key-gated /maxpool/status). Read once at boot.
+const SCREEN_HTML = (() => {
+  try {
+    return readFileSync(new URL('./screen.html', import.meta.url), 'utf8');
+  } catch {
+    return '<!doctype html><title>Maxpool</title><p>screen.html missing</p>';
+  }
+})();
 // Claude Code's absolute per-stream ceiling (binary-verified 2026-10-07: idle timeout =
 // min(env-or-300s-floor, 1800000)). Nothing resets it; the stream dies at 30 min.
 const CLI_STREAM_CEILING_MS = 25 * 60_000;   // bound network holds strictly below it
@@ -146,6 +157,42 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const logDir = config.logDir || null;
   let requestCounter = 0;
 
+  // ── team clients (per-person keys + caller identity) ──
+  // `clients: [{name, key}]` opts into strict auth: EVERY request (proxy traffic,
+  // /maxpool/status, /maxpool/screen) must carry a listed key, the loopback bypass
+  // is removed, and each request is attributed to the named person in logs/status.
+  // A non-loopback listen host also forces strict even without clients (a shared
+  // pool must never trust by address). Default local config (loopback host, no
+  // clients) keeps today's behavior exactly.
+  const clientList = Array.isArray(config.proxy?.clients)
+    ? config.proxy.clients.filter(c => c && typeof c.key === 'string' && c.key)
+    : [];
+  const clientByKey = new Map(clientList.map(c => [c.key, c.name]));
+  // '0.0.0.0' stays in the trusted set for backward compatibility (a solo user who
+  // binds every interface keeps keyless local use); it is warned about at startup
+  // because it also exposes the pool to the network. Shared pools set `clients`.
+  const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0']);
+  const hostIsLoopback = (config.proxy?.host == null) || LOOPBACK_HOSTS.has(String(config.proxy.host).toLowerCase());
+  const strictClients = clientByKey.size > 0 || !hostIsLoopback;
+  const resolveCaller = (key, isLocal) => {
+    if (key != null && clientByKey.has(key)) return { name: clientByKey.get(key), ok: true };
+    // Legacy single key still works — including strict mode, so a solo user can
+    // point clients at a shared host without defining named clients.
+    if (proxyApiKey && key === proxyApiKey) return { name: null, ok: true };
+    if (!strictClients) {
+      // Legacy trust model: loopback callers are trusted; when NO key is
+      // configured at all the pool is open (today's no-apiKey behavior).
+      if (isLocal || !proxyApiKey) return { name: null, ok: true };
+    }
+    return { name: null, ok: false };
+  };
+  if (strictClients) {
+    const who = clientByKey.size > 0 ? `${clientByKey.size} named client${clientByKey.size > 1 ? 's' : ''}` : 'non-loopback listen host';
+    appendEventLog(`[Maxpool] Strict client auth ON (${who}; loopback bypass removed)`);
+  } else if (String(config.proxy?.host) === '0.0.0.0') {
+    appendEventLog('[Maxpool] WARNING: listening on every interface (0.0.0.0) with local callers trusted keyless — set proxy.clients to require a key from everyone');
+  }
+
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
   }
@@ -163,7 +210,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // upstream-bound request headers elsewhere.
   const workerStamp = String(process.pid);
 
-  const server = http.createServer(async (req, res) => {
+  // REQUEST-ARRIVAL TIMEOUTS (2026-10-11 outage). Node's defaults (300s request
+  // timeout, 30s checking interval) are what fired live — but they must be in the
+  // constructor to be settable at all (property assignment after listen is a no-op
+  // in Node 20, measured), so they are read here, env-tunable, never mutated later.
+  const server = http.createServer({
+    requestTimeout: Math.max(1_000, Number(process.env.MAXPOOL_REQUEST_TIMEOUT_MS) || 300_000),
+    connectionsCheckingInterval: Math.max(100, Number(process.env.MAXPOOL_CONNECTIONS_CHECK_MS) || 30_000),
+  }, async (req, res) => {
     try {
       // Disable Nagle on the client socket: flush each SSE event immediately instead
       // of coalescing small writes into bursts. Smooths streaming cadence toward the
@@ -174,10 +228,35 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
       }
-      // Auth check — skip for localhost connections
+      // Auth check — per-person clients when configured, legacy single key otherwise.
+      // strictClients (clients list present, or a non-loopback listen host) removes
+      // the loopback bypass entirely: every caller must present a known key.
       const clientKey = req.headers['x-api-key'];
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+      const caller = resolveCaller(clientKey, isLocal);
+
+      const rejectUnauthorized = () => {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: strictClients ? 'Invalid or missing pool key' : 'Invalid proxy API key' },
+        }));
+      };
+
+      // Account screen: a static page with NO data in it — it asks the viewer for
+      // their pool key and reads /maxpool/status with it (which stays key-gated
+      // below), so serving the shell itself keyless leaks nothing.
+      if (req.method === 'GET' && (req.url === '/maxpool/screen' || req.url === '/maxpool/screen/')) {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Frame-Options': 'DENY',
+          'Referrer-Policy': 'no-referrer',
+        });
+        res.end(SCREEN_HTML);
+        return;
+      }
 
       // Native clients use the same authenticated loopback listener as the proxy,
       // but all mutations remain backend-owned. The app sends typed commands here;
@@ -225,12 +304,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // Status exposes account names and quota state, so require the local
       // proxy key even for loopback callers.
       if (req.method === 'GET' && req.url === '/maxpool/status') {
-        if (proxyApiKey && clientKey !== proxyApiKey) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-          }));
+        if (strictClients ? !caller.ok : (proxyApiKey && clientKey !== proxyApiKey)) {
+          rejectUnauthorized();
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -238,14 +313,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-        }));
+      if (!caller.ok) {
+        rejectUnauthorized();
         return;
       }
+      // In strict mode the legacy single key is still accepted; label it so its
+      // traffic is attributed and logged rather than anonymous.
+      req.callerName = caller.name || (strictClients ? 'legacy-key' : null);
+      accountManager.countRequest?.(req.callerName);
 
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
@@ -253,7 +328,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
         const reqId = ++requestCounter;
         const ctx = { account: '(oauth relay)', status: null };
-        const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session') });
+        const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session'), caller: req.callerName || null });
         if (accepted === false) {
           res.writeHead(503, {
             'Content-Type': 'application/json',
@@ -279,6 +354,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             path: req.url,
             account: ctx.account,
             status: ctx.status,
+            caller: req.callerName || null,
           });
         }
         return;
@@ -289,7 +365,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // sessionKey (from the per-terminal x-maxpool-session header) lets the TUI show
       // how many distinct client sessions the in-flight requests span — so "N in-flight"
       // isn't misread as "N sessions" (subagents of one terminal share one session key).
-      const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session') });
+      const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session'), caller: req.callerName || null });
       if (accepted === false) {
         res.writeHead(503, {
           'Content-Type': 'application/json',
@@ -374,6 +450,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
+          caller: req.callerName || null,
         });
       }
     } catch (err) {
@@ -385,6 +462,31 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // keep-alive clients retire their socket and don't pipeline a new request onto
   // this releasing worker.
   server.maxpoolBeginDrain = () => { draining = true; };
+
+  // STALLED-UPLOAD ANSWER (2026-10-11 outage). When a request body never finishes
+  // arriving, Node's requestTimeout fires and its default handler writes a BODY-LESS
+  // `408 Request Timeout`, which Claude Code surfaces as the opaque "API Error: 408
+  // status code (no body)" (1,711 of them overnight, while the Mac's network stack
+  // was starved). Answer with the standard Anthropic error envelope instead, naming
+  // the actual cause, so the user sees a real message and the CLI treats it like any
+  // other retryable API error. Every other client error keeps Node's own handling.
+  server.on('clientError', (err, socket) => {
+    if (err?.code === 'ERR_HTTP_REQUEST_TIMEOUT' && socket.writable && !socket._httpMessage?.headersSent) {
+      const body = JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'request_timeout',
+          message: 'Maxpool did not receive the full request in time (the upload stalled — usually a network problem on this machine). Retrying should work once the network recovers.',
+        },
+      });
+      // end-then-DESTROY: a half-closed socket kept parsing, so a client that resumed its
+      // upload after the 408 got its request forwarded upstream anyway — a duplicate,
+      // possibly billed call (red-team 2026-10-12, finding 6).
+      socket.end(`HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`, () => socket.destroy());
+      return;
+    }
+    socket.destroy(err);
+  });
 
   return server;
 }
@@ -558,7 +660,19 @@ async function forwardRequest(
     ctx.account = '(none available)';
     const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
     const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
-    const retryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
+    // CLI-RETRIABLE CAP (2026-10-11 "bricked sessions"). The real soonest reset can
+    // be hours out; sending `retry-after: 10800` makes Claude Code's SDK treat the
+    // 429 as terminal (binary-verified 2.1.296: a plain rate_limit 429 whose
+    // retry-after exceeds 60s + 25% headroom aborts with tengu_api_retry_after_too_long
+    // — it neither sleeps nor retries; the turn dies and the session looks dead).
+    // The pool has ALREADY decided not to hold this request, so the honest and
+    // useful header is "retry soon": every SDK retries ≤60s values with backoff,
+    // and the pool answers again immediately with a fresh estimate. The body text
+    // still carries the real wait.
+    // Header = CLI-retriable cap; message = the REAL wait (2026-10-12: the capped
+    // number leaked into the text as "Retry in ~1m" while the real wait was ~1h).
+    const retryAfter = clientRetryAfterSeconds(retryPlan.retryAfterMs);
+    const realWaitS = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
     // Surface the routing decision (logs go to the TUI; this is the only record
     // of WHY a request was rejected rather than queued).
     console.log(`[alPool] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
@@ -566,7 +680,7 @@ async function forwardRequest(
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: unavailableMessage(accountManager, requestInfo, retryAfter, willRecoverSoon),
+        message: unavailableMessage(accountManager, requestInfo, realWaitS, willRecoverSoon),
       },
     }, { 'retry-after': String(retryAfter) });
     return;
@@ -939,15 +1053,15 @@ async function forwardRequest(
       if (logDir) writeRequestLog(logDir, reqId, logSections);
       const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
       const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
-      const clientRetryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
+      const realWaitS = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
       console.log(`[alPool] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
       sendErrorResponse(res, requestInfo, 429, {
         type: 'error',
         error: {
           type: 'rate_limit_error',
-          message: unavailableMessage(accountManager, requestInfo, clientRetryAfter, willRecoverSoon),
+          message: unavailableMessage(accountManager, requestInfo, realWaitS, willRecoverSoon),
         },
-      }, { 'retry-after': String(clientRetryAfter) });
+      }, { 'retry-after': String(clientRetryAfterSeconds(retryPlan.retryAfterMs)) });
       return;
     }
 
@@ -1971,7 +2085,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2751,9 +2865,23 @@ async function queueAndRetry(
   // terminal (disabled / error / auth-dead)". This is what stops an indefinite
   // hold from silently hanging every session when something is actually broken
   // (all accounts logged out, the only healthy account removed, etc.).
-  const retryAfterMs = retryPlan.retryAfterMs;
-  if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) {
-    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+  const retryAfterMs = retryPlan.retryMs ?? retryPlan.retryAfterMs;
+  // ALWAYS HOLD FIRST (owner 2026-10-28: "zero reason to drop those requests… even
+  // when I'm out of accounts completely, I buy new ones"). The old oracle errored
+  // fast whenever no FINITE scheduled reset existed (no_eligible_route,
+  // weekly_reset_unknown, reset beyond window) — but recovery does not need a
+  // schedule: config auto-sync adopts a newly bought account in ~15s, and a sibling
+  // completing frees a slot in seconds; hasAvailableRoute polls both every tick.
+  // So: hold the FULL window regardless of the plan, and only at expiry end with
+  // the ≤60s-retriable 429 (clientRetryAfterSeconds caps the header), which the
+  // CLI obeys silently — that IS the chaining mechanism, for streams and
+  // non-streams alike. Windows stay hard-capped at the client's own ceilings
+  // (25m stream / 5m non-stream), so nothing can hang past what the client
+  // survives. queueHoldChain is now purely informational in the log line.
+  if (queueWindowMs > 0 && Number.isFinite(retryAfterMs)
+      && retryAfterMs > queueWindowMs
+      && !CAPACITY_CLASS_RETRY_CAUSES.has(retryPlan.cause)) {
+    requestInfo.queueHoldChain = true;
   }
 
   requestInfo.queueStartedAt ||= Date.now();
@@ -2780,12 +2908,14 @@ async function queueAndRetry(
 
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
-  console.log(`[alPool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
+  // Hold-chain note: when this hold expires still-full (queueHoldChain), the
+  // finishQueuedStreamIfNeeded below ends the stream with the retriable error and
+  // the client re-enters — the log line makes the chaining visible.
+  console.log(`[alPool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause}${requestInfo.queueHoldChain ? ', hold-chain: reset beyond window' : ''})`);
   ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) {
-    if (res.destroyed || req.destroyed) return true;
     accountManager.removeQueuedRequest?.(requestInfo);
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
@@ -2907,8 +3037,12 @@ async function waitForAvailableRoute(req, res, accountManager, requestInfo, queu
       // removed, or the reset is unknown → retryAfterMs Infinity), stop holding
       // and error fast instead of spinning to the 7d ceiling. Hold is valid only
       // while ≥1 eligible route has a finite, known reset.
-      const plan = accountManager.nextRetryForRequest?.(requestInfo, new Set());
-      if (plan && plan.cause !== 'available' && !Number.isFinite(plan.retryAfterMs)) return false;
+      // NOTE (owner 2026-10-28, queue-never-fail): the old non-finite-plan bail is
+      // GONE. hasAvailableRoute above is checked every tick and returns true the
+      // moment a route exists — including one created by config auto-sync adopting
+      // a newly added account, which nextRetryForRequest cannot foresee. The
+      // window (hard-capped at the client ceilings) bounds the poll; expiry hands
+      // back a ≤60s-retriable 429 the client retries silently.
 
       const remaining = maxWaitMs - (Date.now() - startedAt);
       // Jitter the poll so a synchronized weekly-reset event doesn't re-align
@@ -3095,9 +3229,29 @@ function prepareRuntimeProviders(accountManager, headers) {
       .filter(a => a.configSourced && a.credential)
       .map(a => a.credential),
   );
+  // THE PROXY OWNS THE KEYS (2026-10-10). When config already manages accounts of a
+  // provider kind, a session-supplied key for that kind is ignored outright. Dedup by
+  // token alone was not enough: a session launched before a key rotation keeps sending
+  // the OLD key for its whole life, and it surfaced as a duplicate "glm-fallback"
+  // account for the same z.ai login (1,578 requests on the old key in 2 days).
+  // A kind counts as proxy-managed only while at least one of its config accounts
+  // HOLDS a key: if every one is unresolved (the secret-unresolved outages of
+  // 2026-10-05/08) the session key still stands in as the safety net.
+  const configKinds = new Set(
+    (accountManager.accounts || []).filter(a => a.configSourced && a.credential).map(a => a.provider),
+  );
+  // Self-clean: a fallback created before the config keys loaded (or restored from
+  // state) is dropped as soon as it is idle — no restart, no waiting for old sessions.
+  // (removeAccount itself refuses an account with a request in flight.)
+  for (const a of [...(accountManager.accounts || [])]) {
+    if (a.runtime && !a.configSourced && a.type === 'provider' && configKinds.has(a.provider)
+        && accountManager.removeAccount(accountManager.accounts.indexOf(a))) {
+      console.log(`[Maxpool] Dropped session-supplied "${a.name}" — ${a.provider} keys are managed by the pool config`);
+    }
+  }
 
   const zaiToken = headerValue(headers, 'x-maxpool-zai-token');
-  if (zaiToken && !configTokens.has(zaiToken)) {
+  if (zaiToken && !configKinds.has('zai') && !configTokens.has(zaiToken)) {
     const opus = headerValue(headers, 'x-maxpool-zai-opus-model') || headerValue(headers, 'x-maxpool-zai-model') || 'glm-5.3';
     const sonnet = headerValue(headers, 'x-maxpool-zai-sonnet-model') || headerValue(headers, 'x-maxpool-zai-model') || opus;
     const haiku = headerValue(headers, 'x-maxpool-zai-haiku-model') || 'glm-5.3';
@@ -3116,7 +3270,7 @@ function prepareRuntimeProviders(accountManager, headers) {
   }
 
   const kimiToken = headerValue(headers, 'x-maxpool-kimi-token');
-  if (kimiToken && !configTokens.has(kimiToken)) {
+  if (kimiToken && !configKinds.has('kimi') && !configTokens.has(kimiToken)) {
     // Fallback only — `cc all` always sends x-maxpool-kimi-model from the llm_config SSOT,
     // so this is what a bare/older client gets. Kept current deliberately: it read
     // 'kimi-k2.7' while the fleet had moved to k3.
@@ -3728,7 +3882,25 @@ function markThinkingFromResponse(buffer, accountManager, requestInfo = {}) {
   }
 }
 
+// CLI-RETRIABLE retry-after (2026-10-11/12). Claude Code 2.1.296 retries a 429 whose
+// retry-after is ≤60s (+25% headroom) and treats anything longer as TERMINAL — the
+// turn dies (binary-verified, then reproduced against the real CLI: retry-after 3600
+// → "API Error: Request rejected (429)" at once; retry-after 60 → waits, retries,
+// recovers). Every 429 the pool emits goes through this cap; the real wait still
+// rides in the message text.
+const RETRY_AFTER_RETRIABLE_S = 60;
+// Retry causes whose 'reset' is a re-poll guess (load), not a scheduled quota rollover —
+// these shed within the capacity window instead of hold-chaining (soft-deadlock guard).
+const CAPACITY_CLASS_RETRY_CAUSES = new Set(['concurrency_cap']);
+function clientRetryAfterSeconds(retryAfterMs) {
+  if (!Number.isFinite(retryAfterMs)) return RETRY_AFTER_RETRIABLE_S;
+  return Math.min(Math.max(1, Math.ceil(retryAfterMs / 1000)), RETRY_AFTER_RETRIABLE_S);
+}
+
 function computeRetryAfter(accountManager, requestInfo = {}) {
   const ms = accountManager.nextRetryForRequest?.(requestInfo, new Set())?.retryAfterMs ?? Infinity;
-  return ms === Infinity ? 60 : Math.max(1, Math.ceil(ms / 1000));
+  return clientRetryAfterSeconds(ms);
 }
+
+// Test seam: prepareRuntimeProviders with a plain headers object.
+export const __test = { prepareRuntimeProviders };

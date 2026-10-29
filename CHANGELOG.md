@@ -5,6 +5,163 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.38] - 2026-10-29
+
+### Changed
+
+- Team pool: red-team fixes — run passes shared key, legacy key attributed, pool switch atomic, rc-gate strips pool key on direct leg, 0.0.0.0 warning, freeze clock in flaky cap test
+
+## [1.24.37] - 2026-10-28
+
+### Changed
+
+- Team pool — per-person keys + caller identity, account screen, rc-gate remote leg, pool switch, GCP project env
+- Team pool: headless named-caller log line, screen copy/layout fixes from live render
+- Team pool: simplify strict-auth startup log
+
+## [1.24.36] - 2026-10-28
+
+### Changed
+
+- Queue-never-fail — always hold the window before erroring (owner 2026-10-28)
+- Short queue window in config — burst holds now resolve bounded, hang-detector invariant preserved
+
+## [1.24.35] - 2026-10-28
+
+### Fixed
+
+- Baseline at adoption — hours before an account joined the pool are its previous owner's, not a leak
+
+## [1.24.34] - 2026-10-27
+
+### Changed
+
+- Stage watchdog — a frozen stage fails loudly and stops the release
+
+## [1.24.33] - 2026-10-27
+
+### Added
+
+- Detect a z.ai key used outside the pool; hold reset cards for it (R7)
+
+### Changed
+
+- Replace a REAL z.ai key literal with a fake (public-repo leak root cause)
+- Fail the suite on any live credential literal in a tracked file
+
+### Fixed
+
+- Red-team hardening — no fail-open, restart persistence, hour-floor labels
+
+## [1.24.32] - 2026-10-23
+
+### Fixed
+
+- A held weekly card must not starve the 5h wall (red-team R6 concern 1)
+
+## [1.24.31] - 2026-10-23
+
+### Added
+
+- R6 — hold a wall redeem when the free weekly refill is <24h out
+
+## [1.24.30] - 2026-10-23
+
+### Changed
+
+- Red-team findings ×4 — stable backoff key, account-scoped idempotency, GLOBAL fallback, tries reset
+
+## [1.24.29] - 2026-10-23
+
+### Fixed
+
+- Pass grantType on card redeem + back off failed redeems
+
+## [1.24.28] - 2026-10-21
+
+### Documentation
+
+- Four working rules from the weekly-capacity task — history-check TUI labels, 80-col render, review before release, u-key cutover
+
+### Fixed
+
+- Back off on GLM 429 — 60s floor doubling to 15min, burst-safe, forgets after 1h
+
+## [1.24.27] - 2026-10-13
+
+### Documentation
+
+- Comment matches the no-marker ruling
+- Comment grammar
+
+### Fixed
+
+- Red-team batch — peak discipline, floor on partial history, usable cap input
+
+## [1.24.26] - 2026-10-13
+
+### Removed
+
+- Keep owner's 2026-08-26 no-marker ruling — ≈ stays off the derived row
+
+## [1.24.25] - 2026-10-13
+
+### Fixed
+
+- Weekly tank from partial cycles + unit-coherent columns + plain-English cap prompt
+
+## [1.24.24] - 2026-10-13
+
+### Changed
+
+- Routing clarity round 2 — red-team findings on v1.24.23
+
+## [1.24.23] - 2026-10-13
+
+### Changed
+
+- Routing clarity — honest status, scoped cap label, visible unpin
+
+## [1.24.22] - 2026-10-12
+
+### Fixed
+
+- Red-team findings on the outage fixes (2026-10-12)
+
+## [1.24.21] - 2026-10-12
+
+### Fixed
+
+- Hold a streaming request across the window when the reset is finite-but-far, instead of erroring every window
+
+## [1.24.20] - 2026-10-12
+
+### Changed
+
+- Widen pool-request-open wait to 15s (release-suite flake on a loaded machine)
+
+### Fixed
+
+- Cap fast-429 retry-after at 60s — a longer value bricks Claude Code sessions
+
+## [1.24.19] - 2026-10-11
+
+### Fixed
+
+- A seamless update no longer drops requests waiting in the queue
+
+## [1.24.18] - 2026-10-11
+
+### Fixed
+
+- Reap dead-client tunnels and answer stalled uploads readably
+
+## [1.24.17] - 2026-10-10
+
+### Fixed
+
+- The proxy owns provider keys — session-supplied keys no longer create duplicate accounts
+
 ## [1.24.16] - 2026-10-09
 
 ### Added

@@ -8,16 +8,17 @@
 // This is the one sanctioned active-upstream feature; the proxy is otherwise passive.
 
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
-import { listResetCards, redeemResetCard } from './zai-reset-cards.js';
+import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
 import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
 import { decideZai, decideClaude } from './reset-policy.js';
+import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
 
 // How often a subscription-latched account is rechecked (one probe + at most one
 // token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
 export const SUB_RECHECK_MS = 30 * 60_000;
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null, zaiUsageFn = fetchZaiModelUsage, cardsFn = listResetCards, now = Date.now } = {}) {
     this.am = accountManager;
     // Injectable like probeFn: the default hits api.anthropic.com, so a harness that
     // doesn't stub it makes a REAL network call per oauth sweep (a test then passes
@@ -38,6 +39,9 @@ export class Prober {
     this._stopping = false;
     this._pendingSleep = null;    // canceller for an in-flight pacing sleep
     this._sweepStart = 0;         // rotates the per-sweep start account (fairness)
+    this.zaiUsageFn = zaiUsageFn; // z.ai hourly model-usage fetch (outside-usage detector)
+    this.cardsFn = cardsFn;       // reset-card listing, injectable like the others
+    this._now = now;              // clock (tests inject; defaults to the real one)
   }
 
   start() {
@@ -190,6 +194,7 @@ export class Prober {
       const usage = await this._withTimeout(this.providerProbeFn(account));
       if (!usage) return; // timed out — try again next cycle
       this.am.applyProviderUsage(account.index, usage);
+      await this._checkOutsideUsage(account);
       // Reset cards piggyback on the same poll cycle (z.ai only; zero-spend read).
       // Failures are swallowed on purpose: cards are an enhancement, never a probe
       // health signal — a card-list 401 must not turn the quota bars stale.
@@ -199,7 +204,7 @@ export class Prober {
       if (account.enabled !== false && account.credential) {
         if (account.provider === 'zai' && this.am.applyResetCards) {
           try {
-            const cards = await this._withTimeout(listResetCards(account.credential));
+            const cards = await this._withTimeout(this.cardsFn(account.credential));
             if (cards) {
               this.am.applyResetCards(account.index, cards);
               const act = decideZai(account, cards);
@@ -211,20 +216,78 @@ export class Prober {
     } catch { /* best-effort; never let a probe throw */ }
   }
 
-  /** Execute a z.ai card redeem decided by the policy. Logs before/after. */
+  /** OUTSIDE-USAGE DETECTOR (2026-10-27), hourly per account: fetch z.ai's own
+   *  hourly model-call counts for the account and compare with what the pool sent
+   *  in the same complete hours. A divergent account (key used by someone else —
+   *  measured 2026-08-10→10-26: 45,155 outside calls on max+1) is recorded on the
+   *  account (reset-card policy R7 refuses to feed it) and logged ONCE per
+   *  transition, never per sweep. Disabled accounts are never checked: someone
+   *  else legitimately using the key is WHY the account is benched. */
+  async _checkOutsideUsage(account, now = this._now()) {
+    try {
+      if (account.provider !== 'zai' || !account.credential || account.enabled === false) return;
+      const last = account._outsideCheckedAt || 0;
+      if (now - last < OUTSIDE_CHECK_MS) return;
+      const data = await this._withTimeout(this.zaiUsageFn(account.credential, { now }));
+      if (!isUsableZaiUsage(data)) {
+        // FAILED or malformed read. Never downgrade a true flag on missing data (red-team R1.1:
+        // one 5xx un-protected a known leak and the SAME sweep redeemed a card into
+        // it). Keep the reading, mark it stale (R7 still holds), and RETRY next
+        // sweep — the hourly slot is only consumed by a successful read.
+        const prev = account.outsideUsage;
+        if (prev) account.outsideUsage = { ...prev, stale: true, checkedAt: now };
+        return;
+      }
+      account._outsideCheckedAt = now;          // stamp AFTER success (R1.5)
+      const zai = zaiHourlyCalls(data);
+      const res = compareOutsideUsage(zai, account.poolHourly, { now, poolUpSince: this.am.poolUpSince, sinceMs: account.addedAt ?? null });
+      const prev = account.outsideUsage;
+      const wasOutside = Boolean(prev?.outside);
+      account.outsideUsage = { ...res, checkedAt: now };
+      if (res.outside && !wasOutside) {
+        this.log(`[outside-usage] ${account.name}: z.ai counted ${res.zaiCalls} calls in the last ${res.hours}h but the pool sent ${res.poolCalls} — someone else holds this key; reset cards held`);
+      }
+    } catch { /* detector is best-effort; never block the probe */ }
+  }
+
+  /** Execute a z.ai card redeem decided by the policy. Logs before/after.
+   *  A FAILED redeem backs off exponentially per card (15m, 30m, 1h, cap 6h):
+   *  2026-10-22/23, a z.ai API change made every redeem fail "unavailable" and the
+   *  2-minute poll retried the same card 519 times over 16h — the exact
+   *  rapid-retry shape z.ai's usage-risk notice flagged before. A success resets
+   *  the backoff; the idempotent requestId keeps any overlapping attempt single-spend. */
   async _redeemZaiCard(account, act) {
     try {
+      const key = `${account.name}:${act.card.recordId}`;  // name, not index: index shifts on account removal
+      const now = Date.now();
+      const until = this._cardRetryUntil?.get(key);
+      if (until && until > now) return;                 // still backing off
       const q = account.quota || {};
       this.log(`[reset-card] ${account.name}: redeeming ${act.resetType} card ${act.card.recordId} (${act.reason}; ses=${q.providerSes ?? '?'} wk=${q.providerWk ?? '?'})`);
-      const r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType));
+      let r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType, { grantType: act.card.grantType, accountKey: account.name }));
+      // grantType-less listing + "unavailable" is the exact 2026-10-22 outage shape; GLOBAL
+      // is the only grantType z.ai has ever issued and a wrong one answers 400 no-spend
+      // (measured, src/zai-reset-cards.js header) — so one fallback retry is safe.
+      if (!r?.ok && !act.card.grantType && /unavailable/i.test(r?.error || '')) {
+        r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType, { grantType: 'GLOBAL', accountKey: account.name }));
+      }
       if (r?.ok) {
+        if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
+        this._cardRetryUntil.set(key, 0);               // success clears any backoff
+        this._cardTries?.set(key, 0);                   // ...and the failure count (red-team 2026-10-23)
         this.log(`[reset-card] ${account.name}: card ${act.card.recordId} redeemed`);
         if (this.am.applyResetCards) {
           const fresh = await this._withTimeout(listResetCards(account.credential));
           if (fresh) this.am.applyResetCards(account.index, fresh);
         }
       } else {
-        this.log(`[reset-card] ${account.name}: redeem FAILED card ${act.card.recordId}: ${r?.error}`);
+        const tries = (this._cardTries?.get(key) || 0) + 1;
+        if (!this._cardTries) this._cardTries = new Map();
+        this._cardTries.set(key, tries);
+        const waitMs = Math.min(6 * 3600_000, 900_000 * 2 ** (tries - 1));
+        if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
+        this._cardRetryUntil.set(key, now + waitMs);
+        this.log(`[reset-card] ${account.name}: redeem FAILED card ${act.card.recordId} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       }
     } catch (e) { this.log(`[reset-card] ${account.name}: redeem error ${e.message}`); }
   }

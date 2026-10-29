@@ -44,7 +44,7 @@ export function parseCardExpiry(s) {
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) - 8 * 3600_000;
 }
 
-/** Normalize a raw card array -> [{recordId, expiresAt, expired}], available only. */
+/** Normalize a raw card array -> [{recordId, grantType, expiresAt, expired}], available only. */
 function normalizeCards(arr, now = Date.now()) {
   const out = [];
   for (const c of (Array.isArray(arr) ? arr : [])) {
@@ -52,7 +52,7 @@ function normalizeCards(arr, now = Date.now()) {
     const recordId = Number(c.recordId);
     if (!Number.isFinite(recordId)) continue;
     const expiresAt = parseCardExpiry(c.expireTime);
-    out.push({ recordId, expiresAt, expired: expiresAt != null && expiresAt <= now });
+    out.push({ recordId, grantType: typeof c.grantType === 'string' ? c.grantType : undefined, expiresAt, expired: expiresAt != null && expiresAt <= now });
   }
   // Soonest-expiring first — that's the one to spend first.
   out.sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
@@ -61,10 +61,10 @@ function normalizeCards(arr, now = Date.now()) {
 
 /** List this account's available reset cards. Zero-spend read.
  *  Returns { fiveHour: [], weekly: [] } | { error }. */
-export async function listResetCards(token, { signal } = {}) {
+export async function listResetCards(token, { signal, fetchImpl = fetch } = {}) {
   if (!token) return { error: 'no token' };
   try {
-    const res = await fetch(LIST_URL, {
+    const res = await fetchImpl(LIST_URL, {
       headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
       signal,
     });
@@ -85,27 +85,37 @@ export async function listResetCards(token, { signal } = {}) {
 }
 
 /** Deterministic requestId for a card: retries of the SAME redeem are idempotent
- *  server-side, so a network blip mid-redeem can never double-spend. */
-function requestIdFor(recordId) {
-  const h = createHash('sha256').update(`maxpool-zai-card-${recordId}`).digest('hex').slice(0, 24);
+ *  server-side, so a network blip mid-redeem can never double-spend. The account
+ *  key scopes it too — recordIds collide across z.ai accounts (card 9 on max+1 AND
+ *  glm4, 2026-10-23); z.ai idempotency measured per-account, but scoping keeps the
+ *  two accounts' keys distinct even if that assumption ever changes (red-team).
+ *  accountKey never changes semantics for a given account, so retries stay stable. */
+function requestIdFor(recordId, accountKey = '') {
+  const h = createHash('sha256').update(`maxpool-zai-card-${accountKey}-${recordId}`).digest('hex').slice(0, 24);
   return `maxpool-${h}`;
 }
 
 /** Redeem one card. NEVER retries on the wire here (the idempotency key makes a
  *  caller-level retry safe). Returns { ok:true, recordId } | { ok:false, error, code }. */
-export async function redeemResetCard(token, recordId, resetType, { signal } = {}) {
+export async function redeemResetCard(token, recordId, resetType, { grantType, accountKey = '', signal, fetchImpl = fetch } = {}) {
   if (resetType !== 'WEEK' && resetType !== 'FIVE_HOUR') {
     return { ok: false, error: `invalid resetType ${resetType}` };
   }
   if (!Number.isFinite(recordId)) return { ok: false, error: 'invalid recordId' };
   try {
-    const res = await fetch(USE_URL, {
+    // grantType is REQUIRED (2026-10-23): z.ai started rejecting card redeems without
+    // it ("The specified reset attempt is unavailable") — their web UI sends
+    // {targetType, resetType, recordId, requestId, grantType:'GLOBAL'}. A bogus
+    // grantType answers "Unsupported coupon grant type" without spending anything.
+    const body = {
+      recordId, targetType: 'PERSONAL', resetType,
+      requestId: requestIdFor(recordId, accountKey),
+    };
+    if (grantType) body.grantType = grantType;
+    const res = await fetchImpl(USE_URL, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        recordId, targetType: 'PERSONAL', resetType,
-        requestId: requestIdFor(recordId),
-      }),
+      body: JSON.stringify(body),
       signal,
     });
     const data = await res.json().catch(() => null);
@@ -119,5 +129,29 @@ export async function redeemResetCard(token, recordId, resetType, { signal } = {
     };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
+  }
+}
+
+// z.ai's own hourly per-account model-call counts (zero-spend monitor read). The
+// labels are UTC+8 ("YYYY-MM-DD HH:mm"); outside-usage.js converts. Consumed by
+// the outside-usage detector (2026-10-27) — never by routing.
+const MODEL_USAGE_URL = 'https://api.z.ai/api/monitor/usage/model-usage';
+const zaiStamp = (ms) => new Date(ms + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ');
+
+/** Fetch the last `hours` (default 26) of z.ai hourly model-call counts for a key.
+ *  Returns the raw `data` ({x_time, modelCallCount, ...}) or null on any failure. */
+export async function fetchZaiModelUsage(token, { hours = 26, now = Date.now(), signal, fetchImpl = fetch } = {}) {
+  if (!token) return null;
+  try {
+    const q = new URLSearchParams({ startTime: zaiStamp(now - hours * 3600_000), endTime: zaiStamp(now) });
+    const res = await fetchImpl(`${MODEL_USAGE_URL}?${q}`, {
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json', 'Accept-Language': 'en-US' },
+      signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.code === 200 && data?.data ? data.data : null;
+  } catch {
+    return null;
   }
 }

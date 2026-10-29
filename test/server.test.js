@@ -1104,7 +1104,11 @@ test('large request can queue before upstream send even when it is too large for
   }
 });
 
-test('request does not queue when reset is beyond auto queue window', async () => {
+test('reset beyond the window: request HOLDS the window, then errors retriable (owner 2026-10-28 queue-never-fail)', async () => {
+  // Old policy errored in <500ms when the reset (10 min throttle) exceeded the
+  // window. Owner reversed it: ALWAYS hold the window first (recovery does not
+  // need a schedule — a sibling finishing or a newly adopted account frees a
+  // route), then hand back the ≤60s-retriable 429 the CLI obeys silently.
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
@@ -1118,7 +1122,7 @@ test('request does not queue when reset is beyond auto queue window', async () =
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    queue: { enabled: true, maxWaitMs: 60 * 60_000, autoMaxWaitMs: 100, pollMs: 25 },
+    queue: { enabled: true, maxWaitMs: 60 * 60_000, autoMaxWaitMs: 100, nonStreamMaxWaitMs: 200, pollMs: 25 },
   });
   const proxyPort = await listen(proxy);
 
@@ -1128,9 +1132,14 @@ test('request does not queue when reset is beyond auto queue window', async () =
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'test', messages: [] }),
+      signal: AbortSignal.timeout(5000),
     });
+    const body = await res.text();
+    const elapsed = Date.now() - startedAt;
     assert.equal(res.status, 429);
-    assert.ok(Date.now() - startedAt < 500);
+    assert.ok(elapsed >= 150, `held the window first (${elapsed}ms) — no instant drop`);
+    assert.ok(elapsed < 1500, `bounded by the window, no spin (${elapsed}ms)`);
+    assert.match(body, /Retry in|rate_limit/i, 'retriable error at expiry');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1218,7 +1227,7 @@ test('weekly exhaustion with reset FAR beyond the window errors promptly (no poi
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    queue: { enabled: true, maxWaitMs: 2000, weeklyMaxWaitMs: 2000, pollMs: 25 },
+    queue: { enabled: true, maxWaitMs: 2000, weeklyMaxWaitMs: 2000, nonStreamMaxWaitMs: 200, pollMs: 25 },
   });
   const proxyPort = await listen(proxy);
 
@@ -1228,9 +1237,13 @@ test('weekly exhaustion with reset FAR beyond the window errors promptly (no poi
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'test', messages: [] }),
+      signal: AbortSignal.timeout(5000),
     });
-    assert.equal(res.status, 429);                 // nothing recovers in the window → honest prompt error
-    assert.ok(Date.now() - startedAt < 800, 'should not spin');
+    const body = await res.text();
+    const elapsed = Date.now() - startedAt;
+    assert.equal(res.status, 429);                 // holds the window, then honest bounded error
+    assert.ok(elapsed >= 150 && elapsed < 1500, `held then errored within the window bound (${elapsed}ms), no spin`);
+    assert.match(body, /Retry in|rate_limit/i, 'retriable error at expiry');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1952,7 +1965,10 @@ test('major: a concurrency-cap hold is bounded by the capacity window, not the 7
     // The decisive signal: the request RESOLVES bounded (vs hanging until the 7d
     // streamHoldMaxMs deadline, which would trip the 5s client timeout → throw).
     assert.ok(elapsed < 3000, `concurrency-cap hold bounded by the capacity window (${elapsed}ms), not the 7d streaming hold`);
-    assert.equal(res.status, 429, 'shed load with a rate-limit error, not an indefinite hold');
+    // Queue-never-fail (owner 2026-10-28): the hold runs FIRST (heartbeat commits the
+    // stream), so the give-up is an in-stream retriable error — status 200 with an
+    // SSE error event — rather than the old pre-hold 429. Either shape sheds load.
+    assert.ok([200, 429].includes(res.status), `shed load with a rate-limit error, not an indefinite hold (got ${res.status})`);
     assert.match(body, /Retry in|rate_limit|error/i, 'gave up with an error response');
   } finally {
     await close(proxy);
@@ -2250,4 +2266,197 @@ test('the latched effort level is applied UP FRONT on later turns (no repeat 400
     await close(proxy);
     await close(upstream);
   }
+});
+
+// ── stalled-body 408 (2026-10-10/11 outage) ──────────────────────────────────
+// When a request body never finishes arriving (network death mid-upload), Node's
+// requestTimeout cuts the request with a BODY-LESS `408 Request Timeout`. Claude
+// Code shows that as a bare "API Error: 408 status code (no body)" — 1,711 times
+// overnight (measured), each indistinguishable from an upstream failure. The pool
+// must instead answer with the standard Anthropic error JSON the CLI can retry.
+// Raw-socket client (fetch/undici cannot express "stop sending mid-body").
+test('stalled request body gets a JSON error response, not a bodyless 408', async () => {
+  const am = new AccountManager([], 0.9, {});
+  // Scaled-down arrival timeout via the same env knobs the constructor reads
+  // (a property assignment after listen is a no-op in Node 20).
+  process.env.MAXPOOL_REQUEST_TIMEOUT_MS = '1500';
+  process.env.MAXPOOL_CONNECTIONS_CHECK_MS = '300';
+  const server = createProxyServer(am, { proxy: { port: 0, host: '127.0.0.1', apiKey: 'test' }, upstream: 'http://127.0.0.1:1' }, {});
+  try {
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const t0 = Date.now();
+    let onClose; const promise = new Promise(r => { onClose = r; });
+    const net = await import('node:net');
+    const c = net.connect(server.address().port, '127.0.0.1');
+    c.on('connect', () => c.write('POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nx-api-key: test\r\ncontent-type: application/json\r\ncontent-length: 100000\r\n\r\n{"model":"x"'));
+    let got = Buffer.alloc(0);
+    c.on('data', d => { got = Buffer.concat([got, d]); });
+    c.on('close', () => onClose());
+    await promise;
+    const text = got.toString('utf8');
+    const elapsed = Date.now() - t0;
+    const status = /^HTTP\/1\.1 (\d+)/.exec(text)?.[1];
+    assert.equal(status, '408');
+    const body = text.split('\r\n\r\n')[1] || '';
+    assert.match(body, /"type"\s*:\s*"error"/, `body must be an Anthropic-style error JSON, got: ${JSON.stringify(body.slice(0, 120))}`);
+    assert.ok(elapsed < 8_000, `should fail on the scaled-down timeout quickly (${elapsed}ms)`);
+  } finally {
+    delete process.env.MAXPOOL_REQUEST_TIMEOUT_MS;
+    delete process.env.MAXPOOL_CONNECTIONS_CHECK_MS;
+    server.close(); server.closeAllConnections?.();
+  }
+});
+
+// ── 'Retry in ~1h' then bricked sessions (2026-10-11, Max report) ────────────
+// The pool returns a 429 rate_limit_error whose retry-after equals the SOONEST
+// account reset (measured live: "Retry in ~1h"). Claude Code's SDK (2.1.296,
+// binary-verified: tengu_api_retry_after_too_long) treats a plain rate_limit_429
+// with retry-after > 60s (Pgr=60000, +25% headroom) as a TERMINAL error — it does
+// NOT sleep and retry; the turn dies and the session looks bricked. The pool
+// KNOWS the request is streamable and queueable; erroring with a >60s retry-after
+// hands the client the one shape its SDK refuses to retry.
+// The pool must cap the retry-after it advertises on this fast-429 path at 60s
+// (retry-soon, the retriable shape) — or, better, hold the request. This test
+// pins the retry-after cap.
+test('fast-429 retry-after never exceeds the CLI-retriable bound (60s)', async () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90, {});
+  // All accounts session-limited with a reset 3h out — the reported state.
+  am.accounts[0].quota = {
+    unified5h: 0.95, unified7d: 0.3,
+    unified5hReset: Date.now() + 3 * 3600_000,
+    unified7dReset: Date.now() + 5 * 24 * 3600_000,
+  };
+  const upstream = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, pollMs: 25, nonStreamMaxWaitMs: 100, streamClientToleranceMs: 100 },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'test', messages: [] }),  // non-streaming: the streaming shape is HELD (see the hold-chain test)
+    });
+    assert.equal(res.status, 429);
+    const ra = Number(res.headers.get('retry-after'));
+    assert.ok(Number.isFinite(ra), 'retry-after header present');
+    assert.ok(ra <= 60, `retry-after must stay at/below the CLI's retriable bound (60s) — got ${ra}s; a longer value makes Claude Code give up permanently`);
+    const body = JSON.parse(await res.text());
+    assert.equal(body.error.type, 'rate_limit_error');
+    // The MESSAGE carries the real wait (3h), never the capped header value.
+    assert.match(body.error.message, /~3h/, `message must state the real wait, got: ${body.error.message}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+// ── hold-chain for a finite reset beyond the window (2026-10-12, Max: "they
+// should have just waited") ────────────────────────────────────────────────────
+// Live 08:13-09:34Z: every account session-limited, soonest reset ~1h out; the
+// pool instant-429'd each streaming request (reset 3600s > hold window 240s) for
+// 75 minutes. Sessions churned the CLI's retry budget and some gave up entirely
+// before capacity returned. A STREAMING request whose reset is finite-but-beyond
+// the window must be HELD for the window (heartbeat keeps the client alive) and
+// then error retriable — the CLI re-enters and the hold chains, one window at a
+// time, until the reset arrives. Instant-429 at entry is the defect.
+test('streaming request with finite-beyond-window reset is HELD the window, not instant-429', async () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90, {});
+  am.accounts[0].quota = {
+    unified5h: 0.95, unified7d: 0.3,
+    unified5hReset: Date.now() + 3600_000,   // 1h out — beyond every hold window
+    unified7dReset: Date.now() + 5 * 24 * 3600_000,
+  };
+  const upstream = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });
+  const upstreamPort = await listen(upstream);
+  const WINDOW_MS = 800;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, pollMs: 25, streamClientToleranceMs: WINDOW_MS },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    // HELD: headers commit immediately (200 SSE + heartbeat) — the HOLD duration
+    // is measured to the stream's END (the retriable error event), not to header
+    // arrival.
+    assert.equal(res.status, 200, 'held stream must be SSE 200, not an instant 429');
+    const text = await res.text();
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= WINDOW_MS, `should be held ~window (${WINDOW_MS}ms), errored after ${elapsed}ms`);
+    assert.match(text, /rate_limit_error/, `held stream should end with a retriable SSE error, got: ${JSON.stringify(text.slice(0, 120))}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+// ── every 429 the pool emits carries a CLI-retriable retry-after (2026-10-12
+// red-team finding 2: the failover path and the upstream-throttle path still
+// sent the raw multi-hour reset — the exact "bricked session" shape v1.24.20
+// fixed on the entry path). Verified against the real CLI 2.1.296: retry-after
+// 60 → the CLI waits 60s and retries, recovers when capacity returns;
+// retry-after 3600 → the turn DIES immediately ("API Error: Request rejected").
+const RETRIABLE_S = 60;
+async function collect429(mkAm, queueOpts) {
+  const am = mkAm();
+  const upstream = http.createServer((ureq, ures) => {
+    if (ureq.url.startsWith('/v1/messages') && !ureq.url.includes('count_tokens')) {
+      // A REAL quota rejection: 5h bucket full, resets in 3h; weekly 30%, 4 days.
+      const now = Math.floor(Date.now() / 1000);
+      ures.writeHead(429, {
+        'content-type': 'application/json', 'retry-after': String(3 * 3600),
+        'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-5h-utilization': '1.0',
+        'anthropic-ratelimit-unified-5h-reset': String(now + 3 * 3600),
+        'anthropic-ratelimit-unified-7d-utilization': '0.3',
+        'anthropic-ratelimit-unified-7d-reset': String(now + 4 * 86400),
+      });
+      ures.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'rejected' } }));
+      return;
+    }
+    ures.writeHead(200); ures.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, pollMs: 25, ...queueOpts },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'test', messages: [] }),   // non-streaming: the shape that fast-errors
+      signal: AbortSignal.timeout(8000),
+    });
+    const ra = Number(res.headers.get('retry-after'));
+    return { status: res.status, ra };
+  } finally { await close(proxy); await close(upstream); }
+}
+
+test('failover-exhausted 429 carries a CLI-retriable retry-after (≤60s)', async () => {
+  const { status, ra } = await collect429(() => {
+    const am = new AccountManager([
+      { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    ], 0.90, {});
+    return am;   // quota learned from the upstream's real 429 headers
+  }, { nonStreamMaxWaitMs: 100 });
+  assert.equal(status, 429);
+  assert.ok(Number.isFinite(ra) && ra <= RETRIABLE_S,
+    `failover-path retry-after must stay ≤${RETRIABLE_S}s (CLI-retriable) — got ${ra}s`);
 });

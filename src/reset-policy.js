@@ -34,6 +34,13 @@
  * R5  PACE — at most ONE redeem per account per evaluation. The caller invokes the
  *     policy each poll cycle; the deterministic z.ai requestId makes an accidental
  *     double-fire harmless, but the policy still returns a single action.
+ *
+ * R6  WAIT FOR THE FREE REFILL (owner, 2026-10-23) — a wall redeem (R1) burns a card
+ *     that z.ai's free weekly refill is about to make redundant: when the refill
+ *     lands <24h away and weekly util < 0.98, HOLD the card. At >= 0.98 redeem
+ *     immediately — the owner is never blocked waiting for a free refill that is
+ *     merely hours away. Dying-value redeems (R2) are exempt: an expiring card's
+ *     value cannot survive a wait.
  */
 export const POLICY = {
   wallWeekly: 0.90,       // weekly at 90% = at the wall
@@ -41,6 +48,8 @@ export const POLICY = {
   dyingWindowMs: 24 * 3600 * 1000, // redeem-don't-save horizon
   dyingMinUtilWeekly: 0.30, // below this a dying weekly refill buys too little
   dyingMinUtilSes: 0.50,    // 5h refills are cheap capacity; demand more waste first
+  freeRefillWaitMs: 24 * 3600 * 1000, // R6: hold a wall redeem this close to the free refill
+  freeRefillImmediate: 0.98,          // R6: ...unless this full — never block the owner
 };
 
 function msLeft(t, now) { return t == null ? Infinity : t - now; }
@@ -49,6 +58,7 @@ function msLeft(t, now) { return t == null ? Infinity : t - now; }
 export function decideZai(account, cards, now = Date.now()) {
   if (account?.enabled === false) return null;               // R0
   if (!cards || cards.error) return null;
+  if (account?.outsideUsage?.outside) return null;          // R7: key used by someone else — a card would feed the leak
   const q = account.quota || {};
   const ses = q.providerSes ?? null;
   const wk = q.weeklyAbsent ? null : (q.providerWk ?? null);
@@ -62,6 +72,7 @@ export function decideZai(account, cards, now = Date.now()) {
 
   const weeklyCard = weeklyCards[0] || null;
   const sesCard = sesCards[0] || null;
+  let weeklyHeld = false; // R6: weekly card HELD for the free refill (5h branch may still fire)
 
   // --- weekly card: clears BOTH windows (z.ai docs; measured: glm1 100%->0% both)
   if (weeklyCard) {
@@ -70,15 +81,26 @@ export function decideZai(account, cards, now = Date.now()) {
     const dying = msLeft(weeklyCard.expiresAt, now) < POLICY.dyingWindowMs
       && worst >= POLICY.dyingMinUtilWeekly;
     if (atWall || dying) {
-      return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
-               reason: atWall ? 'weekly at wall' : 'dying value' };
+      // R6: a wall redeem waits when the FREE weekly refill is imminent and the
+      // account isn't critically full (dying-value redeems stay exempt above).
+      // A HELD weekly card is spendable-redundant, not absent: the 5h branch below
+      // may still fire (red-team: holding must not starve a 5h wall — the 5h card
+      // sits redundant behind the free refill anyway, so spending it is pure gain).
+      if (atWall && !dying && q.providerWkReset != null
+          && msLeft(q.providerWkReset, now) < POLICY.freeRefillWaitMs
+          && wkUtil < POLICY.freeRefillImmediate) {
+        weeklyHeld = true;   // fall through — do NOT return; the 5h branch checks this
+      } else {
+        return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
+                 reason: atWall ? 'weekly at wall' : 'dying value' };
+      }
     }
   }
 
   // --- 5h card: clears only the session window
   if (sesCard) {
     const atWall = sesUtil != null && sesUtil >= POLICY.wallSes
-      && (weeklyCard == null);   // R4: a weekly card can do this job AND more
+      && (weeklyCard == null || weeklyHeld);   // R4: a weekly card can do this job AND more — except when R6 HELD it for the free refill
     const dying = msLeft(sesCard.expiresAt, now) < POLICY.dyingWindowMs
       && (sesUtil ?? 0) >= POLICY.dyingMinUtilSes;
     if (atWall || dying) {

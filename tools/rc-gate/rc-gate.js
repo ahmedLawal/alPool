@@ -37,7 +37,8 @@ import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
 // held their fds after close: measured 7,568 CLOSED sockets on one gate process,
 // which is what starved new CONNECTs and made Remote Control "keep dropping after
 // each reconnect". Pooled agents reuse connections and bound the socket count.
-const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
+const POOL_MAX_SOCKETS = Number(process.env.RC_GATE_POOL_MAX_SOCKETS || 64);
+const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: POOL_MAX_SOCKETS, maxFreeSockets: 16 });
 // DIRECT-POOL SATURATION (2026-09-26). The 64-socket cap was chosen on 2026-09-04 for the
 // fd-leak fix, when a handful of Remote Control sessions shared this gate. Measured today:
 // 43 live RC sessions, exactly 64 ESTABLISHED sockets to Anthropic (the cap, pinned) and 9
@@ -143,6 +144,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATE_PORT = Number(process.env.RC_GATE_PORT || 3457);
 const GATE_HOST = process.env.RC_GATE_HOST || '127.0.0.1';
 const MAXPOOL_PORT = Number(process.env.RC_GATE_MAXPOOL_PORT || 3456);
+// Team-pool leg (2026-10-29): the gate normally lives beside its pool on one machine
+// (host hardcoded 127.0.0.1). With a REMOTE shared pool the gate stays on the laptop
+// (mkcert + HTTPS_PROXY are machine-local) and points at the pool over Tailscale.
+// KEY authenticates the gate's requests to a strict-auth pool (proxy.clients).
+const MAXPOOL_HOST = process.env.RC_GATE_MAXPOOL_HOST || '127.0.0.1';
+const MAXPOOL_KEY = process.env.RC_GATE_MAXPOOL_KEY || '';
+// Max time for an inference request BODY to arrive (see the body-arrival deadline).
+// Message bodies are tens of KB to a few MB; 10 min is far above any real upload.
+const MITM_BODY_DEADLINE_MS = Number(process.env.RC_GATE_MITM_BODY_DEADLINE_MS) || 600_000;
 const MITM_HOSTS = new Set((process.env.RC_GATE_MITM_HOSTS || 'api.anthropic.com').split(',').map(s => s.trim()).filter(Boolean));
 const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
 // Direct-forward upstream (test seam; defaults are production values).
@@ -245,6 +255,7 @@ const mitmServer = http.createServer((creq, cres) => {
   const headers = { ...creq.headers };
   delete headers.authorization;           // pool accounts supply upstream auth
   delete headers['proxy-connection'];
+  if (MAXPOOL_KEY) headers['x-api-key'] = MAXPOOL_KEY;  // per-person pool key (remote pool)
   if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = PROFILE;
 
   // `/v1/sessions/<id>` is the v1-COMPAT Remote Control session API (fetch / patch /
@@ -261,6 +272,9 @@ const mitmServer = http.createServer((creq, cres) => {
     const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
     try { _titleSync?.noteAuthHeaders(creq.url, creq.headers); } catch {}
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
+    // A pool key (mp-…) exported as ANTHROPIC_API_KEY for a shared pool must never
+    // travel to Anthropic on the direct leg.
+    if (String(dirHeaders['x-api-key'] || '').startsWith('mp-')) delete dirHeaders['x-api-key'];
     // Session-create responses: force identity encoding so the body is readable end-to-end.
     // The CLI negotiates zstd (server advertises zstd,gzip) and Node cannot decode zstd — a
     // zstd body reached the CLI un-decoded while the create-status tee failed to parse it
@@ -454,10 +468,10 @@ const mitmServer = http.createServer((creq, cres) => {
 
   // Inference paths go to maxpool: pool accounts supply upstream auth.
   const opts = {
-    host: '127.0.0.1', port: MAXPOOL_PORT, method: creq.method,
+    host: MAXPOOL_HOST, port: MAXPOOL_PORT, method: creq.method,
     path: creq.url, headers, agent: poolAgent,
   };
-  console.log(`[mitm] ${creq.method} https://${creq.headers.host}${creq.url}`);
+  console.log(`[mitm] ${creq.method} https://${creq.headers.host}${creq.url} → pool ${MAXPOOL_HOST}:${MAXPOOL_PORT}`);
   // RESPONSE-LEG ACCOUNTING (2026-09-07). maxpool can log a clean 200 while the client
   // still reports "Connection lost mid-response" — the break is then on THIS leg
   // (gate -> CLI) and was previously invisible: the response was piped with no error
@@ -487,6 +501,13 @@ const mitmServer = http.createServer((creq, cres) => {
     if (!upstreamEnded && !cres.writableFinished) {
       clientAborted = true;
       console.log(`[resp-break] CLIENT closed before response completed ${creq.url} after ${bytes}B/${Date.now() - t0}ms`);
+      // CLIENT GONE => TEAR DOWN THE POOL LEG TOO (2026-10-11 outage). `creq.pipe(up)`
+      // does not end `up` when the client dies mid-upload, so the forwarded request sat
+      // open on both ends with its half-sent body parked in kernel socket buffers. A
+      // ~1,000-tunnel fleet of killed/restarted CLIs pinned 1.5-3.6MB each until the
+      // Mac's network-memory pool ran dry ("mbuf alloc failed" 32k/hr) and every
+      // connection on the machine failed until reboot.
+      try { up.destroy(); } catch {}
     }
   });
   cres.on('error', e => {
@@ -497,6 +518,34 @@ const mitmServer = http.createServer((creq, cres) => {
     try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
     cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_upstream_error', message: String(err?.message || err) } }));
   });
+  // BODY-ARRIVAL DEADLINE (2026-10-11 outage, the FIN shape). A CLI that exits
+  // mid-upload sends its FIN behind body bytes the gate has not read yet (the pool
+  // leg was backpressured), so no 'close'/'aborted' ever fires here and the tunnel
+  // held its kernel buffers for hours (9 sockets x 1.5-3.6MB until the Mac's
+  // network-memory pool ran dry). Node's own requestTimeout cannot do this job:
+  // it is never enforced on a server fed by emit('connection') (measured: no
+  // reaping at all). The deadline covers BODY ARRIVAL only and is cleared the
+  // moment the body ends, so a long streaming RESPONSE is never touched.
+  // DEADLINE SHAPE (red-team 2026-10-12): arm the timer only once the pool leg HAS a
+  // socket — a request QUEUED for one (all 64 busy holding long streams) is
+  // backpressured through no fault of its client ('end' cannot fire while the pipe is
+  // paused), and a start-anchored timer destroyed exactly those healthy requests at
+  // peak load. Once armed, the timer measures what it always meant to: the client has
+  // a live wire to the pool and still isn't finishing its upload.
+  let bodyTimer = null;
+  const armBodyDeadline = () => {
+    if (bodyTimer) return;
+    bodyTimer = setTimeout(() => {
+      console.log(`[resp-break] request body never finished arriving ${creq.url} after ${Date.now() - t0}ms — destroying tunnel + pool leg`);
+      try { up.destroy(); } catch {}
+      try { creq.socket?.destroy(); } catch {}
+    }, MITM_BODY_DEADLINE_MS);
+    bodyTimer.unref?.();
+  };
+  up.on('socket', armBodyDeadline);
+  const clearBodyDeadline = (why) => { if (bodyTimer) { clearTimeout(bodyTimer); bodyTimer = null; } if (process.env.RC_GATE_DEBUG_DEADLINE) console.log('[deadline-debug] cleared via', why); };
+  creq.once('end', () => clearBodyDeadline('end'));
+  creq.once('close', () => clearBodyDeadline('close'));
   creq.pipe(up);
 });
 mitmServer.headersTimeout = 0;
@@ -585,7 +634,7 @@ gate.listen(GATE_PORT, GATE_HOST, () => {
   // connect to. Identical output in production, where the requested port is the bound one.
   const boundPort = gate.address()?.port ?? GATE_PORT;
   console.log(`rc-gate listening on ${GATE_HOST}:${boundPort}`);
-  console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool 127.0.0.1:${MAXPOOL_PORT} (profile: ${PROFILE})`);
+  console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool ${MAXPOOL_HOST}:${MAXPOOL_PORT} (profile: ${PROFILE}${MAXPOOL_KEY ? ', key: on' : ''})`);
   console.log(`  everything else: blind tunnel`);
 });
 
