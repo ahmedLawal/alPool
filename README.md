@@ -118,6 +118,21 @@ already listening it exits without changing anything. The one-time switch from a
 terminal-owned service requires the explicit
 `npm run macos:install-backend -- --replace` command.
 
+## Linked team pool
+
+`alpool pool team http://127.0.0.1:13456 <your-pool-key>` adds the cloud pool's
+accounts alongside the local ones. Restart the backend from the native app to
+load the link. Keep Claude Code pointed at the local proxy on port 3456.
+Matching local copies pause automatically while their cloud account is available.
+
+For a managed GCP key, configure the link as
+`{ "name": "team", "url": "http://127.0.0.1:13456", "keySecret": "YOUR_SECRET_NAME" }`
+in the local config's `pools` array. Never commit the key or tunnel configuration.
+With wireproxy installed at `~/.local/bin/wireproxy` and an existing tunnel config
+at `~/.config/maxpool-wg/wireproxy.conf`, run
+`scripts/install-team-tunnel-agent.sh` to start it now and at login. Override
+`WIREPROXY_BIN` or `ALPOOL_TUNNEL_CONFIG` for other installation paths.
+
 ## Recommended setup
 
 The cleanest way to use alPool day-to-day: **keep your normal `claude` login untouched, and add a separate alias that routes through the pool.** Then plain `claude` still uses your default single account, and `ccal` spreads work across all your accounts.

@@ -82,3 +82,20 @@ test('pool switch: shared writes client block; env/run follow it; local restores
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('pool team adds an idempotent cloud link while keeping local routing and other accounts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pool-team-'));
+  const configPath = join(dir, 'config.json');
+  try {
+    await writeFile(configPath, JSON.stringify({ proxy: { host: '127.0.0.1', port: 3456, apiKey: 'test-local' }, accounts: [], providers: [{ name: 'local GLM', provider: 'zai', secretName: 'test-secret' }], client: { mode: 'local' }, pools: [{ name: 'other', url: 'http://127.0.0.1:9999', key: 'other-test-key' }] }));
+    const out = runCli(configPath, 'pool', 'team', 'http://127.0.0.1:13456', 'test-team-key');
+    assert.match(out, /cloud accounts will appear/);
+    runCli(configPath, 'pool', 'team', 'http://127.0.0.1:13456', 'test-team-key');
+    const c = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(c.client.mode, 'local');
+    assert.equal(c.providers[0].name, 'local GLM');
+    assert.equal(c.pools.length, 2);
+    assert.equal(c.pools.find(p => p.name === 'team').url, 'http://127.0.0.1:13456');
+    assert.equal(c.pools.find(p => p.name === 'other').key, 'other-test-key');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
