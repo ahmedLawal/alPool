@@ -15,6 +15,9 @@ const accounts = [
 function account(name, type, provider, session, weekly, status) {
   return {
     name, type, provider, enabled: true, capUtilization: null,
+    remote: provider === 'kimi', monthlyPriceUSD: provider === 'zai' ? 20 : 200,
+    resetCards: provider === 'zai' ? { weekly: [{ recordId: 1, expiresAt: Date.now() + 10 * 86400000, expired: false }, { recordId: 2, expiresAt: Date.now() + 10 * 86400000, expired: false }], fiveHour: [] } : null,
+    outsideUsage: provider === 'zai' ? { outside: true, zaiCalls: 1200, poolCalls: 200, stale: false } : null,
     capacity: {
       session: { current: 1_250_000, latest: 1_180_000, average: 1_210_000, samples: 4, usage: session, source: 'live', lowerBound: false, fresh: true, derived: false },
       weekly: provider === 'kimi'
@@ -43,7 +46,11 @@ function account(name, type, provider, session, weekly, status) {
 
 function snapshot() {
   return {
-    version: { current: '1.5.86', latest: null, hasUpdate: false, source: 'git' },
+    runningVersion: '1.24.65',
+    clientRouting: { mode: 'pool', gateAvailable: false },
+    callerWindows: { Alex: { d7: { req: 125, tok: 2500000 }, d7p: { req: 80, tok: 1500000 } } },
+    pools: [{ name: 'Team pool', ok: true, callerWindows: { Sam: { d7: { req: 234, tok: 4300000 }, d7p: { req: 300, tok: 5000000 } } } }],
+    version: { current: '1.24.65', latest: null, hasUpdate: false, source: 'git' },
     upstreamSync: {
       state: 'failed', phase: 'merge', checkedAt: new Date().toISOString(),
       lastSuccessAt: null, installedVersion: '1.6.1', installedRevision: '80d5ed4',

@@ -1,4 +1,6 @@
 import { createInterface } from 'node:readline';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 
@@ -30,6 +32,7 @@ const vw = s => strip(s).length;
 // Status/Quota start offsets (4/25/35/49) are pure functions of these widths + the
 // 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
+const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
 const RESETS_W = 6;        // 'Rst' column — FIXED width (fits '2~21d'); a variable
@@ -43,7 +46,13 @@ const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the 
 // Titlecase default so a future provider (Codex/Grok) renders sanely; truncated to
 // the column width so a long name can never misalign the row.
 const PROVIDER_LABELS = { anthropic: 'Anthropic', zai: 'z.ai', kimi: 'Moonshot', openai: 'OpenAI', codex: 'Codex', grok: 'Grok', xai: 'Grok' };
+/** 'Cloud' for an account mirrored from a linked team pool, 'Local' otherwise. */
+function whereCell(a) {
+  return a?.remote ? cyan('Cloud'.padEnd(WHERE_W)) : dim('Local'.padEnd(WHERE_W));
+}
+
 function providerLabel(a) {
+
   const key = a.provider || (a.type === 'provider' ? 'provider' : 'anthropic');
   const label = PROVIDER_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
   return label.slice(0, PROVIDER_W);
@@ -60,10 +69,17 @@ function acctHeader(W) {
   const quota = W >= 88 ? 'Quota (used% · resets-in)' : 'Quota';
   return ROW_PREFIX
     + 'Account'.padEnd(NAME_W) + ' '
+    + 'Where'.padEnd(WHERE_W) + ' '
     + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
     + 'Rst'.padEnd(RESETS_W) + ' '
     + quota;
+}
+
+/** padStart by VISIBLE width (ANSI color codes take no columns). */
+function lpadVis(s, w) {
+  const gap = w - vw(s);
+  return gap > 0 ? ' '.repeat(gap) + s : s;
 }
 
 function rpad(s, w) {
@@ -455,7 +471,7 @@ export class TUI {
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
     this.mode = 'normal';    // normal | accounts | routing | capacity | select | input | confirm | providers | addtype
-    this.capacityWindow = 'ses'; // capacity page window: 'ses' (5h) | 'wk' (weekly)
+    this.capacityWindow = 'wk'; // default weekly — the true tank (owner 2026-10-31); 'w' toggles to 5h
     // Hide disabled accounts from the table. With 8 dead/disabled accounts the live
     // ones scroll off the top; `h` collapses them to a one-line summary.
     // Restored from config so an auto-update/reload does not un-hide what the user hid.
@@ -611,6 +627,7 @@ export class TUI {
       case 'routing': this._keyRouting(k); break;
       case 'updates': this._keyUpdates(k); break;
       case 'capacity': this._keyCapacity(k); break;
+      case 'people': this._keyPeople(k); break;
       case 'addtype': this._keyAddType(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
@@ -656,6 +673,8 @@ export class TUI {
       this.mode = 'updates';
     } else if (k === 'y') {
       this.mode = 'capacity';
+    } else if (k === 'p') {
+      this.mode = 'people';
     } else if (k === 'h') {
       this.hideDisabled = !this.hideDisabled;
       this._addLog(this.hideDisabled ? 'Hiding disabled accounts' : 'Showing all accounts');
@@ -749,6 +768,25 @@ export class TUI {
       parts.push(`${yellow(label + ' peak')} ${dim(`ends in ${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}m`)}`);
     }
     return parts.join('  ');
+  }
+
+  /** ` People  max 120 · ahmed 40 · andrey 7` — requests per person since start.
+   *  Merges this pool's named callers with every linked team pool's callers (the
+   *  cloud's view of who used it). '' when nobody named has used the pool. */
+  _peopleLine(W = 80) {
+    const totals = new Map();
+    for (const [n, c] of this.am.callerCounts || []) totals.set(n, (totals.get(n) || 0) + c);
+    for (const l of this.am.poolLinks || []) {
+      for (const [n, v] of Object.entries(l.status?.callers || {})) {
+        totals.set(n, Math.max(totals.get(n) || 0, v?.requests || 0));
+      }
+    }
+    totals.delete('legacy-key');
+    if (!totals.size) return '';
+    const parts = [...totals.entries()].sort((x, y) => y[1] - x[1])
+      .map(([n, c]) => `${n} ${cyan(String(c))}`);
+    const line = ` People   ${parts.join(dim(' · '))}`;
+    return vw(line) > W ? line.slice(0, W) : line;
   }
 
   _routingLine(routing, xpText) {
@@ -1324,7 +1362,11 @@ export class TUI {
       familyFirstSeen.get(fam).push(idx);
     }
     const provGrouped = [...familyFirstSeen.values()].flat();
-    return [...nonProv, ...provGrouped];
+    // Owner 2026-10-29: Where is the PRIMARY grouping — local rows first, cloud rows
+    // after — and the existing ordering (providers grouped by family, OAuth as-added)
+    // stays intact WITHIN each group.
+    const all = [...nonProv, ...provGrouped];
+    return [...all.filter(i => !this.am.accounts[i].remote), ...all.filter(i => this.am.accounts[i].remote)];
   }
 
   _selectableIndexes(action) {
@@ -1427,6 +1469,17 @@ export class TUI {
       process.stdout.write('\nOpening browser to log into Claude…\n');
       const creds = await loginOAuth();
       const profile = await fetchProfile(creds.accessToken);
+      // Owner shape (D15/D16, 2026-10-30): if the browser login belongs to an
+      // account that LIVES in a linked team pool, the fresh login goes STRAIGHT
+      // there — never persisted locally (single writer: one account, one home).
+      // Same keystroke as a local re-auth; the routing is by where the account
+      // lives, so nothing is selected and no menu appears.
+      const mirror = this._findRemoteMirrorFor(profile);
+      if (mirror) {
+        setConsoleStdoutSuppressed(false);
+        await this._sendLoginToRemote(mirror, creds, profile);
+        return;
+      }
       const existing = this._findExistingOAuthAccount(profile);
       let name;
       if (existing) {
@@ -1459,6 +1512,53 @@ export class TUI {
     } finally {
       setConsoleStdoutSuppressed(false);   // restore on every path (incl. the catch)
       if (wasRunning) this.start();
+    }
+  }
+
+  // The browser login belongs to a linked team pool iff a mirror row carries the
+  // same account uuid (M2: mirrors hold remoteUuid, never accountUuid, so a
+  // uuid-first matcher cannot alias onto a local account).
+  _findRemoteMirrorFor(profile) {
+    if (!profile?.accountUuid) return null;
+    return this.am.accounts.find(a => a.remote && a.remoteUuid === profile.accountUuid) || null;
+  }
+
+  // Send a fresh browser login to the linked team pool that OWNS this account
+  // (D15/D16). Never falls back to a local save — a network failure here must
+  // surface, not silently create a second writer on this laptop.
+  async _sendLoginToRemote(mirror, creds, profile) {
+    const remote = mirror.remote;
+    const name = remote.remoteName || mirror.name;
+    process.stdout.write(`\n"${name}" lives in the team pool (${remote.linkName}) — sending the fresh login there…\n`);
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 20_000);
+    try {
+      const res = await fetch(`${String(remote.url).replace(/\/+$/, '')}/maxpool/accounts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': remote.key || '' },
+        body: JSON.stringify({
+          account: {
+            name, type: 'oauth',
+            accountUuid: profile?.accountUuid,
+            accessToken: creds.accessToken,
+            refreshToken: creds.refreshToken,
+            expiresAt: creds.expiresAt,
+            source: 'remote-login',
+          },
+        }),
+        signal: ctl.signal,
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json.ok) {
+        process.stdout.write(`\nDone: "${name}" ${json.result === 'added' ? 'added to' : 're-authenticated in'} the team pool. Nothing was saved on this laptop.\n`);
+        this._addLog(`Remote login: "${name}" → team pool ${remote.linkName} (${json.result})`);
+      } else {
+        process.stdout.write(`\nTeam pool rejected the login (HTTP ${res.status}: ${json?.message || json?.error || 'unknown error'}). NOTHING was saved on this laptop — not retried locally.\n`);
+      }
+    } catch (e) {
+      process.stdout.write(`\nCould not reach the team pool (${e?.name === 'AbortError' ? 'timed out' : e?.message}). NOTHING was saved on this laptop — try again in a moment.\n`);
+    } finally {
+      clearTimeout(t);
     }
   }
 
@@ -1895,6 +1995,10 @@ export class TUI {
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    // Usage by person (owner 2026-10-29: "the only thing missing is usage by person").
+    // Local named callers + each linked team pool's callers, one compact line.
+    const people = this._peopleLine(W);
+    if (people) lines.push(people);
     // Restart/reload in progress: admission is paused while active requests drain, then
     // the process swaps. Without live feedback the screen looks FROZEN (identical
     // dashboard, nothing moving) from R→Yes until the swap — the reported bug. Show an
@@ -1936,6 +2040,15 @@ export class TUI {
       // and cross-provider fragments off the right edge at 120 columns.
       routing = this._routingModeDef(this.am.scheduler?.routingMode || 'sticky').label;
     }
+    // WHERE CLAUDE CODE ROUTES (owner 2026-11-01: "can the app show where the Claude
+    // Code app is routing to now?"). Reads the same switch file rc-gate re-reads per
+    // request, so the header always agrees with the live path. Direct mode is RED —
+    // it means the pool is bypassed and accounts are idle.
+    try {
+      let mode = 'pool';
+      try { mode = readFileSync(homedir() + '/.config/rc-gate-route', 'utf8').trim() || 'pool'; } catch { /* absent = pool */ }
+      routing += mode === 'direct' ? `  ·  Claude Code: ${red('DIRECT (pool bypassed)')}` : `  ·  Claude Code: ${green('pool')}`;
+    } catch { /* display-only */ }
     // Cross-provider fallback policy — only meaningful when GLM/Kimi providers are in
     // the pool (profile=all). never=strict pin (yellow), when-exhausted=default (cyan),
     // always=peer (green).
@@ -2010,6 +2123,14 @@ export class TUI {
       this._writeScreen(lines, W, H);
       return;
     }
+    if (this.mode === 'people') {
+      lines.push(...this._renderPeoplePage(W));
+      while (lines.length < H - 2) lines.push('');
+      lines.push(' ' + dim('─'.repeat(W - 2)));
+      lines.push(this._renderFooter());
+      this._writeScreen(lines, W, H);
+      return;
+    }
 
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -2038,6 +2159,10 @@ export class TUI {
       let hidden = 0;
       for (const i of this._displayOrder()) {
         if (this.hideDisabled && this.am.accounts[i]?.enabled === false) { hidden++; continue; }
+        // Same key also hides local copies guarded by the duplicate guard — they are
+        // effectively off (owner 2026-10-29: "should it hide the local ones that are
+        // in the cloud... they're effectively disabled as well"). No separate key.
+        if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
         lines.push(this._renderAcct(i, bw, showBoth));
       }
       if (hidden > 0) {
@@ -2137,7 +2262,22 @@ export class TUI {
   }
 
   _renderAcct(idx, bw, showBoth) {
-    const a = this.am.accounts[idx];
+    let a = this.am.accounts[idx];
+    // A row benched by the duplicate guard renders the CLOUD's live copy (status,
+    // bars, in-flight, request counts) — never the stale local snapshot. Identity
+    // and name stay local so the row doesn't move.
+    const live = a?.poolBenchedBy ? this.am.remoteRowFor?.(a) : null;
+    if (live) {
+      const r = live.row;
+      a = Object.assign(Object.create(Object.getPrototypeOf(a)), a, {
+        quota: { ...a.quota, ...(r.quota || {}) },
+        inFlight: r.inFlight ?? 0,
+        completedRequests: r.completedRequests ?? a.completedRequests,
+        refreshDead: Boolean(r.refreshDead),
+        rateLimitedUntil: r.rateLimitedUntil ? Date.parse(r.rateLimitedUntil) : null,
+      });
+    }
+
     // Highlight the ACTIVE account(s) — drives BOTH the ► marker and the green
     // "active" status color. In manual mode that's the single pinned account (all
     // traffic goes there). In automatic load-balancing there is no single "current"
@@ -2155,7 +2295,9 @@ export class TUI {
     const cur = isCur ? green('►') : ' ';
 
     // Name (bold if selected)
-    const rawName = a.name.slice(0, NAME_W).padEnd(NAME_W);
+    // A cloud row is named exactly like the account (the Where column says Cloud);
+    // its internal name carries a suffix only to stay unique next to a local copy.
+    const rawName = (a.remote ? a.remote.remoteName : a.name).slice(0, NAME_W).padEnd(NAME_W);
     // A disabled account reads as "off" — dim the whole name. Applied as a SINGLE SGR
     // (never dim(bold(...)) — bold()'s trailing RESET would cancel the dim mid-string),
     // so a disabled row is never also bold-selected.
@@ -2174,7 +2316,13 @@ export class TUI {
     // the one running the recovery probe as "probing" and the rest "waiting"
     // (the pool-wide throttle banner above conveys the cause).
     const upstreamBlocking = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
-    let effectiveStatus = a.enabled === false ? 'disabled' : a.status;
+    // A mirror row whose link is down/stale is benched by syncRemoteMirrors with
+    // enabled=false — show it as cloud-unreachable, never as "disabled" (which reads
+    // as "I switched this off"). _cloud/_cloudOk were never set; key on a.remote.
+    const linkDown = a.remote && (a.remote.link?.lastError || a.remote.link?.lastOkAt == null);
+    let effectiveStatus = a.remote && (linkDown || a.enabled === false)
+      ? (linkDown ? 'cloud-down' : 'disabled')
+      : (a.poolBenchedBy ? 'pool-benched' : (a.enabled === false ? 'disabled' : a.status));
     if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
       effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
     }
@@ -2225,6 +2373,8 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
+      case 'pool-benched': status = gray('in cloud'); break;
+      case 'cloud-down': status = red('⟐ cloud ✕'); break;
       // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
       // The owner's question that drove this (2026-09-30): "when I disable the account
       // and then the token expires, does it show disabled or reauth? It needs to
@@ -2320,7 +2470,7 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
@@ -2481,7 +2631,7 @@ export class TUI {
     // setting whenever the probe is quiet is how a shipped feature reads as absent.
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} Ses ${sesCell}`;
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} Ses ${sesCell}`;
     if (showBoth) line += `  Wk  ${wkCell}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),
@@ -2520,9 +2670,72 @@ export class TUI {
     };
   }
 
+  /** PEOPLE page (SC22) — usage by teammate. Rolling windows (24h/7d/30d, priors
+   *  as DELTAS) + cumulative, requests AND tokens; merges this pool's served traffic
+   *  with linked pools' callerWindows — each request counted once, at the pool that
+   *  served it (red-team verdict 2026-10-29: delta = % on base>=50, raw otherwise;
+   *  honesty footer for coverage + link sync; nobody-yet state, not zeros). */
+  _renderPeoplePage(W = 80) {
+    const out = [];
+    out.push('');
+    out.push(` ${bold('Usage by person')}  ${dim('— requests · ~7d = tokens · rolling windows · no double counting')}`);
+    out.push('');
+
+    const merged = new Map();
+    const addWin = (name, w) => {
+      const cur = merged.get(name) || { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0 };
+      for (const k of ['h24', 'h24p', 'd7', 'd7p', 'd30', 'd30p', 'total']) cur[k] += (w[k]?.req ?? 0);
+      cur.tok7 += (w.d7?.tok ?? 0);
+      merged.set(name, cur);
+    };
+    for (const [n, w] of this.am.callerWindowStats?.() || []) addWin(n, w);
+    for (const l of this.am.poolLinks || []) {
+      const cw = l.status?.callerWindows || {};
+      for (const [n, w] of Object.entries(cw)) addWin(n, w);
+    }
+    merged.delete('legacy-key');
+    if (!merged.size) {
+      out.push(dim('  Nobody has made a named request yet. Rows appear once requests'));
+      out.push(dim('  carry personal pool keys.'));
+      return out;
+    }
+
+    const fmt = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+    const fmtTok = t => t >= 1e6 ? (t / 1e6).toFixed(1) + 'M' : t >= 1000 ? Math.round(t / 1000) + 'k' : String(t);
+    const delta = (cur, prior) => {
+      if (!prior) return dim('--');
+      const d = prior >= 50 ? `${cur > prior ? '+' : ''}${Math.round(((cur - prior) / prior) * 100)}%` : `${cur - prior >= 0 ? '+' : ''}${cur - prior}`;
+      return d.startsWith('+') ? green(d) : d.startsWith('-') ? yellow(d) : dim(d);
+    };
+    const CW = 9;
+    const header = '  ' + 'person'.padEnd(10)
+      + ['24h', 'Δ24h', '7d', 'Δ7d', '30d', 'Δ30d', 'total', '~7d tok'].map(c => c.padStart(CW)).join('');
+    out.push(dimUnderline(fitLine(header, W)));
+
+    const rows = [...merged.entries()].sort((a, b) => b[1].d7 - a[1].d7);
+    const tot = { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0 };
+    for (const [name, w] of rows) {
+      for (const k of Object.keys(tot)) tot[k] += w[k];
+      out.push('  ' + name.slice(0, 10).padEnd(10)
+        + [fmt(w.h24), delta(w.h24, w.h24p), fmt(w.d7), delta(w.d7, w.d7p), fmt(w.d30), delta(w.d30, w.d30p), fmt(w.total), fmtTok(w.tok7)]
+          .map(c => lpadVis(String(c), CW)).join(''));
+    }
+    out.push(dim('  ' + 'total'.padEnd(10)
+      + [fmt(tot.h24), delta(tot.h24, tot.h24p), fmt(tot.d7), delta(tot.d7, tot.d7p), fmt(tot.d30), delta(tot.d30, tot.d30p), fmt(tot.total), fmtTok(tot.tok7)]
+        .map(c => lpadVis(String(c), CW)).join('')));
+
+    const link = (this.am.poolLinks || []).find(l => l.lastOkAt);
+    out.push(dim(`  rolling windows · restarts included${link ? ` · team pool synced ${new Date(link.lastOkAt).toLocaleTimeString()}` : ''}`));
+    return out;
+  }
+
   _keyCapacity(k) {
     if (k === 'w') { this.capacityWindow = this.capacityWindow === 'wk' ? 'ses' : 'wk'; }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  _keyPeople(k) {
+    if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
   }
 
   /**
@@ -2553,11 +2766,11 @@ export class TUI {
     // Current is the live window (estimate while it runs; frozen into the columns at
     // close). Prev/Avg/N are the completed-cycle history. The no-weekly account's
     // weekly view approximates capacity as avg session tank × 33.6 (7×24/5h windows).
-    const ALL_COLS = ['Current', 'Prev', 'Avg', 'N'];
+    const ALL_COLS = ['Current', 'Prev', 'Avg', 'N', '$/1M'];
     const CW = 11;
     const nameW = 12;
     let COLS = ALL_COLS;
-    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 14) > W) {
+    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 22) > W) {
       COLS = COLS.slice(0, -1);
     }
     const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
@@ -2580,6 +2793,11 @@ export class TUI {
         const approx = sesTank && sesTank.n > 0
           ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
         const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
+        // Same price cell as the main path: this account's weekly capacity IS the
+        // derived tank (avg 5h × 33.6) — the price column must not go blank here.
+        const p2 = this.am.monthlyPriceFor?.(a);
+        cellsByName['$/1M'] = gray((sesTank?.avg && p2)
+          ? ('$' + (p2 / (Math.round(sesTank.avg * (7 * 24) / 5) / 1e6)).toFixed(2)).padStart(CW) : '--'.padStart(CW));
         out.push('  ' + name + ' ' + prov + ' '
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
           + dim('  no weekly limit · avg 5h × 33.6'));
@@ -2611,6 +2829,26 @@ export class TUI {
         Avg: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
         N: (tank?.source === 'cycles' ? String(tank.n) : '--'),
       };
+      // $/1M (owner 2026-10-31 "price per token, not per subscription"): the measured
+      // weekly tank divided by the plan's monthly-normalized price. Weekly in BOTH
+      // views — a 5h tank refills ~33.6x per week, so the weekly figure is what a
+      // month of subscription actually buys. '--' until a tank reading AND a price exist.
+      const sesTankObj = this.am.capacityTank?.(i, 'ses');
+      // Weekly-plan accounts: a measured weekly tank, or the derived form ses × 5.5 —
+      // MEASURED weekly tanks run 5-7× the 5h tank (2026-10-31: glm1 1.27M→8.58M,
+      // glm2 1.26M→6.85M, max+4 1.53M→7.21M): the weekly window holds ~5 full 5h
+      // refills, not 33.6. The owner caught the ×33.6 error here ("your math seems
+      // completely off"). weeklyAbsent plans (no weekly limit at all) keep ×33.6.
+      const WK_PER_SES = 5.5;
+      const wkTank = (a.quota?.weeklyAbsent && a.type === 'provider')
+        ? (sesTankObj?.avg ? Math.round(sesTankObj.avg * (7 * 24) / 5) : null)
+        : (this.am.capacityTank?.(i, 'wk')?.avg
+          ?? (a.type === 'provider' && sesTankObj?.avg ? Math.round(sesTankObj.avg * WK_PER_SES) : null));
+      const price = this.am.monthlyPriceFor?.(a);
+      const priceCell = (wkTank && price)
+        ? '$' + (price / (wkTank / 1e6)).toFixed(2)
+        : '--';
+      cellsByName['$/1M'] = gray(priceCell.padStart(CW));
       const row = '  ' + name + ' ' + prov + ' '
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');
       out.push(row + (curPct ? ' ' + curPct : ''));
@@ -2619,6 +2857,7 @@ export class TUI {
     out.push('');
     out.push(' ' + dim('Capacity = tokens ÷ how full the provider said the window was, at close.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
+    out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized). -- = no price or tank yet.'));
     return out;
   }
 
@@ -2656,11 +2895,13 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
       case 'capacity': {
         const other = this.capacityWindow === 'wk' ? '5h session' : 'weekly (7d)';
         return ` ${bold('w')} Show ${cyan(other)}  ${bold('Esc')} Back`;
       }
+      case 'people':
+        return ` ${bold('Esc')} Back`;
       case 'updates': {
         const state = this._autoUpdateOn() ? green('on') : dim('off');
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;

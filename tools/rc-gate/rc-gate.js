@@ -155,6 +155,26 @@ const MAXPOOL_KEY = process.env.RC_GATE_MAXPOOL_KEY || '';
 const MITM_BODY_DEADLINE_MS = Number(process.env.RC_GATE_MITM_BODY_DEADLINE_MS) || 600_000;
 const MITM_HOSTS = new Set((process.env.RC_GATE_MITM_HOSTS || 'api.anthropic.com').split(',').map(s => s.trim()).filter(Boolean));
 const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
+
+// LIVE ROUTING SWITCH (owner 2026-11-01: "make the routing switch without having to
+// restart the app"). A running Claude session pins its proxy env at launch, but every
+// request still passes through THIS gate — so the gate is the one place a flip can
+// take effect instantly for all running sessions. Control file, re-read per request,
+// cached 1s: "direct" routes api.anthropic.com traffic straight to Anthropic (pool
+// bypassed), anything else (or missing file) = the normal pool path. Flipped by
+// `touch`-style writes; never requires a gate restart.
+const ROUTE_SWITCH_FILE = process.env.RC_GATE_ROUTE_FILE
+  || path.join(os.homedir(), '.config', 'rc-gate-route');
+let _routeCache = { at: 0, val: 'pool' };
+function routeMode() {
+  const now = Date.now();
+  if (now - _routeCache.at < 1000) return _routeCache.val;
+  let v = 'pool';
+  try { v = (readFileSync(ROUTE_SWITCH_FILE, 'utf8').trim() || 'pool'); } catch { /* absent = pool */ }
+  if (v !== 'direct') v = 'pool';
+  _routeCache = { at: now, val: v };
+  return v;
+}
 // Direct-forward upstream (test seam; defaults are production values).
 const DIRECT_HOST = process.env.RC_GATE_DIRECT_HOST || 'api.anthropic.com';
 const DIRECT_PORT = Number(process.env.RC_GATE_DIRECT_PORT || 443);
@@ -265,15 +285,27 @@ const mitmServer = http.createServer((creq, cres) => {
   // every one that didn't own the session (measured 2026-09-12: the same id failing on
   // mk@gomokka, privacy@, mk@dubner.io, 2solarmax in turn). Inference stays on the pool:
   // only the sessions APIs go direct.
-  const isIdentityPath = !creq.url.startsWith('/v1/')
+  // `/v1/environments/*` is the Remote Control MACHINE registration (bridge create /
+  // credential renew / work poll) — identity-bound the same way: it renews on the saved
+  // claude.ai login, so a pool-routed renewal lands on the wrong account and is rejected.
+  // Symptom (2026-10-31, launchd hosts com.mokka.claude-rc-*): "could not renew this
+  // environment's credential after repeated attempts" ~300×/host/day, laptop device
+  // entry offline on the phone; gate.log showed 5,710 POST /v1/environments/bridge all
+  // "→ pool" plus 1,478 failed forwards. Same fix class as the sessions split above.
+  const routeDirect = routeMode() === 'direct';   // live switch, no restart
+  const isIdentityPath = routeDirect || !creq.url.startsWith('/v1/')
     || creq.url.startsWith('/v1/code/sessions')
+    || creq.url.startsWith('/v1/environments')
     || /^\/v1\/sessions(\/|$)/.test(creq.url);
   if (isIdentityPath) {
     const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
     try { _titleSync?.noteAuthHeaders(creq.url, creq.headers); } catch {}
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
-    // A pool key (mp-…) exported as ANTHROPIC_API_KEY for a shared pool must never
-    // travel to Anthropic on the direct leg.
+    // A pool key exported as ANTHROPIC_API_KEY for a shared pool must never travel
+    // to Anthropic on the direct leg. Compared by VALUE (not the mp- prefix): the
+    // per-person keys minted into Secret Manager have no guaranteed prefix, and a
+    // prefix match would silently leak any key that lacks it (security review 2026-10-31).
+    if (MAXPOOL_KEY && dirHeaders['x-api-key'] === MAXPOOL_KEY) delete dirHeaders['x-api-key'];
     if (String(dirHeaders['x-api-key'] || '').startsWith('mp-')) delete dirHeaders['x-api-key'];
     // Session-create responses: force identity encoding so the body is readable end-to-end.
     // The CLI negotiates zstd (server advertises zstd,gzip) and Node cannot decode zstd — a
@@ -552,8 +584,14 @@ mitmServer.headersTimeout = 0;
 mitmServer.requestTimeout = 0;
 mitmServer.keepAliveTimeout = 0;
 
+let plain405 = 0;
 const gate = http.createServer((req, res) => {
-  // Plain (non-CONNECT) requests shouldn't arrive; answer honestly.
+  // Plain (non-CONNECT) requests shouldn't arrive; answer honestly — and SAY SO.
+  // A plain request means some client treats this gate as a plain HTTP proxy
+  // (HTTP_PROXY pointing here, a global-agent setup) — invisible without a trace
+  // (the 2026-10-31 session-death diagnosis had zero gate-side evidence).
+  plain405++;
+  console.error(`[rc-gate] plain ${req.method} ${req.url} from ${req.socket.remoteAddress} → 405 (client is using this as a non-CONNECT proxy)`);
   res.writeHead(405).end('rc-gate: CONNECT only');
 });
 gate.on('connect', (req, clientSocket, head) => {

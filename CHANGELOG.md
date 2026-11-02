@@ -5,6 +5,182 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.65] - 2026-10-31
+
+### Changed
+
+- Live routing switch: flip Claude Code between pool and direct with NO restart (owner 2026-11-01)
+
+## [1.24.64] - 2026-10-31
+
+### Changed
+
+- Capacity page opens on weekly — the true tank (owner 2026-10-31)
+
+## [1.24.63] - 2026-10-31
+
+### Changed
+
+- Capacity page: cloud rows actually get their price and tank (owner's screen showed '--' on every cloud row)
+
+## [1.24.62] - 2026-10-31
+
+### Changed
+
+- Delete the aggregate type:'pool' row mechanism — mirrors are the only link rows (architect#5, second attempt, by hand)
+
+## [1.24.61] - 2026-10-31
+
+### Changed
+
+- Head-skip removes the ADMITTED ticket, not the head
+
+## [1.24.60] - 2026-10-31
+
+### Changed
+
+- Thinking-signature 400s: stop charging healthy Claude accounts a failure (owner 2026-10-31 'why so many errors')
+- Boot-seed integration test kills its whole process group (release suite hang)
+- /v1/environments/* goes DIRECT — Remote Control machine registration is identity-bound
+
+## [1.24.59] - 2026-10-31
+
+### Changed
+
+- Price cell: weekly-plan derivation corrected to 5h × 5.5 (measured weekly/5h ratio)
+
+## [1.24.58] - 2026-10-31
+
+### Changed
+
+- Bounded head-skip — a serveable waiter passes a stuck head after 60s (redteam#5)
+- Pin the aggregate pool-row mechanism as dead (architect#5)
+
+## [1.24.57] - 2026-10-31
+
+### Changed
+
+- Capacity page: $/1M price-per-token column (owner 2026-10-31 'price per token, not per subscription')
+
+## [1.24.56] - 2026-10-31
+
+### Changed
+
+- Architect fixes: weekly ladder tiers on the weekly window (cap keeps worst-window), inject 507 on persist failure + config.accounts guard, pin-drop named loudly
+- Pin-drop regex matches the escaped source string
+
+## [1.24.55] - 2026-10-31
+
+### Changed
+
+- Integration test proving the seed benches at boot (mutant-verified); seed moved into the link-setup tick; divergence alarm once per episode
+- Tests for the review fixes that had none (sanitizer, body cap, screen, double count); persisted identities now age from the last good poll; boot test no longer races its own config write
+
+## [1.24.54] - 2026-10-31
+
+### Changed
+
+- Redteam fixes: boot-time single-writer seed (blocking), benched rows never claim grants, suite-wide test isolation, rc-gate 405 logging, token-divergence alarm
+
+## [1.24.53] - 2026-10-31
+
+### Changed
+
+- Council review fixes (product+security): live bars for benched rows, weekly-only dying spend, screen de-dupe, cloud-down status, ingress sanitizer, fail-closed clients, value-based key strip, inject body cap
+- Drop session-util locals the weekly-only dying gate no longer reads
+
+## [1.24.52] - 2026-10-30
+
+### Changed
+
+- Requests released from the queue survive cloud replies, repairs and refusals; GLM session wall 100%
+- Requests released from the queue keep their repairs and failover; capacity refusals wait instead of reaching the client; GLM session wall 100%
+
+## [1.24.51] - 2026-10-30
+
+### Changed
+
+- Widen glob to *.test.mjs + nullglob (link-ttfb/ultra tests now run at release); rename to .test.js
+
+## [1.24.50] - 2026-10-30
+
+### Changed
+
+- Reset policy: never spend any reset on a session limit (owner 2026-10-30); pin Ultra no-5h behavior
+
+## [1.24.49] - 2026-10-30
+
+### Changed
+
+- Test isolation: pin MAXPOOL_CONFIG to a temp dir in remote-inject tests
+
+## [1.24.48] - 2026-10-30
+
+### Changed
+
+- Remote login: one-keystroke cloud re-auth through the TUI (D15/D16)
+
+## [1.24.47] - 2026-10-30
+
+### Changed
+
+- Link forward: TTFB guard follows direct-path budget (120s default, MAXPOOL_LINK_TTFB_MS, floor 15s)
+
+## [1.24.46] - 2026-10-29
+
+### Changed
+
+- Team pool: sort by Where first (local then cloud, existing order within), h also hides guarded local duplicates
+
+## [1.24.45] - 2026-10-29
+
+### Changed
+
+- Team pool: People screen visible-width alignment + SC22 pin (columns, deltas, merge, nobody-yet)
+
+## [1.24.44] - 2026-10-29
+
+### Changed
+
+- Team pool: every cloud account is its own row (Where: Local/Cloud), balanced by the unchanged routing logic; pinned forwarding with fast failover; reset cards exported for cloud rows
+- Team pool: SC20 test — auto-guarded duplicate stays listed (Where=Local, status 'in cloud'), never routes/refreshes
+- Team pool: red-team #3 P1-P5+H/M fixes (pin ceiling, no mirror-of-mirror, pins skip queue gate, link timeout/exclusion/cap, never-remove mirrors, uuid non-aliasing) + People analytics screen (SC22: persisted buckets, tokens+requests, delta columns, no double counting)
+- Team pool: drop duplicate capUtilization key (release lint)
+
+## [1.24.43] - 2026-10-29
+
+### Changed
+
+- Team pool: link scores by the cloud's real load + remaining capacity, so local balancing respects the accounts inside the team pool
+
+## [1.24.42] - 2026-10-29
+
+### Changed
+
+- Team pool: cloud rows render live remote state (status/bars/req-rate), strip client provider tokens on link forward, benched copies never redeem cards or flag outside-usage
+
+## [1.24.41] - 2026-10-29
+
+### Changed
+
+- Team pool: People line in the terminal app — usage by person (local + cloud callers), owner 2026-10-29
+
+## [1.24.40] - 2026-10-29
+
+### Changed
+
+- Team pool: status exports Claude accountUuid so linked pools can bench a duplicate Claude login (caught by live drill; unit test now uses the real status shape)
+
+## [1.24.39] - 2026-10-29
+
+### Changed
+
+- Team pool: cloud pool as one account (D8) — link status poll, duplicate auto-bench, per-account cloud rows, loop guard, 7/7 mutants killed
+- Team pool: link-forward lease accounting — success flag + single release (live-rehearsal bug: failed counter and stuck inFlight on the screen)
+- Team pool: links carry /v1 API traffic only — browser noise (favicon) pinned link leases for the remote hold window (live rehearsal)
+- Team pool: screen shows local/cloud account counts, link row labelled Team pool
+- Team pool: drop unused import caught by release lint
+
 ## [1.24.38] - 2026-10-29
 
 ### Changed

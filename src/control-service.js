@@ -23,6 +23,8 @@ export class ControlService {
     syncAccounts,
     checkForUpdates,
     getUpstreamSyncStatus = () => null,
+    getClientRouting = () => null,
+    setClientRoute = null,
     getActivity = () => ({ activeCount: 0, sessionCount: 0, active: [], recent: [] }),
     requestRestart,
     requestStop,
@@ -35,6 +37,8 @@ export class ControlService {
     this.checkForUpdates = checkForUpdates;
     this.getUpstreamSyncStatus = getUpstreamSyncStatus;
     this.getActivity = getActivity;
+    this.getClientRouting = getClientRouting;
+    this.setClientRoute = setClientRoute;
     this.requestRestart = requestRestart;
     this.requestStop = requestStop;
     this.log = log;
@@ -53,8 +57,25 @@ export class ControlService {
       availableRevision: null,
       error: null,
     };
+    const clientRouting = this.getClientRouting();
     return {
       ...status,
+      // Native UI uses effective cloud prices and tanks, not the local ledger.
+      accounts: (status.accounts || []).map(row => {
+        const a = this.am.accounts.find(a => a.name === row.name);
+        if (!a) return row;
+        const cloudWindow = win => {
+          const t = this.am.capacityTank?.(a.index, win);
+          return t ? { current: t.avg, latest: t.last ?? null, average: t.avg,
+            samples: t.n ?? 0, lowerBound: Boolean(t.lowerBound), derived: false,
+            source: 'cloud', fresh: true, usage: null } : null;
+        };
+        return { ...row, monthlyPriceUSD: this.am.monthlyPriceFor?.(a) ?? row.monthlyPriceUSD ?? null,
+          capacity: row.remote ? { session: cloudWindow('ses'), weekly: cloudWindow('wk') } : row.capacity };
+      }),
+      pools: (status.pools || []).map(row => ({ ...row,
+        callerWindows: this.am.poolLinks?.find(l => l.name === row.name)?.status?.callerWindows || {} })),
+      clientRouting,
       upstreamSync,
       activity: this.getActivity(),
       control: {
@@ -62,6 +83,7 @@ export class ControlService {
         backendPid: process.pid,
         automaticUpdates: this._automaticUpdatesOn(),
         capabilities: {
+          setClientRoute: Boolean(this.setClientRoute && clientRouting?.gateAvailable),
           setRoutingMode: true,
           preferAccount: true,
           manageAccounts: true,
@@ -86,6 +108,12 @@ export class ControlService {
       : {};
 
     switch (type) {
+      case 'set-client-route':
+        if (!['pool', 'direct'].includes(payload.mode)) throw new ControlError('Choose pool or direct.');
+        if (!this.setClientRoute) throw new ControlError('Live switching is unavailable.', 503);
+        try { await this.setClientRoute(payload.mode); }
+        catch (error) { throw new ControlError(error.message, 503, 'gate_unavailable'); }
+        return { ok: true, message: 'Route updated for rc-gate clients on their next request.' };
       case 'set-routing-mode':
         return this._setRoutingMode(payload.mode);
       case 'set-preferred-account':
@@ -124,7 +152,9 @@ export class ControlService {
   _findAccount(name) {
     const index = this.am.accounts.findIndex(account => account.name === name);
     if (index < 0) throw new ControlError(`Account "${name}" was not found.`, 404, 'not_found');
-    return { account: this.am.accounts[index], index };
+    const account = this.am.accounts[index];
+    if (account.remote || account.poolBenchedBy) throw new ControlError('Manage this account on its owning cloud pool.', 409, 'cloud_managed');
+    return { account, index };
   }
 
   _configLocation(account) {

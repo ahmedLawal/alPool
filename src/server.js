@@ -1,5 +1,7 @@
 import http from 'node:http';
 import { appendEventLog } from './event-log.js';
+import { atomicConfigUpdate } from './config.js';
+import { HOP_HEADER, nextHopCount, safeText } from './pool-link.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
@@ -12,6 +14,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 const MAXPOOL_HEADER_PREFIX = 'x-maxpool-';
+const MAX_HOPS_SRV = 2;
 
 const DEFAULT_RETRY = {
   maxAttemptsPerRequest: 0,
@@ -164,16 +167,23 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // A non-loopback listen host also forces strict even without clients (a shared
   // pool must never trust by address). Default local config (loopback host, no
   // clients) keeps today's behavior exactly.
-  const clientList = Array.isArray(config.proxy?.clients)
-    ? config.proxy.clients.filter(c => c && typeof c.key === 'string' && c.key)
-    : [];
+  const rawClients = Array.isArray(config.proxy?.clients) ? config.proxy.clients : [];
+  const clientList = rawClients.filter(c => c && typeof c.key === 'string' && c.key);
+  // Fail CLOSED on intent: a non-empty `clients` list means the operator asked for
+  // per-person keys, even if every entry is malformed (hand-edited VM config, a key
+  // quoted as a number). Each dropped entry is logged so the typo is visible.
+  for (const c of rawClients) {
+    if (!(c && typeof c.key === 'string' && c.key)) {
+      console.error(`[Maxpool] proxy.clients entry ignored (missing/invalid key): name=${safeText(String(c?.name ?? '?'))}`);
+    }
+  }
   const clientByKey = new Map(clientList.map(c => [c.key, c.name]));
   // '0.0.0.0' stays in the trusted set for backward compatibility (a solo user who
   // binds every interface keeps keyless local use); it is warned about at startup
   // because it also exposes the pool to the network. Shared pools set `clients`.
   const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0']);
   const hostIsLoopback = (config.proxy?.host == null) || LOOPBACK_HOSTS.has(String(config.proxy.host).toLowerCase());
-  const strictClients = clientByKey.size > 0 || !hostIsLoopback;
+  const strictClients = rawClients.length > 0 || !hostIsLoopback;
   const resolveCaller = (key, isLocal) => {
     if (key != null && clientByKey.has(key)) return { name: clientByKey.get(key), ok: true };
     // Legacy single key still works — including strict mode, so a solo user can
@@ -228,6 +238,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
       }
+      // Loop guard (owner D8): a request forwarded by another pool carries a hop
+      // count. Refuse beyond MAX_HOPS with a clear error instead of cycling pools.
+      const inboundHops = headerValue(req.headers, HOP_HEADER);
+      if (inboundHops != null && Number.parseInt(inboundHops, 10) >= MAX_HOPS_SRV) {
+        res.writeHead(508, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'request_loop', message: 'Maxpool hop limit reached — two pools are forwarding to each other. Check each pool\'s `pools` config.' } }));
+        return;
+      }
+
       // Auth check — per-person clients when configured, legacy single key otherwise.
       // strictClients (clients list present, or a non-loopback listen host) removes
       // the loopback bypass entirely: every caller must present a known key.
@@ -313,6 +332,92 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // Remote login inject (owner decision D15/D16, 2026-10-30): a linked pool
+      // re-authenticates one of ITS accounts through the front door instead of
+      // SSH. Any valid key may add or re-auth (one permission level — the door
+      // is the per-person key + the audit log, not per-item rules). A uuid
+      // match can only ever re-authorize the SAME account (the browser login
+      // for X replaces the saved login for X), so no healthy-row refusal:
+      // runtime refreshDead lags reality at boot anyway (scratch E2E 2026-10-30:
+      // a dead-on-disk row read "healthy" and a real re-auth was refused 409).
+      if (req.method === 'POST' && req.url === '/maxpool/accounts') {
+        if (strictClients ? !caller.ok : (proxyApiKey && clientKey !== proxyApiKey)) {
+          rejectUnauthorized();
+          return;
+        }
+        // An oauth payload is ~2 KB; cap well above that so a key holder can't grow the heap.
+        const chunks = []; let bodyBytes = 0;
+        for await (const c of req) {
+          bodyBytes += c.length;
+          if (bodyBytes > 256 * 1024) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'too_large' }));
+            req.destroy();
+            return;
+          }
+          chunks.push(c);
+        }
+        let body;
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { body = null; }
+        const acct = body?.account;
+        if (acct && typeof acct.name === 'string') acct.name = safeText(acct.name);
+        if (!acct || acct.type !== 'oauth' || typeof acct.accountUuid !== 'string' || !acct.accountUuid ||
+            typeof acct.refreshToken !== 'string' || !acct.refreshToken || typeof acct.accessToken !== 'string' || !acct.accessToken) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"oauth", accountUuid, accessToken, refreshToken, name?}}' }));
+          return;
+        }
+        const who = caller.name || 'legacy-key';
+        const amAcct = accountManager.accounts.find(a => a.accountUuid === acct.accountUuid);
+        const tokenFields = {
+          accessToken: acct.accessToken,
+          refreshToken: acct.refreshToken,
+          expiresAt: typeof acct.expiresAt === 'number' ? acct.expiresAt : Date.now() + 3600_000,
+          source: acct.source || 'remote-inject',
+        };
+        if (amAcct) {
+          // In-place revive, mirroring the TUI re-auth field set: fresh tokens
+          // BEFORE persisting (the disk writer derives from the AM), refreshDead
+          // cleared here or the row stays benched after a successful re-auth.
+          amAcct.credential = tokenFields.accessToken;
+          amAcct.refreshToken = tokenFields.refreshToken;
+          amAcct.expiresAt = tokenFields.expiresAt;
+          amAcct.refreshDead = false;
+          if (amAcct.status === 'error') amAcct.status = 'active';
+          appendEventLog(`[Maxpool] Remote re-auth: "${amAcct.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
+        } else {
+          const entry = { name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields };
+          accountManager.addAccount(entry);
+          appendEventLog(`[Maxpool] Remote add: "${entry.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
+        }
+        try {
+          await atomicConfigUpdate(diskConfig => {
+            const onDisk = diskConfig.accounts.find(a => a.accountUuid === acct.accountUuid);
+            if (onDisk) {
+              Object.assign(onDisk, tokenFields);
+            } else {
+              diskConfig.accounts.push({ name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields });
+            }
+          });
+          // Keep the in-memory config mirror in step so a later TUI saveConfig
+          // can't clobber the fresh tokens with stale ones.
+          const mem = (config.accounts || []).find(a => a.accountUuid === acct.accountUuid);
+          if (mem) Object.assign(mem, tokenFields);
+        } catch (err) {
+          // A single-use credential write is only "ok" when it is DURABLE: the browser
+          // login may have invalidated the previous refresh token, so memory-only means
+          // a restart bricks the account while both sides recorded success (council
+          // review 2026-10-31). Tell the caller to retry instead of claiming Done.
+          console.error(`[Maxpool] Remote inject persisted to memory but NOT disk for uuid ${acct.accountUuid.slice(0, 8)}: ${err?.message || err}`);
+          res.writeHead(507, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: 'Saved in memory only — the pool could not write it to disk. Log in again.' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result: amAcct ? 'reauthed' : 'added', name: amAcct ? amAcct.name : (acct.name || acct.accountUuid.slice(0, 8)) }));
+        return;
+      }
+
       if (!caller.ok) {
         rejectUnauthorized();
         return;
@@ -320,7 +425,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // In strict mode the legacy single key is still accepted; label it so its
       // traffic is attributed and logged rather than anonymous.
       req.callerName = caller.name || (strictClients ? 'legacy-key' : null);
+      // SC22: count ONLY when this pool serves the request upstream. A request
+      // later routed to a linked pool is UN-counted at release time (the serving
+      // pool owns it) — see the pool-forward path's countRequest(name,{forwarded:true}).
       accountManager.countRequest?.(req.callerName);
+      req._caller = req.callerName;
 
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
@@ -413,7 +522,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           requestInfo.queueBlockedReason = `request body ${body.length} bytes exceeds queue.maxQueuedBodyBytes ${maxQueuedBodyBytes}`;
         }
         requestInfo.profile = getMaxpoolProfile(req.headers);
+        // PIN (owner D8 per-account shape): a linked pool chose a specific account
+        // here. Honored only for an authenticated NAMED client — an anonymous/legacy
+        // caller can't steer routing. Applied by selection as an exclusive filter.
+        const pin = headerValue(req.headers, 'x-maxpool-pin-account');
+        if (pin && req.callerName && req.callerName !== 'legacy-key') requestInfo.pinAccount = String(pin);
+      else if (pin) {
+        // A pin from a legacy-key link is silently dropped — the local pool has
+        // already made mirror-specific decisions on it. Name the misconfiguration
+        // once instead (council review 2026-10-31: no warning fired anywhere).
+        console.error('[Maxpool] x-maxpool-pin-account dropped: the link authenticated with the remote\'s legacy apiKey — mint a named client key (proxy.clients) so pins and per-person attribution work');
+      }
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
+        requestInfo.caller = req._caller || null;
         // The CLIENT tells us how long it will wait — the only source that is actually
         // true. A `cc` session exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h and forwards it
         // here; a bare `claude` sends nothing and keeps the conservative 240s default,
@@ -601,7 +722,7 @@ async function forwardRequest(
   // anything and a 2-account fleet got exactly one repair, while the chain is now six
   // deep. Each repair latches its own flag, so this budget is a backstop, not the bound.
   const repairCount = requestInfo.repairCount || 0;
-  const canRepairBody = repairCount < 6 && !res.headersSent;
+  const canRepairBody = repairCount < 6 && !clientHasRealBytes(res, requestInfo);
 
   // PRE-STRIP a session already known to carry provider-authored thinking. The client
   // resends the whole poisoned history every turn, so without this each turn pays another
@@ -656,6 +777,16 @@ async function forwardRequest(
     );
     if (queued) return;
 
+    if (requestInfo.pinAccount != null) {
+      ctx.status = 503;
+      const busy = Boolean(requestInfo.pinRefusedBusy);
+      ctx.account = `(pinned ${requestInfo.pinAccount} ${busy ? 'busy' : 'unavailable'})`;
+      try { res.setHeader('retry-after', busy ? '2' : '30'); } catch { /* headers sent */ }
+      sendErrorResponse(res, requestInfo, 503, { type: 'error', error: {
+        type: busy ? 'pinned_account_busy' : 'pinned_account_unavailable',
+        message: `Account "${requestInfo.pinAccount}" is ${busy ? 'busy' : 'not available'} right now` } });
+      return;
+    }
     ctx.status = 429;
     ctx.account = '(none available)';
     const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
@@ -792,6 +923,140 @@ async function forwardRequest(
   } else if (account.authHeader === 'x-api-key' || !isOAuth) {
     headers['x-api-key'] = account.credential;
     delete headers['authorization'];
+  }
+
+  // POOL LINK (owner D8): this "account" is another maxpool. Forward the raw
+  // request to it with the person's key, a stepped hop header, and the client's
+  // session header preserved — the remote pool does its own account selection,
+  // so no body rewriting, no credential substitution.
+  if (account.remote) {
+    const hop = nextHopCount(headerValue(req.headers, HOP_HEADER));
+    if (hop == null) {
+      accountManager.releaseAccount(lease, { neutral: true });
+      ctx.status = 508;
+      sendErrorResponse(res, requestInfo, 508, { type: 'error', error: { type: 'request_loop', message: 'Maxpool hop limit reached — pools are forwarding in a circle.' } });
+      return;
+    }
+    const linkHeaders = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const lk = k.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lk) || lk === 'content-length' || lk === 'host' || lk === 'connection') continue;
+      // NEVER forward the client's provider credentials to a linked pool (live finding
+      // 2026-10-29: `cc all` sends x-maxpool-zai-token / x-maxpool-kimi-token and the
+      // cloud pool turned them into runtime accounts — a key the owner had disabled
+      // locally went live remotely). The remote pool owns its own accounts.
+      if (/^x-maxpool-(zai|kimi)-/.test(lk)) continue;
+      if (lk === 'x-maxpool-pin-account') continue;   // M4: only this pool sets a pin
+      linkHeaders[k] = v;
+    }
+    linkHeaders[HOP_HEADER] = String(hop);
+    // person's pool key: the link row holds it; a mirror row carries its link's key
+    linkHeaders['x-api-key'] = account.remote ? account.remote.key : account.credential;
+    delete linkHeaders.authorization;
+    if (account.remote) linkHeaders['x-maxpool-pin-account'] = account.remote.remoteName;
+    const linkBase = account.remote ? String(account.remote.url).replace(/\/+$/, '') : account.upstream;
+    const linkUrl = `${linkBase}${req.url}`;
+    ctx.account = account.name;
+    // The client-gone listener from the pre-response window would release the
+    // lease a SECOND time when the stream closes normally — remove just the
+    // listener (calling releaseOnClientGone would release the lease itself).
+    res.off('close', onClientClose);
+    let linkDone = false;
+    const finishLink = (outcome) => {
+      if (linkDone) return; linkDone = true;
+      accountManager.releaseAccount(lease, outcome);
+    };
+    try {
+      // P4a: a blackholed link must not hang the request (and hold a lease) for
+      // minutes — bound time-to-headers like the direct path's TTFB guard. GLM
+      // thinking turns regularly sit silent 20-60s before headers, so the link
+      // TTFB must match the direct path's UPSTREAM_TTFB_MS (120s default), not a
+      // flat 15s (owner report 2026-10-30: every pinned GLM turn 502-aborted).
+      const linkTtfbMs = Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
+      const linkCtl = new AbortController();
+      const linkTtfb = setTimeout(() => linkCtl.abort(), linkTtfbMs);
+      res.once('close', () => linkCtl.abort());
+      let upRes;
+      try {
+        upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half', signal: linkCtl.signal });
+      } finally { clearTimeout(linkTtfb); }
+      ctx.status = upRes.status;
+      // Pinned cloud account refused (rate-limited / unavailable) before any byte
+      // streamed: cool THIS mirror row and fail over through the normal path to the
+      // next-best account, local or cloud — exactly like a local account's 429.
+      if (account.remote && (upRes.status === 429 || upRes.status === 503) && !clientHasRealBytes(res, requestInfo)) {
+        try { await upRes.body?.cancel(); } catch { /* drained */ }
+        const ra = Number(upRes.headers.get('retry-after'));
+        // P3: "busy" is a 2s back-off on this row only; "unavailable"/429 cools longer.
+        account.cooldownUntil = Date.now() + (Number.isFinite(ra) && ra > 0 ? Math.min(ra, 300) * 1000 : 30_000);
+        finishLink({ status: upRes.status, error: 'remote_pinned_unavailable' });
+        excludedIndexes.add(account.index);
+        if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+        }
+        // Every route refused: that is capacity, so it waits here. The body was cancelled
+        // above, so falling through handed the client a 503 with no body.
+        const queued = await queueAndRetry(
+          `all routes failed after ${upRes.status} from "${account.name}"`,
+          req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
+        );
+        if (queued) return;
+        ctx.status = upRes.status;
+        sendErrorResponse(res, requestInfo, upRes.status, { type: 'error', error: { type: 'overloaded_error', message: `Team pool account "${account.name}" is at capacity` } });
+        return;
+      }
+      // A request released from the queue already holds a committed keep-alive stream.
+      if (requestInfo.queueHeartbeatActive) {
+        clearQueueHeartbeat(requestInfo);
+        if (upRes.status >= 400) {
+          const errorText = await readErrorBody(upRes);
+          sendErrorBody(res, requestInfo, upRes.status, errorText, upRes.headers);
+          finishLink({ success: upRes.status < 500, status: upRes.status });
+          return;
+        }
+      }
+      const outHeaders = {};
+      upRes.headers.forEach((v, k) => { if (!HOP_BY_HOP_HEADERS.has(k) && k !== 'content-length' && k !== 'transfer-encoding') outHeaders[k] = v; });
+      if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
+      if (upRes.body) {
+        const reader = upRes.body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (res.destroyed) { try { await reader.cancel(); } catch { } break; }
+            res.write(Buffer.from(value));
+          }
+        } finally { try { await reader.cancel(); } catch { /* already done */ } }
+      }
+      res.end();
+      finishLink({ success: ctx.status < 500, status: ctx.status });
+      // SC22 no-double-count: this request was counted at auth; the serving pool
+      // counted it too. Undo the local one.
+      if (req.callerName && ctx.status < 500) {
+        accountManager.callerCounts?.set(req.callerName, Math.max(0, (accountManager.callerCounts.get(req.callerName) || 1) - 1));
+        accountManager._unbumpCaller?.(req.callerName);
+      }
+      hooks.onRequestRouted?.(reqId, { account: account.name });
+    } catch (err) {
+      finishLink({ status: 502, error: 'pool_link_unreachable' });
+      excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
+      if (!clientHasRealBytes(res, requestInfo)) {
+        if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+        }
+        const queued = await queueAndRetry(
+          `all routes failed after a link error on "${account.name}"`,
+          req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'network',
+        );
+        if (queued) return;
+      }
+      ctx.status = 502;
+      sendErrorResponse(res, requestInfo, 502, { type: 'error', error: { type: 'api_error', message: `Team pool "${account.name}" unreachable: ${err?.message || err}` } });
+    }
+    return;
   }
 
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
@@ -1189,7 +1454,7 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" cooling down, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
       }
 
-      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
@@ -1310,7 +1575,13 @@ async function forwardRequest(
       const effortMode = classifyEffortRejection(errorBody);
       // A rejected effort level is a REQUEST-shaped fault, not an account-health signal —
       // release neutral so it never charges a consecutive-failure to a healthy account.
-      accountManager.releaseAccount(lease, effortMode
+      // Same for a thinking-signature rejection: the TRANSCRIPT carries another
+      // account's/provider's thinking, the Claude account itself is healthy, and the
+      // strip-and-retry below recovers the request. Charging it a failure cooled healthy
+      // accounts and filled the screen with red counts (2026-10-31: 26 such 400s across
+      // 14 sessions, every one recovered, while kira + max@gomokka.com showed 39/40 failed).
+      const neutral = Boolean(effortMode) || errorType === 'invalid_thinking_signature';
+      accountManager.releaseAccount(lease, neutral
         ? { status: upstreamRes.status, error: errorType, neutral: true }
         : { status: upstreamRes.status, error: errorType });
 
@@ -1320,7 +1591,7 @@ async function forwardRequest(
         writeRequestLog(logDir, reqId, logSections);
       }
       if (errorType === 'invalid_thinking_signature') {
-        console.log(`[alPool] Non-retryable Anthropic thinking signature error on "${account.name}"`);
+        console.log(`[alPool] Transcript carries another provider's thinking; stripping and retrying (account "${account.name}" is fine, not penalized)`);
         // Fail-safe: if this request had been MIGRATED to a different Claude account
         // this turn (cross-account thinking rebalance), the rejected block was issued
         // by the PRE-MIGRATION account. Revert the session there, exclude the failed
@@ -1340,7 +1611,7 @@ async function forwardRequest(
           : null;
         const issuerIsClaude = issuer && issuer.type !== 'provider';
         if (lease.migratedFromName && issuerIsClaude && requestInfo.sessionKey
-          && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+          && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
           accountManager.revertSessionBinding(requestInfo.sessionKey, lease.migratedFromName);
           excludedIndexes.add(account.index);
           console.log(`[alPool] Thinking-signature fail-safe: reverting session to issuer "${lease.migratedFromName}" and retrying`);
@@ -1355,7 +1626,7 @@ async function forwardRequest(
       // EFFORT REPAIR. A rejected output_config.effort is a hard failure of whatever the
       // client was doing (a web search, a tool call) — worth healing rather than surfacing.
       if (effortMode && !requestInfo.effortRepaired
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         const fix = repairEffort(body, effortMode, errorBody);
         if (fix.body) {
           // Latch it so LATER turns apply the working level up front: the client resends the
@@ -1497,7 +1768,7 @@ async function forwardRequest(
       // it when a provider can actually serve it (profile=all with a GLM/Kimi token).
       const providerAvailable = accountManager.accounts?.some(a => a.type === 'provider' && a.enabled !== false);
       if (anthropicIncompat && requestInfo.sessionKey && providerAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
         excludedIndexes.add(account.index);
         console.log(`[alPool] Anthropic rejected this transcript (server_tool_use/thinking); pinning session to GLM/Kimi and retrying`);
@@ -1518,7 +1789,7 @@ async function forwardRequest(
       // Claude account exists to serve it; with none, the 400 surfaces (nothing bigger).
       const claudeAvailable = accountManager.accounts?.some(a => a.type !== 'provider' && a.enabled !== false);
       if (providerTooSmall && requestInfo.sessionKey && claudeAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         accountManager.markSessionLargeContext?.(requestInfo.sessionKey);
         // Bench EVERY provider: today's GLM + Kimi coding legs both cap at ~256K, so once
         // one 400s on size the others can't hold it either. If a genuine 1M-context
@@ -1540,7 +1811,7 @@ async function forwardRequest(
       // latch the session — the fault is one request's shape, not a durable property of
       // the conversation, and latching would evict a session from GLM on a single blip.
       if (providerRejectedShape && claudeAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         for (const a of (accountManager.accounts || [])) {
           if (a.type === 'provider') excludedIndexes.add(a.index);
         }
@@ -1558,7 +1829,7 @@ async function forwardRequest(
       // Trigger on the DETERMINISTIC signature rejection only — never the fuzzy
       // isAnthropicIncompatBody heuristic, so an unrelated malformed request keeps its
       // own upstream error instead of being mislabelled a provider-contamination.
-      if (isSignatureRejection && !res.headersSent) {
+      if (isSignatureRejection && !clientHasRealBytes(res, requestInfo)) {
         const provs = (accountManager.accounts || []).filter(a => a.type === 'provider');
         // Say only what ACTUALLY happened. `thinkingStripped` is set only when the strip
         // ran; without it we found nothing provider-shaped, so claiming we stripped —
@@ -1838,7 +2109,7 @@ async function forwardRequest(
     }
 
     accountManager.releaseAccount(lease, { error: err.message });
-    if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+    if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
       account.status = 'error';
       excludedIndexes.add(account.index);
       return forwardRequest(
@@ -2748,6 +3019,13 @@ function sendErrorBody(res, requestInfo, status, body, headers) {
   res.end(body);
 }
 
+/** True once the client received REAL response bytes. The queue/grace keep-alive commits
+ *  headers plus pings, so res.headersSent is true while nothing is delivered yet: repairs
+ *  and failover stay safe until streamResponse stops the keep-alive. */
+function clientHasRealBytes(res, requestInfo) {
+  return res.headersSent && !requestInfo.queueHeartbeatActive;
+}
+
 async function queueAndRetry(
   reason, req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
   retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody = canRetryBufferedBody, cause = 'quota',
@@ -2769,6 +3047,10 @@ async function queueAndRetry(
   // a real outage doesn't spin. A non-streaming network failure (no keepalive) still
   // fails fast — it would die on the client's own timeout anyway.
   if (cause === 'proxy') return false;
+  // A PINNED request (a linked pool chose one specific account here) never holds:
+  // the caller owns failover across its whole pool, so answer fast and let it pick
+  // the next-best account instead of parking the request on one busy account.
+  if (requestInfo.pinAccount != null) return false;
   if (cause === 'network' && !canQueueBufferedBody) return false;
   // NETWORK SOAK, hard-bounded. A brief connectivity blip should not throw away a turn —
   // but an unbounded soak is worse than a fast error (it presents as a hang, which is the
@@ -3800,9 +4082,11 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
     if (!requestInfo.isCountTokens) {
       if (data.type === 'message_start' && data.message?.usage) {
         accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+        accountManager.countCallerTokens?.(requestInfo.caller, data.message.usage.input_tokens);
         requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.message.usage.input_tokens || 0);
       } else if (data.type === 'message_delta' && data.usage) {
         accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+        accountManager.countCallerTokens?.(requestInfo.caller, data.usage.output_tokens);
         requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, data.usage.output_tokens || 0);
       }
     }
@@ -3856,6 +4140,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo 
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.countCallerTokens?.(requestInfo.caller, (json.usage.input_tokens || 0) + (json.usage.output_tokens || 0));
       // CAPACITY LEDGER — M4: a /count_tokens response is a prompt-size echo with ZERO
       // work delivered. Claude Code calls it constantly; counting it would inflate every
       // cycle by whole prompt sizes.

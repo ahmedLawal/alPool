@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
-import { readFileSync, mkdtempSync, existsSync } from 'node:fs';
+import { readFileSync, mkdtempSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -202,6 +202,53 @@ gateTest('rc-gate: create POST arrives upstream COMPLETE (stream-abort regressio
     assert.deepEqual(JSON.parse(create.body.toString()), JSON.parse(body), 'body arrived byte-complete upstream');
   } finally {
     gate.kill(); await new Promise(r => ups.close(r));
+  }
+});
+
+gateTest('rc-gate: /v1/environments/* routes DIRECT (identity), not through the pool', async () => {
+  // The Remote Control MACHINE registration (bridge create / credential renew / work poll)
+  // renews on the saved claude.ai login; pool-routed renewal lands on the wrong account and
+  // the server rejects it ("could not renew this environment's credential", launchd hosts
+  // offline on the phone, 2026-10-31). Pin the classification both ways.
+  const directPath = { requests: [] };
+  const up = asTLS(http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      directPath.requests.push({ method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks) });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  }));
+  await new Promise(r => up.listen(0, r));
+  const mp = fakeMaxpool();
+  await new Promise(r => mp.server.listen(0, r));
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: String(mp.server.address().port),
+    RC_GATE_DIRECT_HOST: '127.0.0.1',
+    RC_GATE_DIRECT_PORT: String(up.address().port),
+    RC_GATE_PROFILE: 'all',
+  });
+  try {
+    // One request per CONNECT: httpOverTLS sends `connection: close`, so a second
+    // request on the same tunnel EPIPEs. Two tunnels = two independent requests.
+    const { tls: t } = await mitmConnect(gate.port);
+    const res = await httpOverTLS(t, 'POST', '/v1/environments/bridge', { 'content-type': 'application/json' }, '{}');
+    assert.match(res, /HTTP\/1\.1 200/);
+    assert.ok(directPath.requests.some(r2 => r2.url === '/v1/environments/bridge'),
+      'environment bridge call reached the DIRECT upstream');
+    const { tls: t2 } = await mitmConnect(gate.port);
+    const res2 = await httpOverTLS(t2, 'GET', '/v1/environments/env_01TEST/work/poll?timeout_ms=5000', { accept: 'application/json' }, '');
+    assert.match(res2, /HTTP\/1\.1 200/);
+    assert.ok(directPath.requests.some(r2 => r2.url.startsWith('/v1/environments/env_01TEST/work/poll')),
+      'environment work poll reached the DIRECT upstream');
+    assert.ok(!mp.state.requests.some(r2 => (r2.url || '').startsWith('/v1/environments')),
+      'environment calls must NOT reach the pool');
+  } finally {
+    gate.kill();
+    await new Promise(r => up.close(r));
+    await new Promise(r => mp.server.close(r));
   }
 });
 
@@ -725,5 +772,50 @@ gateTest('rc-gate: deadline timer is cleared when the body ends (unit-level pin)
   } finally {
     delete process.env.RC_GATE_DEBUG_DEADLINE;
     gate.kill('SIGKILL'); await new Promise(r => mp.server.close(r));
+  }
+});
+
+test('rc-gate live route switch: direct mode routes api.anthropic.com traffic past the pool, no restart (owner 2026-11-01)', async () => {
+  const src = readFileSync(new URL('../tools/rc-gate/rc-gate.js', import.meta.url), 'utf8');
+  assert.match(src, /function routeMode\(\)/, 'the switch exists');
+  assert.match(src, /const isIdentityPath = routeDirect \|\| !creq\.url\.startsWith\('\/v1\/'\)/,
+    'direct mode makes every /v1 path identity/direct — pool bypassed per request');
+  assert.match(src, /_routeCache = \{ at: now/, '1s cache so the gate re-reads the file without a restart');
+  const idx = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  assert.match(idx, /case 'route':/, 'maxpool route subcommand exists');
+});
+
+gateTest('rc-gate live route switch BEHAVIOR: file=direct bypasses the pool mid-flight, no gate restart (owner 2026-11-01)', async () => {
+  const switchFile = mkdtempSync(join(tmpdir(), 'rt-')) + '/route';
+  writeFileSync(switchFile, 'direct\n');
+  const poolHits = [];
+  const mp = http.createServer((q, r) => { poolHits.push(q.url); r.writeHead(200); r.end('{}'); });
+  await new Promise(r => mp.listen(0, '127.0.0.1', r));
+  const up = asTLS(http.createServer((q, r) => { r.writeHead(200, {'content-type':'application/json'}); r.end(JSON.stringify({ ok: true, via: 'direct' })); }));
+  await new Promise(r => up.listen(0, '127.0.0.1', r));
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_ROUTE_FILE: switchFile,
+    RC_GATE_MAXPOOL_PORT: String(mp.address().port),
+    RC_GATE_DIRECT_HOST: '127.0.0.1',
+    RC_GATE_DIRECT_PORT: String(up.address().port),
+    RC_GATE_PROFILE: 'all',
+  });
+  try {
+    const { tls: t } = await mitmConnect(gate.port);
+    const res = await httpOverTLS(t, 'POST', '/v1/messages', { 'content-type': 'application/json' }, '{}');
+    assert.match(res, /HTTP\/1\.1 200/);
+    assert.match(res, /"via":"direct"/, 'answered by the DIRECT upstream');
+    assert.equal(poolHits.length, 0, 'the pool saw nothing in direct mode');
+    // Flip LIVE (no gate restart) → next request goes to the pool.
+    writeFileSync(switchFile, 'pool\n');
+    await new Promise(r => setTimeout(r, 1300));   // past the 1s cache
+    const { tls: t2 } = await mitmConnect(gate.port);
+    const res2 = await httpOverTLS(t2, 'POST', '/v1/messages', { 'content-type': 'application/json' }, '{}');
+    assert.match(res2, /HTTP\/1\.1 200/);
+    assert.equal(poolHits.length, 1, 'after the flip, the pool serves the request');
+  } finally {
+    gate.kill();
+    mp.close(); up.close();
   }
 });

@@ -5,6 +5,7 @@ import alPoolCore
 private enum AppSection: String, CaseIterable, Identifiable {
     case overview = "Overview"
     case activity = "Activity"
+    case people = "People"
     case capacity = "Capacity"
     case accounts = "Accounts"
     case routing = "Routing"
@@ -15,6 +16,7 @@ private enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview: "gauge.with.dots.needle.67percent"
         case .activity: "waveform.path.ecg"
+        case .people: "person.3"
         case .capacity: "fuelpump"
         case .accounts: "person.2"
         case .routing: "arrow.triangle.branch"
@@ -41,6 +43,7 @@ struct ContentView: View {
                     switch selection ?? .overview {
                     case .overview: OverviewView(snapshot: snapshot)
                     case .activity: ActivityView(snapshot: snapshot)
+                    case .people: PeopleView(snapshot: snapshot)
                     case .capacity: CapacityView(snapshot: snapshot)
                     case .accounts: AccountsView(snapshot: snapshot)
                     case .routing: RoutingView(snapshot: snapshot)
@@ -219,7 +222,7 @@ private struct OverviewView: View {
     @AppStorage("overviewAccountDensity") private var densityValue = OverviewAccountDensity.detailed.rawValue
 
     private var enabledAccounts: [AccountStatus] {
-        snapshot.accounts.filter(\.enabled)
+        snapshot.accounts.filter(\.enabled).filter { $0.poolBenchedBy == nil }
     }
 
     private var density: OverviewAccountDensity {
@@ -229,7 +232,7 @@ private struct OverviewView: View {
     var body: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 16)], spacing: 16) {
-                MetricCard(title: "Accounts", value: "\(snapshot.accounts.filter(\.enabled).count) enabled", symbol: "person.2")
+                MetricCard(title: "Accounts", value: "\(snapshot.accounts.filter(\.enabled).filter { $0.poolBenchedBy == nil }.count) enabled", symbol: "person.2")
                 MetricCard(title: "In flight", value: "\(snapshot.scheduler.globalInFlight)", symbol: "waveform.path.ecg")
                 MetricCard(title: "Routing", value: routingLabel(snapshot.routing), symbol: "arrow.triangle.branch")
                 MetricCard(title: "Queued", value: "\(snapshot.upstreamThrottle?.queued ?? 0)", symbol: "clock.arrow.circlepath")
@@ -369,14 +372,14 @@ private enum CapacityWindow: String {
 
 private struct CapacityView: View {
     let snapshot: ControlSnapshot
-    @AppStorage("capacityWindow") private var windowValue = CapacityWindow.session.rawValue
+    @AppStorage("capacityWindow") private var windowValue = CapacityWindow.weekly.rawValue
 
     private var window: CapacityWindow {
-        CapacityWindow(rawValue: windowValue) ?? .session
+        CapacityWindow(rawValue: windowValue) ?? .weekly
     }
 
     private var enabledAccounts: [AccountStatus] {
-        snapshot.accounts.filter(\.enabled)
+        snapshot.accounts.filter(\.enabled).filter { $0.poolBenchedBy == nil }
     }
 
     var body: some View {
@@ -397,7 +400,7 @@ private struct CapacityView: View {
             }
 
             Section {
-                Text("Capacity is estimated in tokens from observed usage: tokens delivered divided by how full the provider reported the window. Completed windows become measured samples; low-confidence readings are withheld.")
+                Text("The $/1M metric compares monthly plan price against estimated weekly capacity. It is not a provider billing rate. Capacity is estimated in tokens from observed usage: tokens delivered divided by how full the provider reported the window. Completed windows become measured samples; low-confidence readings are withheld.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -420,7 +423,7 @@ private struct CapacityAccountRow: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 Text(account.name).font(.headline)
-                Text("· \(account.providerLabel)")
+                Text("· \(account.providerLabel) · \(account.locationLabel)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -431,6 +434,10 @@ private struct CapacityAccountRow: View {
                 }
             }
 
+            HStack(spacing: 28) {
+                CapacityMetric(label: "Estimated $/1M", value: account.pricePerMillionWeeklyTokens.map { String(format: "$%.2f", $0) } ?? "—")
+                CapacityMetric(label: "Plan / month", value: account.monthlyPriceUSD.map { String(format: "$%.2f", $0) } ?? "—")
+            }
             if hasCapacityData {
                 Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 6) {
                     GridRow {
@@ -501,11 +508,11 @@ private struct AccountsView: View {
     @State private var capTarget: AccountStatus?
 
     var body: some View {
-        List(snapshot.accounts) { account in
+        List(snapshot.accounts.filter { !($0.remote == true && !$0.enabled) }) { account in
             AccountCard(
                 account: account,
                 showsControls: true,
-                canSetCap: snapshot.control.capabilities.setAccountCap == true,
+                canSetCap: snapshot.control.capabilities.setAccountCap == true && account.canManageLocally,
                 capAction: { capTarget = account }
             ) {
                 Task {
@@ -516,9 +523,9 @@ private struct AccountsView: View {
                 }
             }
             .contextMenu {
-                Button("Rename") { renameTarget = account; renameValue = account.name }
+                Button("Rename") { renameTarget = account; renameValue = account.name }.disabled(!account.canManageLocally)
                 Button("Delete", role: .destructive) { deleteTarget = account }
-                    .disabled(account.runtime == true || account.inFlight > 0)
+                    .disabled(!account.canManageLocally || account.runtime == true || account.inFlight > 0)
             }
         }
         .navigationTitle("Accounts")
@@ -630,6 +637,7 @@ private struct RoutingView: View {
 
     var body: some View {
         Form {
+            ClientRouteSection(snapshot: snapshot)
             Section("Routing mode") {
                 ForEach(modes) { mode in
                     Button {
@@ -656,7 +664,7 @@ private struct RoutingView: View {
                     set: { value in Task { await model.send(.init(type: "set-preferred-account", payload: .init(name: value.isEmpty ? nil : value))) } }
                 )) {
                     Text("Automatic").tag("")
-                    ForEach(snapshot.accounts.filter { $0.type != "provider" && $0.enabled }) { account in
+                    ForEach(snapshot.accounts.filter { $0.type != "provider" && $0.enabled && $0.canManageLocally }) { account in
                         Text(account.name).tag(account.name)
                     }
                 }
@@ -674,7 +682,7 @@ private struct UpdatesView: View {
     var body: some View {
         Form {
             Section("Backend") {
-                LabeledContent("Running", value: snapshot.version?.current.map { "v\($0)" } ?? "Unknown")
+                LabeledContent("Running", value: (snapshot.runningVersion ?? snapshot.version?.current).map { "v\($0)" } ?? "Unknown")
                 LabeledContent("Fork revision", value: snapshot.version?.latest ?? "Unknown")
                 Toggle("Install and apply backend updates automatically", isOn: Binding(
                     get: { snapshot.control.automaticUpdates },
@@ -776,6 +784,8 @@ private struct AccountCard: View {
                     Text(account.name).font(.headline)
                     Text("·").foregroundStyle(.tertiary)
                     Text(account.providerLabel).font(.caption).foregroundStyle(.secondary)
+                    Label(account.locationLabel, systemImage: account.remote == true ? "cloud" : "desktopcomputer")
+                        .font(.caption2).foregroundStyle(.secondary)
                     if let visibleStatus {
                         Text("·").foregroundStyle(.tertiary)
                         Text(visibleStatus).font(.caption).foregroundStyle(.secondary)
@@ -797,6 +807,7 @@ private struct AccountCard: View {
                 }
                 if showsControls, let toggle {
                     Button(account.enabled ? "Disable" : "Enable", action: toggle)
+                        .disabled(!account.canManageLocally)
                 }
             }
             QuotaRow(label: "5 hour", value: account.quota.sessionUsage, reset: account.quota.sessionReset)
@@ -806,6 +817,7 @@ private struct AccountCard: View {
                 reset: account.quota.weeklyReset,
                 empty: account.quota.weeklyAbsent == true ? "No weekly limit" : "Waiting for quota"
             )
+            AccountInsights(account: account)
             if density == .detailed {
                 HStack {
                     Text("\(account.usage.totalRequests) requests")

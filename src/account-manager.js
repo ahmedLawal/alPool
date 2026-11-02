@@ -1,10 +1,13 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { computeDuplicates, credentialFp } from './pool-link.js';
+import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
 
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
 // local table so account-manager does not import a private constant).
 const WINDOW_MS_BY_KIND = { ses: 5 * 3600_000, wk: 7 * 86400_000 };
+const PROVIDER_SES_WALL = 1;  // provider 5h bench: serve to 100% (owner 2026-10-30); a usage cap still wins
 
 // A capacity window boundary must move by at least this much to count as a real
 // window ADVANCE rather than reset-stamp jitter (see noteCapacityWindowAdvance).
@@ -468,6 +471,18 @@ export class AccountManager {
     // Named-caller request attribution (team pools): callerName → requests served.
     // Server-side (not TUI-side) so headless pools feed the web screen too.
     this.callerCounts = new Map();
+    // Per-person usage analytics (owner 2026-10-29; red-team verdict: persisted
+    // buckets, requests AND tokens, never the rotating event log). caller -> {
+    //   hours: { 'YYYY-MM-DDTHH' UTC: {req, tok} } (rolling 48)
+    //   days:  { 'YYYY-MM-DD' UTC: {req, tok} }    (rolling 35)
+    //   total: {req, tok}
+    // }. A request ROUTED TO A LINKED POOL is not counted here (SC22: no double
+    // counting — the serving pool owns it), enforced by countRequest's caller.
+    this.callerStats = new Map();
+    // Team-pool links (owner D8): remote pools as accounts + duplicate benching.
+    this.poolLinks = [];
+    this._remoteIdentities = new Map();
+    this._benchedByPool = [];
     this.poolUpSince = Date.now();
     this.accounts = accounts.map((acct, index) => ({
       index,
@@ -815,7 +830,7 @@ export class AccountManager {
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
-    const upstreamThrottleProbe = account.type !== 'provider' && this._claimUpstreamThrottleProbe();
+    const upstreamThrottleProbe = account.type !== 'provider' && !account.remote && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
       // Same clock the selection above used, so the peak-failover guard can never
       // disagree with the peak tier that caused the move (defaults to real time).
@@ -845,9 +860,97 @@ export class AccountManager {
 
   // Named-caller attribution: one bump per CLIENT request (server calls this
   // right after auth, so retries/reroutes never double-count).
-  countRequest(callerName) {
-    if (!callerName) return;
+  countRequest(callerName, { forwarded = false } = {}) {
+    if (!callerName || forwarded) return;
     this.callerCounts.set(callerName, (this.callerCounts.get(callerName) || 0) + 1);
+    this._bumpCaller(callerName, 1, 0);
+  }
+
+  /** Attribute response TOKENS to the caller (SC22: tokens + requests). */
+  countCallerTokens(callerName, tokens) {
+    if (!callerName || !tokens) return;
+    this._bumpCaller(callerName, 0, tokens);
+  }
+
+  _bumpCaller(callerName, req, tok) {
+    const now = new Date();
+    const hourKey = now.toISOString().slice(0, 13);        // 'YYYY-MM-DDTHH' UTC
+    const dayKey = now.toISOString().slice(0, 10);         // 'YYYY-MM-DD' UTC
+    let st = this.callerStats.get(callerName);
+    if (!st) { st = { hours: {}, days: {}, total: { req: 0, tok: 0 } }; this.callerStats.set(callerName, st); }
+    for (const [bucket, key] of [[st.hours, hourKey], [st.days, dayKey]]) {
+      bucket[key] = bucket[key] || { req: 0, tok: 0 };
+      bucket[key].req += req; bucket[key].tok += tok;
+    }
+    st.total.req += req; st.total.tok += tok;
+    this._pruneCallerBuckets(st);
+  }
+
+  /** SC22: reverse one request bucket entry (a forwarded request re-counted at auth). */
+  _unbumpCaller(callerName) {
+    const st = this.callerStats.get(callerName);
+    if (!st) return;
+    const now = new Date();
+    for (const [k, src] of [[now.toISOString().slice(0, 13), st.hours], [now.toISOString().slice(0, 10), st.days]]) {
+      if (src[k]) { src[k].req = Math.max(0, src[k].req - 1); }
+    }
+    st.total.req = Math.max(0, st.total.req - 1);
+  }
+
+  _pruneCallerBuckets(st) {
+    const now = Date.now();
+    for (const k of Object.keys(st.hours)) if (now - Date.parse(k + ':00:00Z') > 48 * 3600_000) delete st.hours[k];
+    for (const k of Object.keys(st.days)) if (now - Date.parse(k + 'T00:00:00Z') > 35 * 24 * 3600_000) delete st.days[k];
+  }
+
+  /** Restore persisted caller stats (restart survival). */
+  restoreCallerStats(saved) {
+    if (!saved || typeof saved !== 'object') return;
+    for (const [name, st] of Object.entries(saved)) {
+      if (st && st.hours && st.days && st.total) {
+        this._pruneCallerBuckets(st);
+        this.callerStats.set(name, st);
+      }
+    }
+  }
+
+  exportCallerStats() {
+    return Object.fromEntries([...this.callerStats.entries()].map(([n, st]) => [n, {
+      hours: st.hours, days: st.days, total: st.total,
+    }]));
+  }
+
+  /** SC22 windows: rolling 24h (from hourly buckets), 7d/30d + prior (daily). */
+  callerWindowStats() {
+    const now = Date.now();
+    const out = new Map();
+    const win = (st, ms, hourly) => {
+      let req = 0, tok = 0;
+      const src = hourly ? st.hours : st.days;
+      for (const [k, v] of Object.entries(src)) {
+        const t = Date.parse(hourly ? k + ':00:00Z' : k + 'T00:00:00Z');
+        if (t <= now && now - t < ms) { req += v.req; tok += v.tok; }
+      }
+      return { req, tok };
+    };
+    const winPrior = (st, fromMs, toMs) => {
+      let req = 0, tok = 0;
+      for (const [k, v] of Object.entries(st.days)) {
+        const t = Date.parse(k + 'T00:00:00Z');
+        const age = now - t;
+        if (t <= now && age >= fromMs && age < toMs) { req += v.req; tok += v.tok; }
+      }
+      return { req, tok };
+    };
+    for (const [name, st] of this.callerStats) {
+      out.set(name, {
+        h24: win(st, 24 * 3600_000, true), h24p: winPrior(st, 24 * 3600_000, 48 * 3600_000),
+        d7: win(st, 7 * 24 * 3600_000, false), d7p: winPrior(st, 7 * 24 * 3600_000, 14 * 24 * 3600_000),
+        d30: win(st, 30 * 24 * 3600_000, false), d30p: winPrior(st, 30 * 24 * 3600_000, 60 * 24 * 3600_000),
+        total: { ...st.total },
+      });
+    }
+    return out;
   }
 
   releaseAccount(lease, outcome = {}) {
@@ -966,6 +1069,14 @@ export class AccountManager {
     // Subscription latched gone (org-disabled 403): benched until re-subscribed. The
     // clear path is a successful re-auth (updateAccountTokens) after re-purchasing.
     if (account.subscriptionGone) return false;
+    // Remote mirror: available while its link is live and the cloud row itself is
+    // usable (not needs-login, not error). Quota benches are handled by scoring /
+    // the caller's weekly gates, mirroring local accounts.
+    if (account.remote) {
+      const l = account.remote.link;
+      if (!l || l.lastError || l.lastOkAt == null) return false;
+      if (account.refreshDead || account.status === 'error') return false;
+    }
     const now = options.now ?? Date.now();
 
     // Check rate limit expiry
@@ -1030,7 +1141,7 @@ export class AccountManager {
   }
 
   getGlobalInFlight() {
-    return this.accounts.reduce((sum, account) => sum + account.inFlight, 0);
+    return this.accounts.filter(a => !a.remote).reduce((sum, account) => sum + account.inFlight, 0);
   }
 
   setAdmissionPaused(paused) {
@@ -1176,7 +1287,7 @@ export class AccountManager {
   _hasAvailableProvider(requestInfo = {}, excludedIndexes = new Set()) {
     const profile = requestInfo.profile || 'claude';
     return this.accounts.some(account => {
-      if (account.type !== 'provider' || excludedIndexes.has(account.index)) return false;
+      if ((account.type !== 'provider' && account.type !== 'pool') || excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
       return this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true });
     });
@@ -1266,10 +1377,27 @@ export class AccountManager {
     const ticket = requestInfo.queueTicket;
     if (!ticket) return true;
     this._reapStaleQueueHead();
-    if (this.queueState.waiting[0]?.id !== ticket.id) return false;
+    // BOUNDED HEAD-SKIP (council red-team #5, 2026-10-31): strict FIFO let an
+    // unserveable HEAD (claude-profile with every Claude weekly-walled) block a
+    // serveable follower (all-profile, healthy GLM) for the head's full window —
+    // up to 25 min of "pool dead" while capacity idled. A waiter that has already
+    // waited HEAD_SKIP_MS may be admitted even when tickets ahead of it exist.
+    // Fairness stays: the skip only fires after a real wait, and the head's own
+    // window (queueAndRetry's ceiling) still bounds IT.
+    const HEAD_SKIP_MS = 60_000;
+    if (this.queueState.waiting[0]?.id === ticket.id) {
+      // fast path: unchanged FIFO
+    } else {
+      const waited = Date.now() - (ticket.queuedAt ?? Date.now());
+      if (waited < HEAD_SKIP_MS) return false;
+    }
     const now = Date.now();
     if (now < this.queueState.rampUntil && now - this.queueState.lastAdmissionAt < 250) return false;
-    this.queueState.waiting.shift();
+    // Remove THIS ticket, not the head: with the head-skip above, the admitted ticket
+    // may not be waiting[0]. shift() here dropped the stuck head's ticket and left the
+    // admitted one queued (found 2026-10-31 re-reading the shipped change).
+    const pos = this.queueState.waiting.findIndex(t => t.id === ticket.id);
+    if (pos >= 0) this.queueState.waiting.splice(pos, 1);
     this.queueState.bytes = Math.max(0, this.queueState.bytes - (ticket.bytes || 0));
     this.queueState.lastAdmissionAt = now;
     requestInfo.queueTicket = null;
@@ -1449,7 +1577,8 @@ export class AccountManager {
    */
   _sessionBenchThreshold(account, now = Date.now()) {
     const cap = this._effectiveCap(account, 'ses', now);
-    return (cap != null && cap < this.switchThreshold) ? cap : this.switchThreshold;
+    const wall = account?.type === 'provider' ? PROVIDER_SES_WALL : this.switchThreshold;
+    return (cap != null && cap < wall) ? cap : wall;
   }
 
   /**
@@ -2349,14 +2478,37 @@ export class AccountManager {
 
   _matchesRequest(account, profile, requestInfo = {}) {
     if (this.admissionPaused) return false;
+    // A pinned request (from a linked pool) may ONLY run on the named account, and
+    // never on a mirror row (no chained forwarding between pools).
+    if (requestInfo.pinAccount != null) {
+      if (account.remote || account.name !== requestInfo.pinAccount) return false;
+      // P1: the pin bypasses this pool's balancer, so keep its anti-dogpile floor
+      // here — refuse past 2x the soft per-account target; the caller fails over.
+      if ((account.inFlight || 0) >= 2 * this.scheduler.perAccountConcurrencyTarget) {
+        requestInfo.pinRefusedBusy = true;
+        return false;
+      }
+      // P3: a pinned request isn't competing in this pool's queue — it skips the
+      // queue-fairness gate (that alone 503'd every pinned Claude request). The
+      // upstream throttle STAYS: it describes this pool's real egress to Anthropic.
+      if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
+      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
+      return true;
+    }
+    // Duplicate guard: a local account whose identity also lives in a team pool
+    // never serves — the cloud copy is the single writer.
+    if (account.poolBenchedBy) return false;
     if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
+    // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
+    // and local queue fairness don't describe them.
+    const providerLike = account.type === 'provider' || Boolean(account.remote);
     if (
-      account.type !== 'provider'
+      !providerLike
       && this.queueState.waiting.length
       && !requestInfo.queueTicket
       && !requestInfo.queueAdmitted
     ) return false;
-    if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
+    if (!providerLike && this._isUpstreamThrottleBlocking()) return false;
     return true;
   }
 
@@ -2391,7 +2543,7 @@ export class AccountManager {
     const incompatible = this._effectiveIncompatible(requestInfo).incompatible;
     // An incompatible session is pinned to its provider family — no mode overrides that.
     if (incompatible) {
-      const isHome = account.type === 'provider'
+      const isHome = (account.type === 'provider')
         && (mode === 'prefer-zai' ? account.provider === 'zai'
           : mode === 'prefer-kimi' ? account.provider === 'kimi' : true);
       return isHome ? 0 : base;
@@ -2609,6 +2761,18 @@ export class AccountManager {
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
     if (!this._matchesProfile(account, profile)) return false;
+    // A cloud mirror carries Anthropic-API traffic only (/v1/…). Browser noise
+    // (favicon, stray GETs) must never be forwarded — on the remote it finds no
+    // route, queues up to the hold window, and pins a link lease the whole time
+    // (live-rehearsal 2026-10-29: 4 favicon GETs showed as "4 running").
+    if (account.remote && !String(requestInfo.path || '').startsWith('/v1/')) return false;
+    // A cloud mirror carries Anthropic-API traffic only (/v1/…). Browser noise
+    // (favicon, stray GETs) must never be forwarded — on the remote it finds no
+    // route, queues up to the hold window, and pins a link lease the whole time
+    // (live-rehearsal 2026-10-29: 4 favicon GETs showed as "4 running"). This guard
+    // used to key on the aggregate type:'pool' row; mirrors (account.remote) are the
+    // only link rows now, so it moves to them.
+
 
     // Kimi (Moonshot) 400s on images Anthropic/GLM accept ("failed to decode
     // image") — and a provider 400 is TERMINAL (not retried to another account), so
@@ -2638,7 +2802,7 @@ export class AccountManager {
       // providerCrossFallback is explicitly off; by default GLM↔Kimi crossing stays
       // allowed even under 'never' (that reliable direction is governed separately
       // from the Claude→provider policy).
-      if (account.type !== 'provider') return false;
+      if (account.type !== 'provider' && account.type !== 'pool') return false;
       if (policy === 'never' && homeProvider && account.provider !== homeProvider
         && this.scheduler.providerCrossFallback === false) return false;
       return true;
@@ -2838,7 +3002,14 @@ export class AccountManager {
   _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
     const now = ctx?.now ?? Date.now();
     const reqWeight = Math.max(1, requestInfo.weight || 1);
-    const inflight = account.activeWeight + reqWeight;
+    // POOL LINK scores as the cloud's WORST-case load (owner 2026-10-29: "the team
+    // pool will respect the accounts within it... included in the balancing act").
+    // The link row's inFlight is mirrored from the remote status poll, so the
+    // concurrency term already treats one link request as N remote requests.
+    // A cloud mirror's depth includes OTHER teammates' live load on that same cloud
+    // account (mirrored from the link poll), so every routing term below — the
+    // unchanged balancing logic — sees it as busy as it really is.
+    const inflight = account.activeWeight + reqWeight + (account._remoteOtherLoad || 0);
     const refillMult = this._fastRefillMultiplier(account);
 
     // DOMINANT term: in-flight concurrency. Short-term throttling is driven by
@@ -3267,12 +3438,23 @@ export class AccountManager {
     if (account.type === 'provider') {
       const sesUsed = q.providerSes != null ? clamp01(q.providerSes) : null;
       const wkUsed = q.providerWk != null ? clamp01(q.providerWk) : null;
-      const used = Math.max(sesUsed ?? 0, wkUsed ?? 0);
+      // The WEEKLY ladder tiers on the weekly window ALONE when the plan HAS one
+      // (owner 2026-10-30: GLM serves to 100% of the session window; the old
+      // Math.max(ses, wk) demoted a 97%-session / 20%-weekly key to 'critical' —
+      // last-resort behind every Claude account with four-fifths of its weekly
+      // window empty — council review 2026-10-31). A weeklyAbsent plan (providerWk
+      // null: z.ai unlimited-weekly) keeps its historical ses-driven tiering — the
+      // session window is its ONLY quota signal. Session availability otherwise
+      // belongs to _isSessionQuotaUnavailable + PROVIDER_SES_WALL.
+      const used = wkUsed != null ? wkUsed : (sesUsed ?? 0);
       // USAGE CAP — checked FIRST, before every tier: a reservation is owner intent
       // and outranks both the tier ladder and the upstream verdict. There is no
       // upstreamAllows carve-out for providers anyway, but the ordering documents
-      // that a cap can never be talked out of by the vendor's "allowed".
-      if (this._capped(account, used, 'wk', now)) return 'capped';
+      // that a cap can never be talked out of by the vendor's "allowed". The cap
+      // reads the WORST window (max of ses/wk): a z.ai cap bounds total spend, and
+      // the 5h reading is real consumption against it.
+      const capUsed = Math.max(sesUsed ?? 0, wkUsed ?? 0);
+      if (this._capped(account, capUsed, 'wk', now)) return 'capped';
       if (used >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
       if (used >= this.scheduler.weeklyCriticalThreshold) return 'critical';
       if (used >= this.scheduler.weeklyReserveThreshold) return 'reserve';
@@ -3525,6 +3707,32 @@ export class AccountManager {
 
   /** Store the latest reset-card listing for an account (prober piggyback).
    *  Read by redeem policy AND by _scoreAccount's reset-aware preference. */
+  /** Monthly-normalized price for the Capacity page's $/1M column (display-only;
+   *  never touches routing). Claude accounts read config.scheduler.monthlyPriceUSD
+   *  (name → USD/mo; no per-account price API exists), providers get theirs from
+   *  the z.ai subscription API via the prober. */
+  applyMonthlyPrice(accountIndex, usd) {
+    const a = this.accounts[accountIndex];
+    if (a) a.monthlyPriceUSD = usd;
+  }
+
+  monthlyPriceFor(account) {
+    // A cloud mirror carries no credential, so this pool cannot read its subscription;
+    // the cloud pool reads it and exports it per row (remoteMonthlyPriceUSD).
+    if (account?.remote && account.remoteMonthlyPriceUSD != null) return account.remoteMonthlyPriceUSD;
+    if (account?.type === 'provider') return account.monthlyPriceUSD ?? null;
+    const tbl = this.scheduler?.monthlyPriceUSD;
+    if (tbl && typeof tbl === 'object') {
+      const hit = tbl[account?.name] ?? tbl['*'];
+      if (Number.isFinite(hit)) return hit;
+    }
+    // Owner 2026-10-31: "Claude monthly price is fixed, it's 200 dollars per month."
+    // Anthropic has no per-account price API, so this is the default for every Claude
+    // login; scheduler.monthlyPriceUSD (name or '*') overrides it.
+    if (account?.type === 'oauth') return 200;
+    return null;
+  }
+
   applyResetCards(accountIndex, cards) {
     const account = this.accounts[accountIndex];
     if (!account || !cards) return;
@@ -3787,6 +3995,19 @@ export class AccountManager {
   capacityTank(accountIndex, window) {
     const a = this.accounts[accountIndex];
     if (!a) return null;
+    // A cloud mirror's history lives in TWO ledgers: this pool's, under the account's
+    // pre-migration name (months of cycles measured locally before it moved), and the
+    // cloud pool's own, exported per row as remoteTank. Mirror rows are named
+    // "<name> ☁", which matched neither — so every cloud row read "--" (2026-10-31).
+    if (a.remote) {
+      // Prefer whichever ledger holds MORE cycles: the cloud pool only started
+      // measuring at migration (2026-10-29), so for weeks its 0-2 cycles would
+      // otherwise override months of history measured here.
+      const cloud = a.remoteTank?.[window] || null;
+      const local = this.capacity.tankStats(a.remote.remoteName || a.name, window);
+      const best = (cloud && local) ? ((cloud.n || 0) >= (local.n || 0) ? cloud : local) : (cloud || local);
+      return best ? { ...best, source: 'cycles' } : null;
+    }
     const measured = this.capacity.tankStats(a.name, window);
     if (measured) return { ...measured, source: 'cycles' };
     const est = this.capacityEstimate(accountIndex, window);
@@ -4114,6 +4335,7 @@ export class AccountManager {
       if (
         !account.enabled
         || account.type === 'provider'
+        || account.remote   // H4: cloud rows egress from the cloud, not this machine
         || !this._isRequestCompatible(account, requestInfo.profile || 'claude', requestInfo)
       ) {
         continue;
@@ -4167,6 +4389,10 @@ export class AccountManager {
     // read-only probing, and re-enabling refreshes on the next real request.
     // `force` still wins: an explicit re-auth/enable path may need the rotation.
     if (!force && account.enabled === false) return true;
+    // Duplicate guard: a benched local copy must NEVER spend its single-use
+    // refresh token — the cloud pool owns rotation now; a local rotation would
+    // invalidate the cloud's token (invalid_grant → bricked account).
+    if (account.poolBenchedBy) return true;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
@@ -4455,7 +4681,7 @@ export class AccountManager {
     // being iterated makes the loop skip the element after each removal — so
     // dropping 2 of 3 config providers left one phantom behind.
     for (const a of [...this.accounts]) {
-      if (a.configSourced && !wantedNames.has(a.name)) {
+      if (a.configSourced && !a.remote && !wantedNames.has(a.name)) {
         const idx = this.accounts.indexOf(a);
         if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);
       }
@@ -4559,7 +4785,7 @@ export class AccountManager {
    * by account identity so it can be matched back after a restart.
    */
   exportQuotaState() {
-    return this.accounts.map(a => {
+    return this.accounts.filter(a => !a.remote).map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
       const out = { accountUuid: a.accountUuid, name: a.name, quota };
@@ -4613,6 +4839,171 @@ export class AccountManager {
   /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
+  /** Register pool links (from config.pools). Each link polls its remote pool's
+   *  status; duplicate benching is re-computed on every poll tick. */
+  setPoolLinks(links, onPoll) {
+    for (const l of this.poolLinks) l.stop?.();
+    this.poolLinks = Array.isArray(links) ? links : [];
+    this._remoteIdentities = new Map();
+    const recompute = () => this.applyPoolLinks();
+    for (const l of this.poolLinks) l.start(() => { recompute(); onPoll?.(l); });
+    this.applyPoolLinks();
+  }
+
+  /** Boot-time single-writer guard: seed each link's persisted identity map
+   *  (state.json) so a boot during a link outage keeps local copies benched
+   *  until the first successful poll (red-team 2026-10-31). */
+  seedPoolLinks(saved, savedAt) {
+    if (!saved || typeof saved !== 'object') return;
+    for (const l of this.poolLinks) {
+      const byName = saved[l.name];
+      if (byName) l.seedPoolIdentities?.(byName, savedAt);
+    }
+    this.applyPoolLinks();
+  }
+
+  /** When these identities were last CONFIRMED by a good poll (a seed keeps its own
+   *  age, so the expiry in seedPoolIdentities can actually fire in a long outage). */
+  poolIdentitiesAt() {
+    const times = this.poolLinks.map(l => l.lastOkAt ?? l._seedAt ?? 0);
+    return times.length ? Math.max(...times) : null;
+  }
+
+  /** Per-link identity maps for state.json (keyed by link name). */
+  exportPoolIdentities() {
+    const out = {};
+    for (const l of this.poolLinks) {
+      const ids = l.exportPoolIdentities?.();
+      if (ids) out[l.name] = ids;
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
+  /** Apply duplicate benching + link health from the links' last polls. Idempotent. */
+  applyPoolLinks() {
+    const ids = new Map();
+    for (const l of this.poolLinks) {
+      if (l.identities) for (const [k, v] of l.identities) ids.set(k, v);
+    }
+    for (const l of this.poolLinks) this.syncRemoteMirrors(l);
+    const dups = computeDuplicates(this.accounts.filter(a => !a.remote), ids);
+    const benchedIdx = new Set(dups.map(d => d.index));
+    for (const a of this.accounts) {
+      const wasBenched = Boolean(a.poolBenchedBy);
+      const d = dups.find(x => x.index === a.index);
+      // Token-divergence alarm (red-team 2026-10-31): the cloud row for this
+      // identity is refreshDead while the local copy holds a healthy credential —
+      // both sides went dark in the boot-outage scenario. Name it loudly instead
+      // of silently benching the only working copy.
+      if (d) {
+        const remoteRow = (this.poolLinks || [])
+          .flatMap(l => (l.status?.accounts || []).filter(r => r.name === d.remoteName))[0];
+        if (remoteRow?.refreshDead && !a.refreshDead && a.refreshToken) {
+          // Once per episode: this runs on every 30s poll.
+          if (!a._divergenceLogged) {
+            a._divergenceLogged = true;
+            const msg = `[Maxpool] Token divergence: team pool's "${d.remoteName}" needs login while local "${a.name}" still has a stored token — log in again on that row, or the account stays unavailable on both sides`;
+            console.log(msg);
+            appendEventLog(msg);
+          }
+        } else {
+          a._divergenceLogged = false;
+        }
+      }
+      a.poolBenchedBy = d ? (d.remoteName || 'team pool') : null;
+      if (d && !wasBenched) {
+        console.log(`[Maxpool] Duplicate guard: local account "${a.name}" also lives in team pool (${a.poolBenchedBy}) — benched locally, no routing, no token refresh`);
+        appendEventLog(`[Maxpool] Duplicate guard benched "${a.name}" (also in team pool as ${a.poolBenchedBy})`);
+      } else if (!d && wasBenched) {
+        console.log(`[Maxpool] Duplicate guard released "${a.name}" (no longer in team pool)`);
+        appendEventLog(`[Maxpool] Duplicate guard released "${a.name}"`);
+      }
+    }
+    this._benchedByPool = [...benchedIdx];
+    this._remoteIdentities = ids;
+  }
+
+  /** The linked pool's LIVE row for a benched local account (by identity), or null.
+   *  The local copy's own quota/counters go stale the moment it's benched — the
+   *  display must read the cloud's numbers (owner 2026-10-29: "I don't know if I can
+   *  trust the session and weekly limits I'm seeing"). */
+  remoteRowFor(account) {
+    if (!account?.poolBenchedBy) return null;
+    for (const l of this.poolLinks) {
+      const row = (l.status?.accounts || []).find(ra => ra.name === account.poolBenchedBy);
+      if (row) return { row, linkOk: l.lastOkAt != null && !l.lastError, linkName: l.name };
+    }
+    return null;
+  }
+
+  /** MIRROR the linked pool's accounts as individual routable rows (owner
+   *  2026-10-29: "every cloud account listed the same way the local ones are ...
+   *  pulled together without any aggregation"). Each mirror row carries the remote's
+   *  live quota/status and NO credential — prober, token refresh, card redemption and
+   *  persistence all skip credential-less rows by construction. A request routed to a
+   *  mirror row is forwarded to its pool PINNED to that remote account. */
+  syncRemoteMirrors(link) {
+    if (!link) return;
+    const rows = link.lastError || link.lastOkAt == null ? [] : (link.status?.accounts || []);
+    const seen = new Set();
+    for (const ra of rows) {
+      if (ra.remote) continue;                 // never mirror a mirror (no chained hops)
+      if (ra.enabled === false) continue;      // benched on the cloud = not offered
+      const name = `${ra.name} ☁`;
+      seen.add(name);
+      let a = this.accounts.find(x => x.remote && x.name === name);
+      if (!a) {
+        this.addAccount({
+          name, type: ra.type === 'oauth' ? 'oauth' : (ra.type === 'provider' ? 'provider' : ra.type),
+          provider: ra.provider, profiles: ra.type === 'provider' ? ['all'] : ['claude', 'all'],
+          configSourced: true, runtime: false,
+        });
+        a = this.accounts[this.accounts.length - 1];
+      }
+      a.remote = { linkName: link.name, remoteName: ra.name, url: link.url, key: link.key, link };
+      a.credential = null; a.refreshToken = null;
+      // M2: keep the cloud's uuid OFF accountUuid so uuid-first matchers (config
+      // persistence, re-auth, disk sync) can never resolve to a mirror row.
+      a.accountUuid = null;
+      a.remoteUuid = ra.accountUuid || null;
+      a.provider = ra.provider || a.provider;
+      a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
+      a.status = ra.status || 'active';
+      a.refreshDead = Boolean(ra.refreshDead);
+      a.lastError = ra.lastError || null;
+      a.rateLimitedUntil = ra.rateLimitedUntil ? Date.parse(ra.rateLimitedUntil) : null;
+      a.capUtilization = ra.capUtilization ?? null;
+      a.capMode = ra.capMode ?? a.capMode;
+      a.capCeiling = ra.capCeiling ?? a.capCeiling;
+      a.capRampStart = ra.capRampStart ?? a.capRampStart;
+      a.addedAt = null;                        // H3: mirrors never count as "warming"
+      a.resetCards = ra.resetCards || null;
+      a.resetGrants = ra.resetGrants || null;
+      a.remoteMonthlyPriceUSD = Number.isFinite(ra.monthlyPriceUSD) ? ra.monthlyPriceUSD : null;
+      a.remoteTank = ra.tank || null;
+      // Other teammates' live load on this cloud account (remote inFlight minus our
+      // own leases) — so the balancer sees the account as busy as it really is.
+      a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
+      a._remoteLoad = ra.load || null;
+      a.probing = false;
+      a.enabled = true;
+    }
+    // A cloud account that left the cloud (or a down link): drop the mirror so
+    // routing never targets it. Rows with in-flight leases drain first.
+    // Never REMOVE at runtime (red-team P5): removal reindexes every account while
+    // refreshes/exclusions hold numeric indexes. A gone or unreachable cloud account
+    // is disabled in place (out of routing, hidden from the list) and revived when
+    // it reappears.
+    for (const a of this.accounts) {
+      if (a.remote && a.remote.linkName === link.name && !seen.has(a.name)) a.enabled = false;
+    }
+  }
+
+  /** True when account is benched by the duplicate guard. */
+  isPoolBenched(account) {
+    return Boolean(account && account.poolBenchedBy);
+  }
+
   getStatus() {
     const now = Date.now();
     return {
@@ -4638,6 +5029,27 @@ export class AccountManager {
         type: a.type,
         provider: a.provider,
         enabled: a.enabled,
+        poolBenchedBy: a.poolBenchedBy || null,
+        remote: Boolean(a.remote),
+        // Reset cards / grants (display + cross-pool routing preference). Card ids,
+        // counts and expiry only — no credentials; the redeem stays with the holder.
+        resetCards: a.resetCards ? { fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly, checkedAt: a.resetCards.checkedAt } : null,
+        resetGrants: a.resetGrants ? { grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil, checkedAt: a.resetGrants.checkedAt } : null,
+        // Capacity-page inputs for linked pools (a mirror has no credential and no
+        // local cycles): this pool's plan price and measured tanks, per window.
+        monthlyPriceUSD: a.remote ? null : this.monthlyPriceFor(a),
+        tank: a.remote ? null : (() => {
+          const pick = w => { const t = this.capacity?.tankStats(a.name, w);
+            return t ? { avg: t.avg, n: t.n, prev: t.prev, last: t.last, lowerBound: t.lowerBound } : null; };
+          const ses = pick('ses'), wk = pick('wk');
+          return ses || wk ? { ses, wk } : null;
+        })(),
+        // Identity for duplicate matching by linked pools (D12). The Claude account
+        // UUID is an identifier, not a credential; provider keys export only a
+        // fingerprint. Without these a linked pool can't see a duplicate Claude login
+        // (live-rehearsal 2026-10-29: status omitted accountUuid → no bench).
+        accountUuid: a.type === 'oauth' ? (a.accountUuid || null) : null,
+        keyFingerprint: (a.type === 'provider' && a.credential) ? credentialFp(a.credential) : null,
         upstream: a.upstream,
         profiles: a.profiles,
         priority: a.priority,
@@ -4730,6 +5142,33 @@ export class AccountManager {
           : 0,
       },
       callers: Object.fromEntries([...this.callerCounts.entries()].map(([n, c]) => [n, { requests: c }])),
+      // SC22: per-person analytics for linked pools (day buckets + windows + tokens).
+      callerStats: Object.fromEntries([...this.callerStats.entries()].map(([n, st]) => [n, {
+        days: st.days, total: { ...st.total },
+      }])),
+      callerWindows: Object.fromEntries([...this.callerWindowStats().entries()].map(([n, w]) => [n, w])),
+      pools: this.poolLinks.map(l => ({
+        name: l.name,
+        url: l.url,
+        ok: l.lastOkAt != null && !l.lastError,
+        lastError: l.lastError,
+        lastOkAt: l.lastOkAt ? new Date(l.lastOkAt).toISOString() : null,
+        summary: l.summary,
+        accounts: (l.status?.accounts || []).map(ra => ({
+          name: ra.name,
+          type: ra.type,
+          provider: ra.provider,
+          enabled: ra.enabled,
+          refreshDead: Boolean(ra.refreshDead),
+          quota: ra.quota || null,
+          status: ra.status || null,
+          inFlight: ra.inFlight || 0,
+          completedRequests: ra.completedRequests || 0,
+          failedRequests: ra.failedRequests || 0,
+          lastError: ra.lastError || null,
+          load: ra.load || null,
+        })),
+      })),
       sessions: {
         stickyBindings: this.sessionBindings.size,
         thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,

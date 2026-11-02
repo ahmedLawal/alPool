@@ -42,6 +42,7 @@ import { CapacityLedger } from './capacity-ledger.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
+import { ClientRoute } from './client-route.js';
 import { ControlError, ControlService } from './control-service.js';
 import { readUpstreamSyncStatus } from './upstream-sync-status.js';
 import { ActivityFeed } from './activity-feed.js';
@@ -138,6 +139,10 @@ switch (command) {
     break;
   case 'pool':
     await poolCommand();
+    process.exit(0);
+    break;
+  case 'route':
+    await routeCommand();
     process.exit(0);
     break;
   case 'status':
@@ -658,6 +663,7 @@ async function serverWorkerCommand() {
   // self-healing window as an abrupt SIGKILL. A cold restart reads the clean-shutdown
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
+  if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -687,6 +693,40 @@ async function serverWorkerCommand() {
       }
     } catch (err) {
       console.error(`[alPool] Config provider resolution failed: ${err.message}`);
+    }
+  }
+
+  // ── team-pool links (owner D8): each remote pool becomes ONE routable account ──
+  // config.pools: [{ name, url, keySecret? | key? }]. The person's pool key is
+  // resolved from GCP Secret Manager when keySecret is set (never written to disk),
+  // or taken literally from `key`. The link polls the remote status; duplicates of
+  // local accounts are auto-benched (single writer per login/key).
+  if (Array.isArray(config.pools) && config.pools.length > 0) {
+    try {
+      const { PoolLink } = await import('./pool-link.js');
+      const defs = config.pools.filter(p => p && p.name && p.url);
+      const secretNames = defs.map(p => p.keySecret).filter(Boolean);
+      let resolved = {};
+      if (secretNames.length) {
+        const { resolveSecrets } = await import('./secret-resolver.js');
+        resolved = await resolveSecrets(secretNames);
+      }
+      const links = defs.map(p => new PoolLink({
+        ...p,
+        key: p.keySecret ? (resolved[p.keySecret] || null) : (p.key || null),
+      }));
+      // Owner 2026-10-29: no single "team" account — each cloud account is mirrored
+      // as its own row (syncRemoteMirrors on every link poll) and balanced with the
+      // local accounts by the unchanged routing logic.
+      accountManager.setPoolLinks(links);
+      // Boot-time single-writer guard: seed from the last persisted run in the SAME
+      // tick as setPoolLinks, before the first poll or probe can run. Links must exist
+      // first (a seed above this point looped over an empty list and did nothing).
+      accountManager.seedPoolLinks(savedState?.poolIdentities, savedState?.poolIdentitiesAt);
+      const armed = links.filter(l => l.key).length;
+      console.log(`[Maxpool] Team pools: ${armed} linked${links.length - armed ? `, ${links.length - armed} unresolved key` : ''}`);
+    } catch (err) {
+      console.error(`[Maxpool] Team pool link setup failed: ${err.message}`);
     }
   }
 
@@ -724,6 +764,13 @@ async function serverWorkerCommand() {
         // OPEN cycle must persist or a mid-cycle restart records a near-empty cycle as
         // a real capacity observation and poisons the averages forever (B1).
         capacity: accountManager.capacity?.serialize?.() || null,
+        // SC22 per-person analytics — same generation-guarded payload, survives
+        // restarts and seamless reloads.
+        callerStats: accountManager.exportCallerStats?.() || {},
+        // Last-good remote identity maps — the boot-time single-writer guard reads
+        // these (see restore above). Rides the same generation-guarded payload.
+        poolIdentities: accountManager.exportPoolIdentities?.() || null,
+        poolIdentitiesAt: accountManager.poolIdentitiesAt?.() ?? null,
       },
       { expectedGeneration },
     )
@@ -1246,6 +1293,7 @@ async function serverWorkerCommand() {
     return syncAccountsFromDisk(diskConfig, config, accountManager);
   };
 
+  const clientRoute = new ClientRoute();
   const controlService = new ControlService({
     accountManager,
     config,
@@ -1254,6 +1302,8 @@ async function serverWorkerCommand() {
     checkForUpdates: () => checkForUpdatesNow(),
     getUpstreamSyncStatus: () => readUpstreamSyncStatus(),
     getActivity: () => activityFeed.snapshot(),
+    getClientRouting: () => clientRoute.snapshot(),
+    setClientRoute: mode => clientRoute.set(mode),
     requestRestart: () => restartController.requestRestart(),
     requestStop: () => shutdownGracefully('app', { cleanExit: true }),
     log: message => (tui?._addLog ? tui._addLog(message) : console.log(`[alPool] ${message}`)),
@@ -1754,6 +1804,39 @@ async function envCommand() {
 }
 
 // ── pool (client-side switch between local and shared pool) ─
+
+/** `maxpool route [pool|direct|status]` — flip rc-gate routing LIVE (owner
+ *  2026-11-01: "if there is a way to make the routing switch without having to
+ *  restart the app, that would be amazing"). The gate re-reads the switch file
+ *  per request (1s cache), so already-running Claude Code sessions change route
+ *  instantly — no restart of anything. status shows what Claude Code routes
+ *  through RIGHT NOW. */
+async function routeCommand() {
+  const { homedir } = await import('node:os');
+  const { writeFile, readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const file = join(homedir(), '.config', 'rc-gate-route');
+  const arg = process.argv[3] || 'status';
+  const readIt = async () => { try { return (await readFile(file, 'utf8')).trim() || 'pool'; } catch { return 'pool'; } };
+  if (arg === 'pool' || arg === 'direct') {
+    await writeFile(file, arg + '\n', { mode: 0o600 }).catch(async () => {
+      const { mkdir } = await import('node:fs/promises');
+      await mkdir(join(homedir(), '.config'), { recursive: true });
+      await writeFile(file, arg + '\n', { mode: 0o600 });
+    });
+    console.log(`Routing: ${arg === 'pool' ? 'through maxpool (all accounts, cloud + local)' : 'direct to Anthropic (pool bypassed)'} — takes effect on the next request, no restart needed`);
+    return;
+  }
+  // status
+  const mode = await readIt();
+  const gateUp = await (async () => { try { await fetch('http://127.0.0.1:3457/', { signal: AbortSignal.timeout(1000) }).catch(() => {}); return true; } catch { return false; } })();
+  console.log('Claude Code routes through: ' + (gateUp
+    ? (mode === 'direct'
+      ? 'rc-gate → DIRECT to Anthropic (pool bypassed)'
+      : 'rc-gate → maxpool (local :3456, cloud accounts via the team tunnel)')
+    : 'no rc-gate on :3457 — sessions use whatever ANTHROPIC_BASE_URL they started with'));
+  console.log(`Switch file: ${file} = ${mode}`);
+}
 
 async function poolCommand() {
   const sub = args[1];

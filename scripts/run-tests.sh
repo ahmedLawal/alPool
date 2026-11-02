@@ -9,11 +9,18 @@
 # subprocess-heavy reload file runs in its OWN node process — process exit frees
 # those resources between files.
 set -euo pipefail
+shopt -s nullglob
 cd "$(dirname "$0")/.."
 
 # Tests spawn real supervisor+worker subprocesses; on macOS the sleep-guard would
 # spawn `caffeinate` children (harmless — they die with their worker via -w — but
 # noisy and would keep the dev box awake during the run). Disable it for the suite.
+# Suite-wide isolation pin (red-team 2026-10-31): per-file opt-in let any NEW test
+# that touches a disk-persisting path resolve the REAL ~/.config config and mutate
+# the live pool (the 3f927d7 incident). Tests needing a specific config still
+# override per-file/per-child — those wins over the ambient default.
+_MAXPOOL_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/maxpool-tests.XXXXXX")"
+export MAXPOOL_CONFIG="$_MAXPOOL_TEST_DIR/config.json"
 export MAXPOOL_DISABLE_SLEEP_GUARD=1
 # Quota probing is on by default in real installs, but a startup probe would fire a
 # token refresh / hit stubs and race the reload+refresh rotation-count assertions.
@@ -28,7 +35,7 @@ if [ -f "$_mkcert_root" ]; then export NODE_EXTRA_CA_CERTS="$_mkcert_root"; fi
 
 # Fast, in-process tests (everything except the subprocess-spawning reload files).
 fast=()
-for f in test/*.test.js; do
+for f in test/*.test.js test/*.test.mjs; do
   case "$f" in
     *reload-*) ;;            # handled per-file below
     *) fast+=("$f") ;;

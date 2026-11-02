@@ -9,6 +9,7 @@
 
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
+import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
 import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
 import { decideZai, decideClaude } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
@@ -103,7 +104,8 @@ export class Prober {
         // Skip only auth-dead accounts (dead refresh token): probing them just re-POSTs
         // the rejected token every cycle — a 400 storm. They recover only on re-auth.
         const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead);
-        const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);
+        // Pool links are probed by their own PoolLink status poll, not here.
+        const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);  // 'pool' rows are excluded by type
 
         // Providers read DISTINCT hosts (z.ai monitor / Kimi) — no collision — so
         // they run concurrently. Every OAuth account, though, reads the SAME
@@ -201,7 +203,19 @@ export class Prober {
       // OWNER GATE (2026-09-30): disabled accounts are excluded from listing AND
       // redemption entirely — a readable key on a disabled account (someone else
       // uses it) is not authority to act.
-      if (account.enabled !== false && account.credential) {
+      // A duplicate-guard-benched copy never redeems: the team pool owns that key now,
+      // and two pools redeeming one key would burn two cards for one reset.
+      if (account.enabled !== false && account.credential && !account.poolBenchedBy) {
+        // Subscription (price-per-token column): same cadence, same key, best-effort.
+        if (account.provider === 'zai' && this.am.applyMonthlyPrice) {
+          try {
+            if (!account._subsCheckedAt || Date.now() - account._subsCheckedAt > 24 * 3600_000) {
+              const subs = await this._withTimeout(listSubscriptions(account.credential));
+              account._subsCheckedAt = Date.now();
+              if (subs && !subs.error) this.am.applyMonthlyPrice(account.index, monthlyPriceUSD(subs.subscriptions));
+            }
+          } catch { /* price is display-only */ }
+        }
         if (account.provider === 'zai' && this.am.applyResetCards) {
           try {
             const cards = await this._withTimeout(this.cardsFn(account.credential));
@@ -225,7 +239,8 @@ export class Prober {
    *  else legitimately using the key is WHY the account is benched. */
   async _checkOutsideUsage(account, now = this._now()) {
     try {
-      if (account.provider !== 'zai' || !account.credential || account.enabled === false) return;
+      // Benched duplicate: the team pool's traffic on this key is NOT outside usage.
+      if (account.provider !== 'zai' || !account.credential || account.enabled === false || account.poolBenchedBy) return;
       const last = account._outsideCheckedAt || 0;
       if (now - last < OUTSIDE_CHECK_MS) return;
       const data = await this._withTimeout(this.zaiUsageFn(account.credential, { now }));
@@ -329,7 +344,9 @@ export class Prober {
       // Claude banked resets (cedar_ember) piggyback on the oauth poll — same
       // OWNER GATE as z.ai cards: a DISABLED account is never listed or claimed.
       try {
-        if (account.enabled !== false && account.credential && this.am.applyResetGrants) {
+        // A pool-benched duplicate never claims a grant: the cloud owns this account
+        // (mirror of the z.ai card guard above; red-team 2026-10-31).
+        if (account.enabled !== false && account.credential && !account.poolBenchedBy && this.am.applyResetGrants) {
           const listing = await this._withTimeout(this.grantsFn(account.credential));
           if (listing) {
             this.am.applyResetGrants(account.index, listing);

@@ -84,6 +84,17 @@ hides request and token totals while retaining both quota windows; the selected
 view is remembered across launches. Accounts serving live requests receive a
 green outline and serving badge.
 
+The native app also shows Local/Cloud account badges, weekly reset-card counts and
+expiry dates, and outside-usage warnings. Cloud mirrors and guarded local copies
+are read-only; manage them on their owning pool. The People page shows 24-hour,
+7-day, and 30-day caller usage separately for each pool. Capacity opens on the
+weekly view and includes the same estimated $/1M comparison as upstream (plan
+price divided by a weekly token tank, not an API billing rate).
+
+Routing exposes the live pool/direct switch when rc-gate is reachable. It affects
+only rc-gate sessions; clients using `ANTHROPIC_BASE_URL` directly stay on the proxy.
+Direct mode needs valid Anthropic credentials and asks for confirmation in the app.
+
 The Notifications page controls native quota alerts. alPool notifies once when
 an enabled account crosses 60%, 85%, or 100% usage and again when a five-hour or
 weekly quota window resets. The first snapshot establishes a baseline, and that
@@ -92,6 +103,7 @@ Closing the app window keeps notifications active; quitting alPool stops them.
 
 ```bash
 npm run macos:test
+npm run macos:check-insights  # model checks that also work without XCTest
 npm run macos:build
 open dist/alPool.app
 ```

@@ -1,6 +1,6 @@
 {
   "name": "alpool",
-  "version": "1.24.38",
+  "version": "1.24.65",
   "description": "alPool multi-account Claude Code proxy with adaptive, rate-aware load balancing",
   "type": "module",
   "main": "src/index.js",
@@ -21,7 +21,8 @@
     "macos:build": "bash scripts/build-macos-app.sh",
     "macos:install-backend": "bash scripts/install-backend-agent.sh",
     "release": "bash scripts/release.sh",
-    "version": "bash scripts/update-changelog.sh"
+    "version": "bash scripts/update-changelog.sh",
+    "macos:check-insights": "bash scripts/test-macos-insights.sh"
   },
   "keywords": [
     "claude",

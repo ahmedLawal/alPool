@@ -113,3 +113,40 @@ test('account cap command persists configured accounts and updates runtime state
     error => error instanceof ControlError && error.code === 'invalid_command',
   );
 });
+
+test('native snapshot exposes effective cloud capacity and caller analytics without link credentials', () => {
+  const { service, am } = fixture();
+  am.accounts.push({ name: 'GLM cloud', index: 2, remote: { key: 'private-link-key' } });
+  am.getStatus = () => ({ accounts: [{ name: 'GLM cloud', remote: true }], pools: [{ name: 'Team', ok: true }] });
+  am.monthlyPriceFor = () => 15;
+  am.capacityTank = () => ({ avg: 8_000_000, last: 7_000_000, n: 3 });
+  am.poolLinks = [{ name: 'Team', key: 'private-link-key', status: { callerWindows: { Alex: { d7: { req: 12, tok: 2400 } } } } }];
+  const s = service.snapshot();
+  assert.equal(s.accounts[0].monthlyPriceUSD, 15);
+  assert.equal(s.accounts[0].capacity.weekly.current, 8_000_000);
+  assert.equal(s.pools[0].callerWindows.Alex.d7.req, 12);
+  assert.ok(!JSON.stringify(s).includes('private-link-key'));
+});
+
+test('native live-route command validates mode and reports gate failures', async () => {
+  const { service } = fixture();
+  let mode;
+  service.getClientRouting = () => ({ mode: 'pool', gateAvailable: true });
+  service.setClientRoute = async value => { mode = value; };
+  assert.equal(service.snapshot().control.capabilities.setClientRoute, true);
+  await service.execute({ type: 'set-client-route', payload: { mode: 'pool' } });
+  assert.equal(mode, 'pool');
+  await assert.rejects(service.execute({ type: 'set-client-route', payload: { mode: 'other' } }), /Choose pool or direct/);
+  service.setClientRoute = async () => { throw new Error('Gate unavailable'); };
+  await assert.rejects(service.execute({ type: 'set-client-route', payload: { mode: 'direct' } }), error => error.status === 503);
+});
+
+test('native controls cannot mutate a cloud mirror or its guarded local copy', async () => {
+  const { service, am } = fixture();
+  am.accounts[0].remote = { linkName: 'Team' };
+  await assert.rejects(service.execute({ type: 'set-account-enabled', payload: { name: 'claude', enabled: false } }), error => error.code === 'cloud_managed');
+  delete am.accounts[0].remote;
+  am.accounts[0].poolBenchedBy = 'cloud Claude';
+  await assert.rejects(service.execute({ type: 'delete-account', payload: { name: 'claude' } }), error => error.code === 'cloud_managed');
+  assert.equal(am.accounts[0].enabled, true);
+});

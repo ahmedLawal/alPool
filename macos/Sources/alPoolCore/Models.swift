@@ -11,6 +11,10 @@ public struct BackendConnection: Codable, Sendable {
 }
 
 public struct ControlSnapshot: Decodable, Sendable {
+    public let runningVersion: String?
+    public let clientRouting: ClientRoutingInfo?
+    public let callerWindows: [String: PersonWindows]?
+    public let pools: [PoolInfo]?
     public let version: VersionInfo?
     public let upstreamSync: UpstreamSyncInfo?
     public let activity: ActivityInfo?
@@ -106,6 +110,7 @@ public struct ControlInfo: Decodable, Sendable {
 }
 
 public struct Capabilities: Decodable, Sendable {
+    public let setClientRoute: Bool?
     public let setRoutingMode: Bool
     public let preferAccount: Bool
     public let manageAccounts: Bool
@@ -118,6 +123,11 @@ public struct Capabilities: Decodable, Sendable {
 }
 
 public struct AccountStatus: Decodable, Identifiable, Sendable {
+    public let remote: Bool?
+    public let poolBenchedBy: String?
+    public let resetCards: ResetCardsInfo?
+    public let outsideUsage: OutsideUsageInfo?
+    public let monthlyPriceUSD: Double?
     public var id: String { name }
     public let name: String
     public let type: String
@@ -149,6 +159,7 @@ public struct AccountStatus: Decodable, Identifiable, Sendable {
     }
 
     public var displayStatus: String {
+        if poolBenchedBy != nil { return "Served in cloud" }
         if !enabled { return "Disabled" }
         if refreshDead { return "Needs login" }
         return status.capitalized
