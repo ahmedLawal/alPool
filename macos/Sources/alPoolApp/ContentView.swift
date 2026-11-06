@@ -220,10 +220,22 @@ private enum OverviewAccountDensity: String {
 private struct OverviewView: View {
     let snapshot: ControlSnapshot
     @AppStorage("overviewAccountDensity") private var densityValue = OverviewAccountDensity.detailed.rawValue
+    @AppStorage("overviewHideMaxed") private var hideMaxed = false
 
     private var enabledAccounts: [AccountStatus] {
         snapshot.accounts.filter(\.enabled).filter { $0.poolBenchedBy == nil }
     }
+
+    private var visibleAccounts: [AccountStatus] {
+        guard hideMaxed else { return enabledAccounts }
+        return enabledAccounts.filter { account in
+            // Unknown quota (nil) never hides an account — only a reading that
+            // has actually reached the limit does. Fractions can exceed 1.0.
+            (account.quota.sessionUsage ?? 0) < 0.999 && (account.quota.weeklyUsage ?? 0) < 0.999
+        }
+    }
+
+    private var hiddenCount: Int { enabledAccounts.count - visibleAccounts.count }
 
     private var density: OverviewAccountDensity {
         OverviewAccountDensity(rawValue: densityValue) ?? .detailed
@@ -243,6 +255,9 @@ private struct OverviewView: View {
                 HStack(spacing: 16) {
                     Text("Accounts").font(.title2.bold())
                     Spacer()
+                    Toggle("Hide maxed", isOn: $hideMaxed)
+                        .controlSize(.small)
+                        .fixedSize()
                     Picker("Account detail", selection: $densityValue) {
                         Text("Compact").tag(OverviewAccountDensity.compact.rawValue)
                         Text("Detailed").tag(OverviewAccountDensity.detailed.rawValue)
@@ -252,8 +267,15 @@ private struct OverviewView: View {
                     .frame(width: 180)
                     SafetyLegend()
                 }
-                ForEach(enabledAccounts) { account in
+                ForEach(visibleAccounts) { account in
                     AccountCard(account: account, density: density, hidesRoutineStatus: true)
+                }
+                if hideMaxed && hiddenCount > 0 {
+                    Text(hiddenCount == 1
+                         ? "1 account hidden — 5-hour or weekly limit reached"
+                         : "\(hiddenCount) accounts hidden — 5-hour or weekly limit reached")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding([.horizontal, .bottom])
@@ -817,8 +839,8 @@ private struct AccountCard: View {
                 reset: account.quota.weeklyReset,
                 empty: account.quota.weeklyAbsent == true ? "No weekly limit" : "Waiting for quota"
             )
-            AccountInsights(account: account)
             if density == .detailed {
+                AccountInsights(account: account)
                 HStack {
                     Text("\(account.usage.totalRequests) requests")
                     Text("·")

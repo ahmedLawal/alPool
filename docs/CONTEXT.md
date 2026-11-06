@@ -65,6 +65,63 @@ routing modes. Current version: **v1.10.2** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-11-02 · #27 — Compact cards show identity + limits only
+
+**Context:** Ahmed flagged that Overview's Compact mode still showed reset
+cards and outside-usage lines — the only visible difference from Detailed was
+the requests/tokens footer. Root cause: `AccountCard` rendered
+`AccountInsights` unconditionally.
+**Decision:** Compact = name, provider, location, status, and the two quota
+rows — nothing else. `AccountInsights` (reset cards, outside-usage warnings,
+cloud-handled note) and the requests/tokens footer render only in Detailed.
+The Accounts page (which uses the card with default `.detailed`) is unchanged.
+Also this session: a mock-backend demo window left open was mistaken for a
+regression ("only 5 accounts", fake People "Alex"/"Sam") — demos get closed in
+the same breath as the wrap-up, never left on screen.
+**Consequences:** uncommitted in the working tree with #26; rebuilt to
+dist/ and swapped into ~/Applications/alPool.app.
+
+### 2026-11-02 · #26 — Overview page gains a "Hide maxed" filter
+
+**Context:** Ahmed asked to hide accounts that have reached their 5-hour or
+7-day limits on the native app's Overview page — with the team cloud pool
+carrying his z.ai buckets, several rows sit at 100% and bury the usable ones.
+**Decision:** `OverviewView` gets an `overviewHideMaxed` AppStorage toggle
+(same pattern as the density picker). When on, accounts whose
+`quota.sessionUsage` or `quota.weeklyUsage` fraction has reached 0.999 are
+hidden; nil quota never hides an account. A caption discloses how many rows
+are hidden ("N accounts hidden — 5-hour or weekly limit reached"), so the
+shorter list is never mistaken for the whole pool. The Accounts metric card
+still counts all enabled accounts. Uncommitted in the working tree
+(ContentView.swift); built to dist/alPool.app.
+**Consequences:** `swift build` green with the 26.5 SDK pin; `npm run lint`
+and `npm test` green. `swift test` (macos package) fails on this Mac under
+BOTH 27.2 and 26.5 SDKs on `unable to resolve module dependency: 'XCTest'` —
+proven pre-existing on a clean origin/main worktree (46bd61f), untouched by
+this change. Local `main` is ahead of `origin/main` (unpushed merges) — noted,
+not acted on.
+
+### 2026-10-20 · #25 — "GLM Max" (ZAI_API_KEY) joins the pool under a Max-approved exception
+
+**Context:** Ahmed asked for max@gomokka.com in his GLM list. That key is
+`ZAI_API_KEY`, the shared automation key the maxpool registry reserves for
+automation; CLAUDE.md also carries a precedence trap — a persistent config
+entry with this token makes config model pins beat the `cc all` SSOT headers.
+Max approved the exception in DM (2026-08-21 11:41 UTC, D07M3EHCBL1):
+"ask claude to provision glm max@gomokka.com z.ai — for now, it should already
+be in gcp".
+**Decision:** Add provider "GLM Max" (secretName `ZAI_API_KEY`, enabled) with a
+modelMap pinned to the mokka-workspace SSOT (`llm_config/models.yaml`
+claude_code.glm as of 2026-10-20: opus/sonnet glm-5.3, haiku glm-5-turbo) so
+config-beats-headers stays behavior-neutral. Backend restarted to load it.
+**Consequences:** The pool balances personal traffic across 4 GLM accounts and
+the shared automation key now absorbs some of it — burn is visible in Max's CI
+if it gets heavy. Legacy TOKENS_LIMIT plan has no weekly limit (existing open
+item), so the weekly guard will not restrain this account. The modelMap is a
+pinned copy: when models.yaml rotates models, update this entry to match or the
+CLAUDE.md trap goes live. Revert: delete the entry + restart (pre-change config
+backup at ~/.config/maxpool.json.backup-20261020-195250).
+
 ### 2026-08-24 · #24 — MaxPool v1.10.2 capacity and repair updates are integrated
 
 **Context:** The automatic upstream merge stopped at six overlapping hunks in
