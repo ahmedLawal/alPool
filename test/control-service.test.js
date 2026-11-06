@@ -39,6 +39,12 @@ function fixture() {
       installedRevision: '80d5ed4', availableVersion: '1.7.1',
       availableRevision: 'aac169c', error: 'The update could not be merged.',
     }),
+    getSelfUpdateStatus: () => ({
+      state: 'update-available', phase: null, checkedAt: '2026-11-06T09:00:00Z',
+      updatedAt: '2026-11-05T22:14:00Z', runningVersion: '1.24.66',
+      latestRevision: 'main@46bd61f', toRevision: 'f76a6ba', error: null,
+      lastFailedAt: '2026-11-06T08:12:00Z', lastError: 'linked checkout has uncommitted changes',
+    }),
     getActivity: () => ({
       activeCount: 1, sessionCount: 1,
       active: [{ id: '7', method: 'POST', path: '/v1/messages', account: 'glm' }],
@@ -58,6 +64,8 @@ test('snapshot exposes safe control metadata', () => {
   assert.equal(snapshot.upstreamSync.state, 'failed');
   assert.equal(snapshot.upstreamSync.installedVersion, '1.6.1');
   assert.equal(snapshot.upstreamSync.availableVersion, '1.7.1');
+  assert.equal(snapshot.selfUpdate.state, 'update-available');
+  assert.equal(snapshot.selfUpdate.lastError, 'linked checkout has uncommitted changes');
   assert.equal(snapshot.activity.activeCount, 1);
   assert.equal(snapshot.activity.recent.length, 1);
 });

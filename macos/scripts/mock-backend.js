@@ -57,6 +57,15 @@ function snapshot() {
       availableVersion: '1.7.1', availableRevision: 'aac169c',
       error: 'The MaxPool upstream update could not be merged automatically.',
     },
+    selfUpdate: {
+      state: 'failed', phase: 'install',
+      checkedAt: new Date().toISOString(),
+      updatedAt: new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString(),
+      runningVersion: '1.24.66', latestRevision: 'main@46bd61f', toRevision: 'f76a6ba39aa1',
+      error: 'linked checkout has uncommitted changes',
+      lastFailedAt: new Date().toISOString(),
+      lastError: 'linked checkout has uncommitted changes',
+    },
     activity: {
       activeCount: 1, sessionCount: 1,
       active: [{

@@ -102,13 +102,25 @@ export async function checkGitForUpdate(currentRevision, {
     );
     const latestRevision = String(stdout || '').trim().split(/\s+/)[0];
     if (!/^[0-9a-f]{40}$/i.test(latestRevision)) return null;
+    // Local-ahead guard (2026-11-06): when HEAD already contains the remote tip
+    // (unpushed local commits — the fork sat ~60 ahead of origin and every check
+    // read "update available" toward an OLDER revision), there is nothing to pull.
+    // merge-base exit 0 = the tip is an ancestor of HEAD → up to date. Diverged
+    // history still reports hasUpdate, so a real divergence surfaces loudly.
+    let hasUpdate = !currentRevision || currentRevision !== latestRevision;
+    if (hasUpdate && currentRevision) {
+      try {
+        await run('git', ['merge-base', '--is-ancestor', latestRevision, currentRevision], { cwd, timeout: timeoutMs });
+        hasUpdate = false;
+      } catch { /* not an ancestor (or object unknown) — genuinely newer or diverged */ }
+    }
     return {
       source: 'git',
       current: currentRevision ? `${ref}@${currentRevision.slice(0, 7)}` : `${ref}@unknown`,
       latest: `${ref}@${latestRevision.slice(0, 7)}`,
       currentRevision,
       latestRevision,
-      hasUpdate: !currentRevision || currentRevision !== latestRevision,
+      hasUpdate,
     };
   } catch {
     return null;
@@ -234,6 +246,7 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
     if (_bootRevision === undefined) _bootRevision = await _getRevision();
     const result = config?.updateCheck === false ? null : await _checkGit(_bootRevision, source);
     const hasUpdate = Boolean(result?.hasUpdate);
+    const checkFailed = config?.updateCheck === false ? false : !result;
 
     if (onVersionInfo) {
       try {
@@ -245,6 +258,7 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
       } catch { /* indicator is best-effort */ }
     }
 
+    if (checkFailed) return { hasUpdate: false, applicable: false, checkFailed: true };
     if (!hasUpdate) return { hasUpdate: false, applicable: false };
     if (announce) notify(`Update available: ${result.current} → ${result.latest}`);
     if (!config?.autoUpdate) {
@@ -253,14 +267,16 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
     }
 
     let onDisk = await _getRevision();
+    let justUpdated = false;
     if (onDisk !== result.latestRevision) {
       notify(`Auto-updating to ${result.latest}…`);
       const updated = await _selfGit(source);
       if (!updated.ok) {
         notify(`Auto-update failed: ${updated.error}`);
-        return { hasUpdate: true, applicable: false };
+        return { hasUpdate: true, applicable: false, error: updated.error, phase: 'install' };
       }
       onDisk = await _getRevision();
+      justUpdated = true;
     }
 
     const advanced = Boolean(onDisk) && onDisk !== _bootRevision;
@@ -272,13 +288,14 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
     } else if (advanced && !config?.autoApply && announce) {
       notify(`Updated to ${result.latest}. Restart alPool to apply.`);
     }
-    return { hasUpdate: true, installedVersion: onDisk, applicable };
+    return { hasUpdate: true, installedVersion: onDisk, applicable, updated: justUpdated };
   }
 
   if (_bootVersion === undefined) _bootVersion = await _get();
   const current = _bootVersion;
   const result = config?.updateCheck === false ? null : await _check(current);
   const hasUpdate = Boolean(result?.hasUpdate);
+  const checkFailed = config?.updateCheck === false ? false : !result;
 
   if (onVersionInfo) {
     try {
@@ -286,6 +303,7 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
     } catch { /* indicator is best-effort; never break startup */ }
   }
 
+  if (checkFailed) return { hasUpdate: false, applicable: false, checkFailed: true };
   if (!hasUpdate) return { hasUpdate: false, applicable: false };
   if (announce) notify(`Update available: ${result.current} → ${result.latest}`);
 
@@ -297,13 +315,15 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
   // Skip the reinstall if the latest is ALREADY on disk (a prior check downloaded it) —
   // otherwise every periodic check re-runs `npm i -g` + re-logs until a manual restart.
   const onDisk = await _get();
+  let justUpdated = false;
   if (!onDisk || compareVersions(onDisk, result.latest) < 0) {
     notify(`Auto-updating to ${result.latest}…`);
     const r = await _self();
     if (!r.ok) {
       notify(`Auto-update failed: ${r.error}. Run: npm i -g ${PACKAGE}`);
-      return { hasUpdate: true, applicable: false };
+      return { hasUpdate: true, applicable: false, error: r.error, phase: 'install' };
     }
+    justUpdated = true;
   }
 
   const installed = await _get();
@@ -323,5 +343,5 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
   } else if (advanced && !config?.autoApply) {
     if (announce) notify(`Updated to ${installed}. Restart alPool to apply (sessions are not interrupted).`);
   }
-  return { hasUpdate: true, installedVersion: installed, applicable };
+  return { hasUpdate: true, installedVersion: installed, applicable, updated: justUpdated };
 }

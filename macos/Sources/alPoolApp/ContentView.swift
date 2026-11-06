@@ -705,12 +705,32 @@ private struct UpdatesView: View {
         Form {
             Section("Backend") {
                 LabeledContent("Running", value: (snapshot.runningVersion ?? snapshot.version?.current).map { "v\($0)" } ?? "Unknown")
-                LabeledContent("Fork revision", value: snapshot.version?.latest ?? "Unknown")
+                LabeledContent("Latest on GitHub", value: snapshot.version?.latest ?? "Unknown")
                 Toggle("Install and apply backend updates automatically", isOn: Binding(
                     get: { snapshot.control.automaticUpdates },
                     set: { enabled in Task { await model.send(.init(type: "set-automatic-updates", payload: .init(enabled: enabled))) } }
                 ))
                 Button("Check and apply now") { Task { await model.send(.init(type: "check-update")) } }
+            }
+            Section("Update status") {
+                LabeledContent("Status") {
+                    Label(selfUpdateLabel, systemImage: selfUpdateSymbol)
+                        .foregroundStyle(selfUpdateColor)
+                }
+                if let checkedAt = snapshot.selfUpdate?.checkedAt {
+                    LabeledContent("Last checked", value: ActivityTimeFormatter.shortDateTime(checkedAt))
+                }
+                if let updatedAt = snapshot.selfUpdate?.updatedAt {
+                    LabeledContent("Last updated", value: lastUpdatedLabel(updatedAt))
+                }
+                if snapshot.selfUpdate?.state == "failed" {
+                    Text(snapshot.selfUpdate?.error ?? "The update failed. The running version is still active.")
+                        .foregroundStyle(.red)
+                } else if let lastFailedAt = snapshot.selfUpdate?.lastFailedAt, let lastError = snapshot.selfUpdate?.lastError {
+                    Text("Last failure \(ActivityTimeFormatter.shortDateTime(lastFailedAt)) — \(lastError)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
             Section("MaxPool upstream") {
                 LabeledContent("Installed", value: versionLabel(snapshot.upstreamSync?.installedVersion ?? snapshot.version?.current))
@@ -736,6 +756,42 @@ private struct UpdatesView: View {
     private func versionLabel(_ version: String?) -> String {
         guard let version, !version.isEmpty else { return "Not checked" }
         return version.hasPrefix("v") ? version : "v\(version)"
+    }
+
+    private func lastUpdatedLabel(_ updatedAt: String) -> String {
+        guard let revision = snapshot.selfUpdate?.toRevision.map({ String($0.prefix(7)) }) else {
+            return ActivityTimeFormatter.shortDateTime(updatedAt)
+        }
+        return "\(ActivityTimeFormatter.shortDateTime(updatedAt)) · main@\(revision)"
+    }
+
+    private var selfUpdateLabel: String {
+        switch snapshot.selfUpdate?.state {
+        case "up-to-date": "Up to date"
+        case "update-available": "Update available"
+        case "checking": "Checking"
+        case "failed": "Update failed"
+        default: "Not checked yet"
+        }
+    }
+
+    private var selfUpdateSymbol: String {
+        switch snapshot.selfUpdate?.state {
+        case "up-to-date": "checkmark.circle.fill"
+        case "failed": "exclamationmark.triangle.fill"
+        case "checking": "arrow.triangle.2.circlepath"
+        case "update-available": "arrow.down.circle.fill"
+        default: "clock"
+        }
+    }
+
+    private var selfUpdateColor: Color {
+        switch snapshot.selfUpdate?.state {
+        case "up-to-date": .green
+        case "failed": .red
+        case "checking", "update-available": .orange
+        default: .secondary
+        }
     }
 
     private var upstreamStatusLabel: String {

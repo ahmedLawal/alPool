@@ -23,8 +23,12 @@ repository is `ahmedLawal/alPool`, and the globally linked checkout pulls its ow
 `origin/main`. Compatibility-sensitive identifiers remain unchanged: alPool uses
 the existing `~/.config/maxpool.json`, `MAXPOOL_*` environment variables,
 `x-maxpool-*` headers, and `/maxpool/status` endpoint, so no account or integration
-migration is required. Upstream remains `2solarmax/maxpool`; synchronization runs
-locally through a six-hour macOS LaunchAgent and a transactional Bash script.
+migration is required. Upstream remains `2solarmax/maxpool`; synchronization is
+`scripts/sync-upstream.sh` (transactional, disposable worktree, pushes to the fork’s
+origin). Designed to run under a six-hour LaunchAgent via `scripts/install-local-sync.sh`,
+but the agent is NOT installed on this Mac (verified 2026-11-06) — upstream merges land
+only when run by hand; the backend’s 30-minute self-updater then fast-forwards the live
+checkout from origin.
 
 A native SwiftUI macOS client is the primary IO layer. The Node
 backend remains the sole owner of proxying, credentials, configuration, routing,
@@ -36,8 +40,9 @@ client.
 
 Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
 load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
-routing modes. Current version: **v1.10.2** (installed as a global symlink to
-`~/Sources/repo/Me/alPool`, so validated fast-forwards update the running install).
+routing modes. Current version: **v1.24.67** (launchd runs the repo checkout at
+~/repos/Me/alPool directly, so validated fast-forwards from origin update the running
+install).
 
 **Recently shipped (2026-08-10/11):**
 - v1.5.80: routing modes (`balance`, `prefer-claude`, `prefer-zai`, `prefer-kimi`,
@@ -64,6 +69,44 @@ routing modes. Current version: **v1.10.2** (installed as a global symlink to
 ---
 
 ## Decisions
+
+### 2026-11-06 · #29 — Self-updater: a remote tip already contained in HEAD is "up to date"
+
+**Context:** `checkGitForUpdate` flagged ANY revision difference as `hasUpdate`.
+With local `main` ~60 unpushed commits ahead of `origin/main`, every 30-minute
+check announced an "update" toward the OLDER origin revision; with a dirty tree
+the pull refused ("linked checkout has uncommitted changes" — the 2026-11-06
+log spam), and even clean it could never converge.
+**Decision:** After `ls-remote`, run `git merge-base --is-ancestor <tip> HEAD`;
+exit 0 (tip already in local history) → `hasUpdate: false`. Diverged history
+still reports `hasUpdate`, so a real divergence still surfaces via the failing
+pull. The 2026-11-06 push of 76 local commits to origin makes checks converge
+to "up to date" for real.
+**Consequences:** Unpushed local work no longer reads as a pending update.
+`test/updater.test.js` fakes now route `ls-remote` vs `merge-base` separately.
+
+### 2026-11-06 · #28 — Updates tab shows check outcomes, failure reasons, and timestamps
+
+**Context:** The 30-minute self-updater reported only into the event log; the
+native Updates tab showed Running/Fork-revision and a "MaxPool upstream" panel
+fed by a file only the (uninstalled) six-hour sync agent writes. A failing
+auto-update was therefore invisible in the app. Ahmed asked: see if an update
+failed, why, and when the last update was done.
+**Decision:** New `src/self-update-status.js` records every check outcome to
+`~/.local/state/alpool/self-update.json` — state (checking → up-to-date /
+update-available / failed), `checkedAt`, `updatedAt` when a fast-forward
+actually landed (with `toRevision`), and sticky `lastFailedAt`/`lastError`
+that survive later successes. `maybeCheckForUpdate` now returns `checkFailed`,
+`error`+`phase` ('check'|'install'), and `updated` instead of burying them in
+notify lines. The control snapshot exposes the record as `selfUpdate`; the
+Updates tab renders Status, Last checked, Last updated, the active failure in
+red, and the most recent past failure in gray. "Fork revision" renamed
+"Latest on GitHub" to stop reading origin's tip as the fork's.
+**Consequences:** One glance at Updates answers "did it fail, why, when did it
+last update". Upstream merges gain a few small additive hunks in `updater.js`
+and `index.js` — accepted for the visibility. Related finding the same day:
+the six-hour upstream-sync LaunchAgent was never installed (see Current
+focus); installing it is a separate decision for Ahmed.
 
 ### 2026-11-02 · #27 — Compact cards show identity + limits only
 

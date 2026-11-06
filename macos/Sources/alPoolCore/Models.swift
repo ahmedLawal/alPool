@@ -17,6 +17,7 @@ public struct ControlSnapshot: Decodable, Sendable {
     public let pools: [PoolInfo]?
     public let version: VersionInfo?
     public let upstreamSync: UpstreamSyncInfo?
+    public let selfUpdate: SelfUpdateInfo?
     public let activity: ActivityInfo?
     public let currentAccount: String?
     public let routing: RoutingInfo
@@ -66,6 +67,19 @@ public struct UpstreamSyncInfo: Decodable, Sendable {
     public let availableVersion: String?
     public let availableRevision: String?
     public let error: String?
+}
+
+public struct SelfUpdateInfo: Decodable, Sendable {
+    public let state: String?
+    public let phase: String?
+    public let checkedAt: String?
+    public let updatedAt: String?
+    public let runningVersion: String?
+    public let latestRevision: String?
+    public let toRevision: String?
+    public let error: String?
+    public let lastFailedAt: String?
+    public let lastError: String?
 }
 
 public struct VersionInfo: Decodable, Sendable {

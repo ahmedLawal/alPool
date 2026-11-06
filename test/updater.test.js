@@ -42,7 +42,8 @@ test('checkGitForUpdate compares the linked checkout HEAD with a remote branch',
   const calls = [];
   const execFile = async (cmd, args, options) => {
     calls.push({ cmd, args, options });
-    return { stdout: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/main\n' };
+    if (args[0] === 'ls-remote') return { stdout: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/main\n' };
+    throw new Error('merge-base: not an ancestor'); // exit 1 — the remote tip is genuinely newer
   };
   const r = await checkGitForUpdate('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', {
     remote: 'origin', ref: 'main', cwd: '/repo', execFile,
@@ -358,4 +359,67 @@ test('ESCAPE: a manual quit+relaunch clears the quarantine (fresh process)', asy
   h.setLatest('1.0.4');
   const r2 = await checkAndMaybeApply(CFG_AUTO, h.deps);
   assert.equal(r2.applied, true, 'quarantine cleared — 1.0.4 applies cleanly');
+});
+
+test('checkGitForUpdate treats a remote tip already contained in HEAD as up to date', async () => {
+  const execFile = async (_cmd, args) => {
+    if (args[0] === 'ls-remote') return { stdout: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/main\n' };
+    return { stdout: '' }; // merge-base --is-ancestor exits 0 — the tip is an ancestor of HEAD
+  };
+  const r = await checkGitForUpdate('cccccccccccccccccccccccccccccccccccccccc', {
+    remote: 'origin', ref: 'main', cwd: '/repo', execFile,
+  });
+  assert.equal(r.hasUpdate, false, 'a local branch ahead of origin is not an update');
+  assert.equal(r.latestRevision, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+});
+
+test('maybeCheckForUpdate reports git install failure and update landing', async () => {
+  __resetUpdaterState();
+  const latestRevision = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const base = {
+    getCurrentVersion: async () => '1.24.67',
+    getCurrentRevision: async () => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    checkGitForUpdate: async currentRevision => ({
+      source: 'git', current: 'main@' + currentRevision.slice(0, 7), latest: 'main@bbbbbbb',
+      currentRevision, latestRevision, hasUpdate: true,
+    }),
+  };
+  const failed = await maybeCheckForUpdate(
+    { updateCheck: true, autoUpdate: true, updateSource: { type: 'git', remote: 'origin', ref: 'main' } },
+    () => {}, () => {},
+    { ...base, selfUpdateFromGit: async () => ({ ok: false, error: 'linked checkout has uncommitted changes' }) });
+  assert.equal(failed.hasUpdate, true);
+  assert.equal(failed.error, 'linked checkout has uncommitted changes');
+  assert.equal(failed.phase, 'install');
+
+  let diskRevision = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const landed = await maybeCheckForUpdate(
+    { updateCheck: true, autoUpdate: true, updateSource: { type: 'git', remote: 'origin', ref: 'main' } },
+    () => {}, () => {},
+    { ...base, getCurrentRevision: async () => diskRevision,
+      selfUpdateFromGit: async () => { diskRevision = latestRevision; return { ok: true }; } });
+  assert.equal(landed.updated, true);
+  assert.equal(landed.installedVersion, latestRevision);
+});
+
+test('maybeCheckForUpdate distinguishes unreachable sources from up-to-date', async () => {
+  __resetUpdaterState();
+  const unreachableGit = await maybeCheckForUpdate(
+    { updateSource: { type: 'git', remote: 'origin', ref: 'main' } },
+    () => {}, () => {},
+    { getCurrentVersion: async () => '1.0.0', getCurrentRevision: async () => 'a'.repeat(40),
+      checkGitForUpdate: async () => null });
+  assert.equal(unreachableGit.checkFailed, true);
+  assert.equal(unreachableGit.hasUpdate, false);
+
+  const unreachableNpm = await maybeCheckForUpdate({}, () => {}, () => {},
+    { getCurrentVersion: async () => '1.0.0', checkForUpdate: async () => null });
+  assert.equal(unreachableNpm.checkFailed, true);
+
+  const npmInstallFailure = await maybeCheckForUpdate({ autoUpdate: true }, () => {}, () => {},
+    { getCurrentVersion: async () => '1.0.0',
+      checkForUpdate: async () => ({ latest: '1.1.0', current: '1.0.0', hasUpdate: true }),
+      selfUpdate: async () => ({ ok: false, error: 'EACCES' }) });
+  assert.equal(npmInstallFailure.error, 'EACCES');
+  assert.equal(npmInstallFailure.phase, 'install');
 });

@@ -19,6 +19,11 @@ public enum ActivityTimeFormatter {
         return String(format: "%02d:%02d:%02d", hour, minute, second)
     }
 
+    public static func shortDateTime(_ timestamp: String?) -> String {
+        guard let timestamp, let date = parse(timestamp) else { return "—" }
+        return date.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened))
+    }
+
     private static func parse(_ timestamp: String) -> Date? {
         let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
         if let date = try? fractional.parse(timestamp) { return date }

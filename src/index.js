@@ -45,6 +45,7 @@ import { RestartController } from './restart-controller.js';
 import { ClientRoute } from './client-route.js';
 import { ControlError, ControlService } from './control-service.js';
 import { readUpstreamSyncStatus } from './upstream-sync-status.js';
+import { readSelfUpdateStatus, recordSelfUpdateOutcome, recordSelfUpdateStart } from './self-update-status.js';
 import { ActivityFeed } from './activity-feed.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
@@ -1301,6 +1302,7 @@ async function serverWorkerCommand() {
     syncAccounts: syncAccountsNow,
     checkForUpdates: () => checkForUpdatesNow(),
     getUpstreamSyncStatus: () => readUpstreamSyncStatus(),
+    getSelfUpdateStatus: () => readSelfUpdateStatus(),
     getActivity: () => activityFeed.snapshot(),
     getClientRouting: () => clientRoute.snapshot(),
     setClientRoute: mode => clientRoute.set(mode),
@@ -1394,10 +1396,12 @@ async function serverWorkerCommand() {
   // manual action, so two `npm i -g` can never race (global-package corruption). hasLease
   // already blocks CROSS-worker races; this blocks same-worker timer-vs-manual overlap.
   let updateInFlight = false;
+  let lastCheckInfo = null;
   const runUpdateCheck = async ({ announce, apply, forceInstall = false }) => {
     if (updateInFlight || !hasLease || config?.updateCheck === false) return undefined;
     updateInFlight = true;
     try {
+      recordSelfUpdateStart();
       // The MANUAL action forces the install (autoUpdate:true) so pressing 'u' → 'c'
       // actually downloads + reloads even when AUTOMATIC updates are off. Without this,
       // maybeCheckForUpdate short-circuits before installing when config.autoUpdate is
@@ -1405,10 +1409,14 @@ async function serverWorkerCommand() {
       // quit/relaunch dance this menu exists to kill. The periodic + cold-start paths
       // pass the real config so they still respect the user's autoUpdate choice.
       const cfg = forceInstall ? { ...config, autoUpdate: true } : config;
-      const r = await maybeCheckForUpdate(cfg, notifyUpdate, info => { accountManager.versionInfo = info; }, { announce });
+      const r = await maybeCheckForUpdate(cfg, notifyUpdate, info => { accountManager.versionInfo = info; lastCheckInfo = info; }, { announce });
+      recordSelfUpdateOutcome(r, lastCheckInfo);
       apply(r);
       return r;
-    } catch { return undefined; /* update path is best-effort; never break the proxy */ }
+    } catch (err) {
+      recordSelfUpdateOutcome(null, lastCheckInfo, err);
+      return undefined; /* update path is best-effort; never break the proxy */
+    }
     finally { updateInFlight = false; }
   };
   // 'u' → check & apply now: force an immediate check + install + seamless reload so the

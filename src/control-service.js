@@ -23,6 +23,7 @@ export class ControlService {
     syncAccounts,
     checkForUpdates,
     getUpstreamSyncStatus = () => null,
+    getSelfUpdateStatus = () => null,
     getClientRouting = () => null,
     setClientRoute = null,
     getActivity = () => ({ activeCount: 0, sessionCount: 0, active: [], recent: [] }),
@@ -36,6 +37,7 @@ export class ControlService {
     this.syncAccounts = syncAccounts;
     this.checkForUpdates = checkForUpdates;
     this.getUpstreamSyncStatus = getUpstreamSyncStatus;
+    this.getSelfUpdateStatus = getSelfUpdateStatus;
     this.getActivity = getActivity;
     this.getClientRouting = getClientRouting;
     this.setClientRoute = setClientRoute;
@@ -57,6 +59,7 @@ export class ControlService {
       availableRevision: null,
       error: null,
     };
+    const selfUpdate = this.getSelfUpdateStatus?.() || null;
     const clientRouting = this.getClientRouting();
     return {
       ...status,
@@ -77,6 +80,7 @@ export class ControlService {
         callerWindows: this.am.poolLinks?.find(l => l.name === row.name)?.status?.callerWindows || {} })),
       clientRouting,
       upstreamSync,
+      selfUpdate,
       activity: this.getActivity(),
       control: {
         generatedAt: new Date().toISOString(),
