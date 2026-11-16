@@ -159,7 +159,8 @@ public struct AccountStatus: Decodable, Identifiable, Sendable {
     public let lastResponseMs: Double?
     public let lastError: String?
     public let cooldownUntil: String?
-    public let quota: QuotaInfo
+    /// nil for a pool-benched row: the cloud twin owns its quota (upstream fd94c72).
+    public let quota: QuotaInfo?
     public let weekly: WeeklyInfo
     public let usage: UsageInfo
     public let rateLimitedUntil: String?

@@ -60,20 +60,22 @@ public struct QuotaSample: Equatable, Sendable {
     public static func enabledAccounts(_ accounts: [AccountStatus]) -> [QuotaSample] {
         accounts.filter(\.enabled).flatMap { account in
             var samples: [QuotaSample] = []
-            if let usage = account.quota.sessionUsage {
+            // A pool-benched row has no quota of its own (nil): its cloud twin reports it.
+            guard let quota = account.quota else { return samples }
+            if let usage = quota.sessionUsage {
                 samples.append(.init(
                     accountName: account.name,
                     window: .fiveHour,
                     usage: usage,
-                    resetAt: account.quota.sessionReset
+                    resetAt: quota.sessionReset
                 ))
             }
-            if let usage = account.quota.weeklyUsage, account.quota.weeklyAbsent != true {
+            if let usage = quota.weeklyUsage, quota.weeklyAbsent != true {
                 samples.append(.init(
                     accountName: account.name,
                     window: .weekly,
                     usage: usage,
-                    resetAt: account.quota.weeklyReset
+                    resetAt: quota.weeklyReset
                 ))
             }
             return samples

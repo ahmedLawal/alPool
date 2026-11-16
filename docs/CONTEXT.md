@@ -70,6 +70,26 @@ install).
 
 ## Decisions
 
+### 2026-11-16 · #31 — The app tolerates `quota: null` on pool-benched rows
+
+**Context:** Minutes after the fork's first unattended self-update to
+v1.24.98, the native app showed "Backend unavailable — the data couldn't be
+read because it is missing" while the backend was healthy (pid up, port
+answering, 1.24.98 serving). Upstream fd94c72 (in the 1.24.97 batch) makes
+`getStatus()` report `quota: null` for a local row benched by its cloud twin
+— all four of Ahmed's GLM rows, since the team pool carries them. The app's
+`AccountStatus.quota` was non-optional, so one null row failed the whole
+snapshot decode and the app read the backend as absent.
+**Decision:** `quota` is `QuotaInfo?`; every reader (Overview hide-maxed
+filter, quota rows, capacity empty-state, weekly estimate, quota
+notifications) treats nil as "served by the cloud copy" — the quota rows say
+exactly that. A decode test pins a benched row with `quota: null`.
+**Consequences:** Reproduced with a Swift probe decoding the live `/maxpool/
+control` JSON (`NULL VALUE at accounts[0].quota` → `DECODE OK`). The sync
+agent's `npm test` gate covers the backend only — an app-affecting upstream
+change still needs a rebuild; a `swift test` lane in the agent is the open
+follow-up.
+
 ### 2026-11-16 · #30 — Merge Maxpool v1.24.97 (30 releases) into alPool
 
 **Context:** Max's 2026-11-16 fleet call (hw-team-sync thread) asked every local

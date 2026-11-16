@@ -231,7 +231,7 @@ private struct OverviewView: View {
         return enabledAccounts.filter { account in
             // Unknown quota (nil) never hides an account — only a reading that
             // has actually reached the limit does. Fractions can exceed 1.0.
-            (account.quota.sessionUsage ?? 0) < 0.999 && (account.quota.weeklyUsage ?? 0) < 0.999
+            (account.quota?.sessionUsage ?? 0) < 0.999 && (account.quota?.weeklyUsage ?? 0) < 0.999
         }
     }
 
@@ -492,7 +492,7 @@ private struct CapacityAccountRow: View {
     }
 
     private var emptyMessage: String {
-        if window == .weekly, account.quota.weeklyAbsent == true {
+        if window == .weekly, account.quota?.weeklyAbsent == true {
             return "Collecting complete 5-hour samples for the weekly estimate"
         }
         return "Collecting usage and completed-window samples"
@@ -888,12 +888,12 @@ private struct AccountCard: View {
                         .disabled(!account.canManageLocally)
                 }
             }
-            QuotaRow(label: "5 hour", value: account.quota.sessionUsage, reset: account.quota.sessionReset)
+            QuotaRow(label: "5 hour", value: account.quota?.sessionUsage, reset: account.quota?.sessionReset)
             QuotaRow(
                 label: "Weekly",
-                value: account.quota.weeklyUsage,
-                reset: account.quota.weeklyReset,
-                empty: account.quota.weeklyAbsent == true ? "No weekly limit" : "Waiting for quota"
+                value: account.quota?.weeklyUsage,
+                reset: account.quota?.weeklyReset,
+                empty: account.quota == nil ? "Served by the cloud copy" : (account.quota?.weeklyAbsent == true ? "No weekly limit" : "Waiting for quota")
             )
             if density == .detailed {
                 AccountInsights(account: account)

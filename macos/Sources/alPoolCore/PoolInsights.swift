@@ -60,7 +60,7 @@ public extension AccountStatus {
     }
 
     var weeklyTokenEstimate: Double? {
-        if quota.weeklyAbsent == true {
+        if quota?.weeklyAbsent == true {
             guard let session = capacity?.session?.average ?? capacity?.session?.current, session > 0 else { return nil }
             return session * 33.6
         }

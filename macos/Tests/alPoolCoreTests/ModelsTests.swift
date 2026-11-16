@@ -58,6 +58,15 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(resolved.standardizedFileURL, node.standardizedFileURL)
     }
 
+    func testBenchedAccountDecodesWithNullQuota() throws {
+        // Upstream fd94c72: a pool-benched local row reports quota: null (its cloud twin owns it).
+        // One such row must not take the whole snapshot down ("Backend unavailable", 2026-11-16).
+        let data = Data(#"{"name":"GLM AL","type":"provider","provider":"zai","enabled":true,"capUtilization":null,"capacity":null,"runtime":true,"status":"active","refreshDead":false,"inFlight":0,"completedRequests":0,"failedRequests":0,"lastStatus":null,"lastResponseMs":null,"lastError":null,"cooldownUntil":null,"quota":null,"weekly":{"state":"normal","rawState":"normal","effectiveUsage":null,"paceState":"normal"},"usage":{"totalInputTokens":0,"totalOutputTokens":0,"totalRequests":0},"rateLimitedUntil":null,"poolBenchedBy":"team"}"#.utf8)
+        let account = try JSONDecoder().decode(AccountStatus.self, from: data)
+        XCTAssertNil(account.quota)
+        XCTAssertEqual(account.name, "GLM AL")
+    }
+
     func testExplicitNodeOverrideWins() throws {
         let node = URL(fileURLWithPath: "/bin/sh")
         let resolved = try ConnectionLoader.findNodeExecutable(
