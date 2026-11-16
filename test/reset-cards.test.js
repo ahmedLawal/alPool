@@ -8,7 +8,10 @@ const DAY = 24 * H;
 const soon = (ms) => Date.now() + ms;
 
 function acct({ ses, wk, weeklyAbsent = false, enabled = true } = {}) {
-  return { name: 't', enabled, quota: { providerSes: ses, providerWk: wk, weeklyAbsent, unified5h: ses, unified7d: wk } };
+  // C1 freshness prerequisites: a claim only fires on a probe-fresh reading whose
+  // weekly window has not rolled (CLAIM_FRESH_MS / unified7dReset gates, 2026-11-10).
+  return { name: 't', enabled, quota: { providerSes: ses, providerWk: wk, weeklyAbsent,
+    unified5h: ses, unified7d: wk, unified7dReset: Date.now() + 3 * DAY, lastProbeOkAt: Date.now() } };
 }
 
 // ── expiry parsing ────────────────────────────────────────────────────────────
@@ -66,14 +69,18 @@ test('R3: expired cards are never chosen', () => {
 });
 
 // ── Claude grants ─────────────────────────────────────────────────────────────
-function grant({ endsAt = soon(20 * DAY), resetsLeft = 1, usableNow = true, paused = false, requiresLimit = false, clears = ['five_hour', 'seven_day'] } = {}) {
-  return { id: 'g1', resetsLeft, resetsTotal: resetsLeft, endsAt, startsAt: null, usableNow: usableNow, paused, requiresLimit, clears, label: null, expired: endsAt <= Date.now() };
+function grant({ endsAt = soon(20 * DAY), resetsLeft = 1, usableNow = true, paused = false, requiresLimit = false, clears = ['five_hour', 'seven_day'], ...rest } = {}) {
+  return { id: 'g1', resetsLeft, resetsTotal: resetsLeft, endsAt, startsAt: null, usableNow: usableNow, paused, requiresLimit, clears,
+    givesBackWeekly: false, blocking: false, unavailableReason: null, label: null, expired: endsAt <= Date.now(), ...rest };
 }
 
-test('claude: weekly-clearing grant fires at weekly wall', () => {
+test('claude: general grant fires at the Claude weekly wall (0.99, NOT the z.ai 0.90)', () => {
   const g = grant();
-  const act = decideClaude(acct({ wk: 0.92 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
+  assert.equal(decideClaude(acct({ wk: 0.98 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null }), null,
+    'below CLAUDE_WALL_WEEKLY: no claim (z.ai 0.90 wall must NOT move)');
+  const act = decideClaude(acct({ wk: 0.995 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
   assert.equal(act?.grant?.id, 'g1');
+  assert.equal(act?.scope, 'general');
 });
 
 test('claude: requiresLimit grant is NOT spent on dying value pre-wall', () => {
@@ -90,13 +97,20 @@ test('claude: no-requirement grant IS spent on dying value', () => {
 test('claude: cooldown blocks; spent grants (resets_left 0) dropped upstream', () => {
   const g = grant();
   const cooled = { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: soon(H) };
-  assert.equal(decideClaude(acct({ wk: 0.95 }), cooled), null);
+  assert.equal(decideClaude(acct({ wk: 0.995 }), cooled), null);
 });
 
-test('claude: honors nextGrantId when server names one', () => {
-  const a = grant(); const b = { ...grant(), id: 'g2' };
-  const act = decideClaude(acct({ wk: 0.95 }), { grants: [a, b], eligible: true, nextGrantId: 'g2', cooldownUntil: null });
-  assert.equal(act.grant.id, 'g2');
+test('claude: per-grant scope beats the server-named order (pre-mortem #8)', () => {
+  // A general grant and a Fable grant; the server names the GENERAL one next, but
+  // only the Fable bucket is at its wall — the Fable grant must be chosen, never
+  // the general grant through nextGrantId order.
+  const general = grant({ id: 'gen', clears: ['seven_day'] });
+  const fable = grant({ id: 'fab', clears: ['seven_day_overage_included'] });
+  const a = acct({ wk: 0.50 });
+  a.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: soon(3 * DAY), isActive: true } };
+  const act = decideClaude(a, { grants: [general, fable], eligible: true, nextGrantId: 'gen', cooldownUntil: null });
+  assert.equal(act?.grant?.id, 'fab', 'the scoped-wall grant is chosen, not nextGrantId');
+  assert.equal(act?.scope, 'fable');
 });
 
 // ── idempotency of the redeem wire format ─────────────────────────────────────
@@ -159,13 +173,13 @@ test('redeemResetCard sends the card\'s grantType in the request body', async ()
 });
 
 test('prober redeem path passes the policy-chosen card\'s grantType to the wire', async () => {
-  const { Prober } = await import('../src/prober.js');
   let sent = null;
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init) => { sent = init?.body ? JSON.parse(init.body) : null;
     return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; };
   try {
     const logs = [];
+    const { Prober } = await import('../src/prober.js');
     const self = { log: (m) => logs.push(m), am: {}, _withTimeout: (p) => p };
     await Prober.prototype._redeemZaiCard.call(self,
       { name: 'glm t', credential: 'tok', quota: {} },
@@ -251,6 +265,7 @@ test('grantType-less card gets one GLOBAL fallback retry on "unavailable"', asyn
 });
 
 test('backoff key is the account NAME (stable across reindex), and tries resets on success', async () => {
+  const { Prober: _Prober } = await import('../src/prober.js');
   const src = (await import('node:fs')).readFileSync(new URL('../src/prober.js', import.meta.url), 'utf8');
   assert.match(src, /`\$\{account\.name\}:\$\{act\.card\.recordId\}`/, 'keyed by name');
   assert.match(src, /_cardTries\?\.set\(key, 0\)/, 'tries reset on success');
@@ -353,9 +368,102 @@ test('owner 2026-10-30: a dying weekly card/grant is never spent because of the 
   const zaiWk = { enabled: true, quota: { providerSes: 0.10, providerWk: 0.40 } };
   assert.equal(decideZai(zaiWk, cards, now)?.reason, 'dying value', 'weekly-driven dying spend still allowed');
   // Claude: weekly-clearing grant, weekly 10%, session 96%, dying
-  const cl = { enabled: true, quota: { unified5h: 0.96, unified7d: 0.10 } };
-  const listing = { eligible: true, grants: [{ id: 'g1', usableNow: true, endsAt: soon, clears: ['five_hour', 'seven_day'] }] };
-  assert.equal(decideClaude(cl, listing, now), null, 'session-driven dying grant refused');
-  const clWk = { enabled: true, quota: { unified5h: 0.10, unified7d: 0.40 } };
-  assert.equal(decideClaude(clWk, listing, now)?.reason, 'dying value', 'weekly-driven dying grant still allowed');
+  const freshQ = { unified5h: 0.96, unified7d: 0.10, unified7dReset: now + 3 * DAY, lastProbeOkAt: now };
+  const cl = { enabled: true, quota: freshQ };
+  const listing = { eligible: true, grants: [{ id: 'g1', usableNow: true, endsAt: soon, clears: ['five_hour', 'seven_day'], givesBackWeekly: false }] };
+  assert.equal(decideClaude(cl, listing, now, { now }), null, 'session-driven dying grant refused');
+  const clWk = { enabled: true, quota: { ...freshQ, unified5h: 0.10, unified7d: 0.40 } };
+  assert.equal(decideClaude(clWk, listing, now, { now })?.reason, 'dying value', 'weekly-driven dying grant still allowed');
+});
+
+// ── TEST 8 (A4, 2026-11-10): z.ai card listings keep the last good on error/timeout/drift ──
+test('A4: error, timeout, all-unavailable, and renamed-field listings all HOLD the stored cards (stale), one log line', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { Prober } = await import('../src/prober.js');
+  const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', credential: 'k', apiKey: 'k' }], 0.9);
+  const GOOD_CARDS = () => ({ weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: soon(20 * DAY), expired: false }], fiveHour: [], source: 'zai' });
+  am.applyResetCards(0, GOOD_CARDS());
+  const logs = [];
+  let mode = 'error';
+  const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m),
+    providerProbeFn: async () => ({ ses: { utilization: 0.2, resetAt: soon(3 * H) }, wk: { utilization: 0.3, resetAt: soon(3 * DAY) }, source: 'zai' }),
+    cardsFn: async () => {
+    if (mode === 'error') return { error: 'HTTP 500' };
+    if (mode === 'timeout') return null;                     // _withTimeout resolves null
+    if (mode === 'unavailable') return { weekly: [], fiveHour: [] };   // raw parse of all-unavailable is legitimately empty — NOT drift
+    if (mode === 'renamed') return { error: 'drift: 2 raw entries, 0 kept' };  // listResetCards-level drift
+    return GOOD_CARDS();
+  } });
+  const cardLogs = () => logs.filter(l => /^\[reset-card\] glm t:/.test(l));
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].resetCards.weekly.length, 1, 'error: the stored cards are held');
+  assert.equal(am.accounts[0].resetCards.stale, true, 'marked stale');
+  mode = 'timeout';
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].resetCards.weekly.length, 1, 'timeout: held');
+  mode = 'renamed';
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].resetCards.weekly.length, 1, 'renamed field (drift): held, never a good empty');
+  assert.equal(cardLogs().length, 1, 'ONE failure line across the failed sweeps');
+  mode = 'ok';
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(cardLogs().length, 2, 'recovery logs once');
+  assert.match(cardLogs()[1], /listing recovered/);
+  assert.equal(am.accounts[0].resetCards.stale, false);
+});
+
+test('A4: a 200 with every entry available:false is a legitimate empty list (not drift)', async () => {
+  const { listResetCards } = await import('../src/zai-reset-cards.js');
+  const fetchImpl = async () => ({ status: 200, json: async () => ({ code: 200, data: {
+    fiveHourResets: [{ recordId: 5, expireTime: '2099-12-22 23:59:59', available: false }],
+    weekResets: [],
+  } }) });
+  const r = await listResetCards('tok', { fetchImpl });
+  assert.deepEqual(r, { fiveHour: [], weekly: [], source: 'zai' }, 'all-unavailable parses to an honest empty, no error');
+});
+
+test('A4: listResetCards treats a 200 with a RENAMED field as drift (raw>0 kept 0)', async () => {
+  const { listResetCards } = await import('../src/zai-reset-cards.js');
+  const fetchImpl = async () => ({ status: 200, json: async () => ({ code: 200, data: {
+    fiveHourResets: [{ recordIdx: 5, expireTime: '2099-12-22 23:59:59', available: true }],   // recordId renamed
+    weekResets: [],
+  } }) });
+  const r = await listResetCards('tok', { fetchImpl });
+  assert.ok(r.error && /drift/.test(r.error), 'drift reads as an error, never a good empty list');
+});
+
+test('A4: expected arrays MISSING from a 200 is drift', async () => {
+  const { listResetCards } = await import('../src/zai-reset-cards.js');
+  const fetchImpl = async () => ({ status: 200, json: async () => ({ code: 200, data: { fiveHourResets2: [], weekResets: [] } }) });
+  const r = await listResetCards('tok', { fetchImpl });
+  assert.ok(r.error && /drift/.test(r.error));
+});
+
+// ── TEST 9 (A4/SC5): a redeem removes the card from the stored list even when the follow-up read fails ──
+test('A4/SC5: a successful redeem removes the recordId locally; a FAILED follow-up listing keeps the removal', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { Prober } = await import('../src/prober.js');
+  const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', credential: 'k', apiKey: 'k' }], 0.9);
+  am.applyResetCards(0, { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] });
+  const realFetch = globalThis.fetch;
+  let listFails = false;
+  globalThis.fetch = async (_u, init) => {
+    if (init?.method === 'POST') return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) };
+    if (listFails) return { status: 500 };
+    return { status: 200, json: async () => ({ code: 200, data: { fiveHourResets: [], weekResets: [] } }) };
+  };
+  const logs = [];
+  const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
+    cardsFn: async () => ({ weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] }) });
+  try {
+    await Prober.prototype._redeemZaiCard.call({ ...prober, log: m => logs.push(m), am, _withTimeout: p => p },
+      am.accounts[0], { card: { recordId: 9, grantType: 'GLOBAL' }, resetType: 'WEEK', reason: 'weekly at wall' });
+    // The follow-up read FAILS — the removal must still hold.
+    listFails = true;
+    assert.ok(logs.some(l => /card 9 redeemed/.test(l)));
+    const weekly = am.accounts[0].resetCards.weekly || [];
+    assert.ok(!weekly.some(c => c.recordId === 9), 'the redeemed card is GONE from the stored list');
+    // And the routing discount no longer sees a usable reset.
+    assert.equal(am._holdsUsableReset(am.accounts[0]), false, 'no stale discount for a spent card');
+  } finally { globalThis.fetch = realFetch; }
 });

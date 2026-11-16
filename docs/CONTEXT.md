@@ -70,6 +70,112 @@ install).
 
 ## Decisions
 
+### 2026-11-16 · #30 — Merge Maxpool v1.24.97 (30 releases) into alPool
+
+**Context:** Max's 2026-11-16 fleet call (hw-team-sync thread) asked every local
+pool to reach 1.24.97. alPool sat on 1.24.67 — 201 commits behind — because the
+six-hour upstream-sync LaunchAgent had never been installed (installed same day,
+see #28's consequence). The agent's first run correctly refused the 36-hunk
+conflict set; this merge crosses the gap by hand.
+**Decision:** Merge upstream/main (b371429, v1.24.97) wholesale. Resolution
+rules: upstream's machinery wins (terminal hand-off, non-blocking TTY,
+`settleRolledBackReload`, `fallBack`, `printFatal`, login routing via
+`_routeLogin`, no-plan quota label, `logFailedAttempt` instrumentation,
+capacity identity/grouping machinery); the fork's identity and fork-only
+features stay on top (`[alPool]` branding, alpool package identity with their
+version, `controlService` in the TUI, `subscribeEventLog` + event-level tags,
+`quotaProbeEnabled` config gate, `capacitySnapshot`/`capacityTank` for the
+native app, the T9 capacity test, the 2026-11-06 self-update-status feature —
+re-wired onto upstream's `runUpdateCheck`). Adapted tests:
+`tui-service-mode` expects "Stop alPool?" (fork wording); the route-switch
+rc-gate test uses the fork's `gateTest` fixture guard (upstream renamed it
+`gateDescribe`).
+**Consequences:** `tui-terminal-pty` test (c) "self-update hand-off" fails on
+THIS Mac even on pure upstream/main (baseline worktree suite run 2026-11-16 —
+only (c) and a 250ms timing doc-test fail there), so it is skipped by default
+with a reason; `ALPOOL_RUN_PTY_C=1` opts back in. Same for the
+`reload-terminal-round2` "probe" tripwire (this pty never holds a pending
+raw-mode switch; fails on pure upstream here too) — `ALPOOL_RUN_PTY_PROBE=1`. Same family as the
+pre-existing Swift XCTest gap (#26). Additional adaptations beyond the merge
+itself: the oauth-across-reload test's server-ready regex watches the fork
+banner (`alPool Proxy`), upstream's attempt-log/server-listen/cache-affinity expectations
+extended to accept the fork's `[alPool]` prefix on dual-origin lines (log
+captures and `startsWith` finds), the listen-error block keeps the fork
+wording plus a "Dashboard:" line, raw accountUuid comparisons in
+control-service/persistLiveConfig replaced with `sameAccountIdentity` (upstream
+hygiene rule), and `brew install tmux` satisfied the new pool-service tests.
+The six-hour sync agent keeps the fork current from here; with (c) skipped its
+`npm test` gate reflects a fully green baseline.
+
+### 2026-11-13 · release B red-team round 1 — first-byte floor vs client patience, mixed-version 504
+
+- **Deadline present ⇒ the first-byte wait is min(remaining, hop cap), not the 120s floor.** The floor still applies to
+  requests with no patience header. Before: a >120s non-streaming answer on the cloud timed out at the floor, came back as
+  a bare 503 and the Mac booked a failure on the cloud row (F3). A pool-deadline request that times out with no route
+  left now answers the request-scoped 504 (Mac books it neutral).
+- **A request forwarded by another pool (hop header) without the pool deadline header is an OLD Mac: no deadline at all.**
+  It forwards the client's X-Stainless-Timeout; answering a deadline 504 made it book a failed request (F1). Direct
+  clients with X-Stainless-Timeout still get the 504 (T2).
+- **Every re-send site shares one guard** (`resendAllowed`: client gone + 60s minimum-move); moves also check a route (F5).
+- Nits: body read goes through an owned reader so a cancel really closes the socket (F4); the B11 exit line goes to the
+  event log only (F6); the `ns` tag is POST /v1/messages only (F9).
+- Release evidence for the two-pool tests needs an explicit gated run (`MAXPOOL_TWO_POOL_TESTS=1`, `MAXPOOL_OLD_MAC_DIR`).
+
+### 2026-11-10 · reset machinery — scope from `clears`, cap lift (D2), reactive claim
+
+**Context:** resets were invisible on cloud rows (the export omitted `eligible`),
+the count flickered on transient listing failures (null-on-error), every measured
+grant was model-scoped (`seven_day_overage_included` = Fable) while the claim gate
+required a literal `seven_day` (so NO grant could ever be claimed), and capped
+accounts could never reach their claim wall. Task:
+`mokka-workspace/work/tooling/1-discovery/bug-2026-11-10-maxpool-reset-machinery-all-accounts/`.
+
+**Decisions (owner D1-D4 + pre-mortem amendments):**
+- Scope is Anthropic's own `clears` field via one shared `appliesTo()`
+  (`seven_day`=general, `five_hour`=session, `seven_day_overage_included`=fable);
+  missing `clears` → `[]` = unknown: shown, never claimed, never lifts. Missing
+  `usable_now` → false (fail closed).
+- Claude claims read their OWN wall `CLAUDE_WALL_WEEKLY=0.99`; z.ai's
+  `POLICY.wallWeekly` stays 0.90 (shared constant would move GLM redeems).
+- The claim decision runs AFTER this sweep's usage probe (freshness: lastProbeOkAt
+  ≤5 min, unified7dReset future, lastProbeOkAt > lastClaimAt) and picks the grant
+  by scope, never by the server's nextGrantId order.
+- Cap lift (D2): a held full-refill reset (seven_day grant or z.ai weekly card)
+  suspends the cap on BOTH windows + the provider max(ses,wk) cap, remaps
+  soft/reserve/critical → normal below the wall, and ends on claim / grant-gone /
+  10-min listing-failure grace expiry. Give-back grants lift only to cap + the
+  MEASURED unified7d drop (never a full lift on an unmeasured one).
+- capLift is computed ONLY by the holder pool and exported; mirrors honour it.
+- Reactive claim: a weekly-class 429 (7d header ≥ wall) claims on the serving
+  lease's local account at once; a scoped 429 only with a probe-MEASURED bucket;
+  stored listing allowed stale ≤6h; current token only (a 401 defers to the sweep);
+  one claim lock per account shared with the prober; failure backoff 15m/30m/1h
+  cap 6h per (account, grantId).
+- Grants listed ≤1 per 5 min per account (the call shares the rate-limited
+  /api/oauth/usage endpoint); two calls kept (distinct header sets, no merge).
+- TUI Rst column: fixed grammar at width 6 (`n~Xd` general, `nF~Xd` scoped,
+  `g+sF` mixed, `n?` unknown, gray+`?` not-fresh); count = SUM of resetsLeft +
+  live cards; expiry checked live in the render.
+- ttfb = the serving attempt's upstream wait (its fetch resolve minus its own
+  forward start), stamped only on a successful fetch; the queue heartbeat never
+  stamps it.
+
+**Review round (judge @2c4da59, same day):** one claim per wall is ordered by the
+probe's SEND time (a probe sent before a claim cannot license another); a
+successful claim spends the reset in the stored listing at once; the reactive
+claim runs off the request (fire-and-forget, 10s abort) and a 401 defers to the
+sweep without backoff; no lift — and no dying-value claim — within 24h of the
+limit's free refill unless the reset itself dies first (D4); mirrors read the
+holder's exported lift ceiling; the skip log prints the policy's own reason;
+claim state (cached org, backoff) is per login and cleared on re-login/removal;
+the give-back OR rule also holds for stored (normalized) grants. Timing constants
+live in one leaf module, `src/reset-timing.js`.
+
+**Consequences:** every row (cloud included) shows its resets with scope; capped
+accounts spend their general resets; a 429 at the wall claims for the NEXT request
+without slowing this one; z.ai schema drift reads as a failed listing, never a
+silent 0.
+
 ### 2026-11-06 · #29 — Self-updater: a remote tip already contained in HEAD is "up to date"
 
 **Context:** `checkGitForUpdate` flagged ANY revision difference as `hasUpdate`.

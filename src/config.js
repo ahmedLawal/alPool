@@ -4,6 +4,8 @@ import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
+import { copyFile } from 'node:fs/promises';
+import { SCHEMA_VERSION as CAPACITY_SCHEMA_VERSION } from './capacity-ledger.js';
 
 export function getConfigPath() {
   if (process.env.MAXPOOL_CONFIG) return process.env.MAXPOOL_CONFIG;
@@ -72,6 +74,17 @@ export function createDefaultConfig() {
     // onto exactly the account it cannot see. Use quotaProbeEnabled:false to opt out.
     quotaProbeEnabled: true,
     quotaProbeSeconds: 60,
+    // Provider-thinking scrub (owner 2026-11-05): drop `thinking`/`redacted_thinking`
+    // blocks (and any unknown block type) from PROVIDER responses before they reach the
+    // client, so a mixed GLM+Claude session never stores foreign thinking — the stored
+    // blocks are what Anthropic signature-400s on and the repair strips, breaking the
+    // cache prefix. Claude-account responses are NEVER scrubbed. Default OFF until the
+    // E2E package is owner-approved.
+    providerThinkingScrub: false,
+    // Each upstream account presents ONE fixed Claude Code identity (device id +
+    // machine profile) regardless of who sent the request — pooled accounts stop
+    // showing several installs alternating within seconds. On by default; false = verbatim.
+    accountIdentity: true,
     routing: {
       mode: 'automatic',
       preferredAccount: null,
@@ -298,6 +311,31 @@ export async function readGeneration(path) {
  * generation you read; omit it to read-then-bump unconditionally (single-owner
  * fast path). Returns the generation written, or null when refused.
  */
+/**
+ * Capacity-ledger rollback protection (red-team J2). An older build cannot read a newer
+ * capacity schema, boots with an EMPTY ledger and its next flush would overwrite the
+ * file, destroying the history. So, before every state write:
+ *  - an on-disk `capacity.schemaVersion` NEWER than this build's refuses the write
+ *    (throws loudly; the caller surfaces it) — never clobber a newer build's ledger;
+ *  - the FIRST write of this build's schema over an OLDER one first copies the file to
+ *    `<state>.v<old>.bak-<utc ts>` so a rollback keeps its history.
+ */
+async function guardCapacitySchema(path, nextState) {
+  let disk;
+  try { disk = JSON.parse(await readFile(path, 'utf-8')); } catch { return; }
+  const onDiskV = Number(disk?.capacity?.schemaVersion);
+  if (!Number.isFinite(onDiskV)) return;
+  if (onDiskV > CAPACITY_SCHEMA_VERSION) {
+    const msg = `refusing to write ${path}: its capacity ledger is schema v${onDiskV}, newer than this build's v${CAPACITY_SCHEMA_VERSION} (a newer maxpool owns it; overwriting would destroy its history)`;
+    console.error(`[maxpool] ${msg}`);
+    throw Object.assign(new Error(msg), { code: 'STATE_SCHEMA_NEWER' });
+  }
+  if (onDiskV < CAPACITY_SCHEMA_VERSION && Number(nextState?.capacity?.schemaVersion) === CAPACITY_SCHEMA_VERSION) {
+    const ts = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+    await copyFile(path, `${path}.v${onDiskV}.bak-${ts}`);
+  }
+}
+
 let _stateWriteChain = Promise.resolve();
 
 /**
@@ -309,6 +347,7 @@ let _stateWriteChain = Promise.resolve();
  */
 export function saveStateUnbumped(state, generation) {
   const run = async () => {
+    await guardCapacitySchema(getStatePath(), state);
     await atomicWrite(getStatePath(), JSON.stringify({ ...state, _generation: generation }, null, 2) + '\n');
   };
   const result = _stateWriteChain.then(run, run);
@@ -327,6 +366,7 @@ export function saveState(state, { expectedGeneration = null } = {}) {
       return null;
     }
     const next = onDisk + 1;
+    await guardCapacitySchema(path, state);
     await atomicWrite(path, JSON.stringify({ ...state, _generation: next }, null, 2) + '\n');
     return next;
   };

@@ -1,8 +1,19 @@
 import { createInterface } from 'node:readline';
-import { readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { readFileSync, writeSync } from 'node:fs';
+import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
-import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
+import { sendLoginToPool } from './cloud-login.js';
+import { describeLinkError } from './pool-link.js';
+import { normalizeRemoteResets, resolveStickyBusyBudget } from './account-manager.js';
+import { appliesTo } from './claude-reset-grants.js';
+import { LISTING_FRESH_MS } from './reset-timing.js';
+import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
+
+// Running as the background service (tools/pool-service): set by its launchd plist.
+const serviceMode = () => process.env.MAXPOOL_SERVICE === '1';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -21,6 +32,113 @@ const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
 const dimUnderline = s => `${ESC}2;4m${s}${RESET}`;
+// The cache figures of a request line, by whether the cache held (#642 port, 2026-11-15).
+const CACHE_PAINT = { hit: green, partial: yellow, miss: red, none: dim };
+
+// Terminal output budget (2026-11-12: the pool froze for up to 60s inside a synchronous
+// TTY write() — a full-screen redraw per log line, 4.9 GB in 12h49m). Frames are
+// coalesced to one per RENDER_MIN_INTERVAL_MS (≤10/s), an unchanged frame is re-sent
+// only after REPAINT_MS, and nothing is written while the terminal has not drained.
+const RENDER_MIN_INTERVAL_MS = 100;
+const REPAINT_MS = 5000;
+const EXIT_SEQ = `${ESC}?25h${ESC}?1049l`;   // show cursor + leave the alt screen
+
+/**
+ * Write to the terminal synchronously at PROCESS EXIT. The TUI turns its output
+ * non-blocking, and Node drops a non-blocking stream's queued bytes on exit — the exit
+ * sequence written through the stream never arrives and the shell is left in the
+ * dashboard (pre-mortem r2 B1, real-pty probe). Blocking back on + a direct fd write
+ * delivers it. Exit paths only: a blocking write is exactly what froze the pool.
+ */
+export function writeTerminalSync(s) {
+  if (!isatty(1)) return;
+  try { process.stdout._handle?.setBlocking?.(true); } catch { /* not a libuv tty */ }
+  try { writeSync(1, s); } catch { /* terminal gone */ }
+}
+
+/**
+ * Re-enter raw mode after another process reset the terminal (post-update reassert).
+ * setRawMode is tcsetattr(TCSADRAIN): it blocks the WHOLE process until the terminal
+ * has read everything already sent (2026-11-12, measured 2.8s on a paused pty). So the
+ * toggle waits until our own queued output has drained — the remaining wait is the
+ * kernel's ~1 KB — and a terminal that is not reading at all gets it on 'drain'.
+ * Resolves true when reclaimed now, false when deferred to 'drain'.
+ * 'drain' is emitted only after a write crossed the stream's high-water mark, so a
+ * deferred reclaim also polls the queue length and goes ahead once it is empty
+ * (2026-11-13: a frame below 16 KB never produced 'drain'). Fallback only: a worker
+ * with a terminal helper (terminal-mode.js) never switches on its own thread. `guard` is re-checked
+ * at reclaim time (a TUI stopped meanwhile must not be put back in raw mode);
+ * `onDeferredReclaim` runs once the deferred reclaim actually happened.
+ */
+export async function reclaimRawMode({
+  stdin = process.stdin, stdout = process.stdout, flush, timeoutMs = 1500,
+  guard = () => true, onDeferredReclaim = () => {}, pollMs = 100,
+} = {}) {
+  if (!stdin.isTTY) return true;
+  // OFF then ON: Node short-circuits setRawMode(true) while it believes isRaw is already
+  // true, and the reset happened in ANOTHER process (verified on a real pty 2026-08-07).
+  const reclaim = () => {
+    if (!guard()) return;
+    try { stdin.setRawMode(false); stdin.setRawMode(true); stdin.resume(); } catch { /* terminal gone */ }
+  };
+  if (!flush || await flush({ timeoutMs })) { reclaim(); return true; }
+  let settled = false;
+  const later = () => {
+    if (settled) return;
+    settled = true;
+    clearInterval(poll);
+    stdout.removeListener?.('drain', later);
+    reclaim();
+    try { onDeferredReclaim(); } catch { /* never */ }
+  };
+  // Only once our queue is EMPTY (polled, or 'drain'): a mere shrink — one whole write
+  // landed — fired the switch on the serving thread while a bursty terminal still held
+  // several bursts of ours, stalling the pool for each (red-team round 2). Our queue
+  // cannot grow without bound meanwhile: the dashboard stops writing at the high-water
+  // mark and owes one frame on 'drain', so a busy dashboard still reaches 'drain'.
+  const poll = setInterval(() => { if (stdout.writableLength === 0) later(); }, pollMs);
+  poll.unref?.();
+  stdout.once('drain', later);
+  return false;
+}
+
+/**
+ * Call `cb` once, as soon as the terminal has taken everything queued for it (our
+ * write queue is empty) — polled, since 'drain' fires only after a write crossed the
+ * high-water mark. Returns a cancel function.
+ */
+export function whenTerminalCaughtUp(cb, { stdout = process.stdout, pollMs = 100 } = {}) {
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    clearInterval(poll);
+    stdout.removeListener?.('drain', onDrain);
+    cb();
+  };
+  const onDrain = () => { if (!stdout.writableLength) finish(); };
+  const poll = setInterval(onDrain, pollMs);
+  poll.unref?.();
+  stdout.on?.('drain', onDrain);
+  if (!stdout.writableLength) Promise.resolve().then(finish);
+  return () => { if (done) return; done = true; clearInterval(poll); stdout.removeListener?.('drain', onDrain); };
+}
+
+/**
+ * reclaimRawMode + the update-window measurement (release B, B11): says how long the new
+ * worker took to take the terminal back, or that it was deferred to the terminal's drain
+ * (and how long that took when it finally happened). `now`/`log` are injectable for tests.
+ */
+export async function reclaimRawModeLogged({ stdout = process.stdout, log = m => console.log(`[Maxpool] ${m}`), now = Date.now, ...rest } = {}) {
+  const t0 = now();
+  const done = await reclaimRawMode({
+    stdout, ...rest,
+    onDeferredReclaim: () => log(`reload: terminal reclaimed after drain in ${now() - t0}ms`),
+  });
+  if (done) log(`reload: terminal reclaimed in ${now() - t0}ms`);
+  else log('reload: terminal reclaim deferred to drain');
+  return done;
+}
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
@@ -29,14 +147,16 @@ const vw = s => strip(s).length;
 // ── Accounts-table columns ───────────────────────────────────
 // Fixed column widths shared by the header row (acctHeader) AND every data row, so
 // the header labels stay aligned with the columns they name. The Account/Provider/
-// Status/Quota start offsets (4/25/35/49) are pure functions of these widths + the
-// 4-col row prefix, independent of the quota-bar width.
+// Status/MRst/ARst/Quota start offsets are pure functions of these widths +
+// the 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
-const RESETS_W = 6;        // 'Rst' column — FIXED width (fits '2~21d'); a variable
-                           // width ('0' vs '1~21d') shifted every quota bar per row.
+const MRST_W = 11;         // 'MRst' column (model resets) — FIXED width (fits '2Fable~118d': count AND expiry, owner 2026-11-11);
+                           // a variable width ('0' vs '1~21d') shifted every quota bar per row.
+const ARST_W = 7;          // 'ARst' column (account-level resets) — FIXED width (fits '1~118d?'); owner 2026-11-15: model and
+                           // account resets in ONE mixed cell read as confusing, so they are two aligned columns.
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 
 // Human provider name for the accounts-table "Provider" column. account.provider
@@ -60,8 +180,8 @@ function providerLabel(a) {
 
 /**
  * Aligned column header for the accounts table. Names the three columns that carry
- * NO inline label (Account / Type / Status) plus a group label over the two quota
- * bars (Quota). The per-bar naming (Ses/Wk for OAuth, Tok/Req for API keys) and the
+ * NO inline label (Account / Type / Status) plus a group label over the quota bars
+ * (Quota). The per-bar naming (Ses/Fbl/Wk for OAuth, Tok/Fbl/Req for API keys) and the
  * load fields (Now/15m/1h) stay inline per row — they're row-type-dependent and
  * begin at a variable offset — so the header stops after the Quota group label.
  */
@@ -72,7 +192,8 @@ function acctHeader(W) {
     + 'Where'.padEnd(WHERE_W) + ' '
     + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
-    + 'Rst'.padEnd(RESETS_W) + ' '
+    + 'MRst'.padEnd(MRST_W) + ' '
+    + 'ARst'.padEnd(ARST_W) + ' '
     + quota;
 }
 
@@ -80,6 +201,45 @@ function acctHeader(W) {
 function lpadVis(s, w) {
   const gap = w - vw(s);
   return gap > 0 ? ' '.repeat(gap) + s : s;
+}
+
+/**
+ * Which quota bars fit a terminal W columns wide, and how wide each bar is. The
+ * space before the first bar comes from the column widths above, never from a
+ * hard-coded number (the old number went stale when the reset columns were added).
+ * Each extra bar costs its label gap ("  Fbl " or "  Wk  ") plus one bar width.
+ * Under 70 columns only the session bar shows, 5 to 20 wide; from 70 the weekly
+ * bar joins it, both 5 to 20 wide. The Fable bar joins only once all three can be
+ * 9 wide (118 columns), the narrowest bar that still shows "100% 2d5h", and three
+ * bars stop growing at 11 wide, so the row never passes column 124 and the tags
+ * after the bars (cap, prefer, staleness) keep the room they have with two bars.
+ * Narrower terminals keep today's two bars plus the "Fable NN%" tag.
+ * When no account reports a session window, the session bar is left out: the
+ * weekly bar always shows and the Fable bar joins it from 103 columns.
+ */
+const BAR_START = ROW_PREFIX.length + NAME_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + MRST_W + 1 + ARST_W + 1 + 'Ses '.length;
+const BAR_GAP = '  Wk  '.length;
+const BAR_MIN_W = 5;
+const BAR_MAX_W = 20;
+const FABLE_BAR_MIN_W = 9;
+const THREE_BAR_MAX_W = 11;
+function barLayout(W, showSession = true) {
+  const showBoth = W >= 70 || !showSession;
+  const others = (showSession ? 1 : 0) + (showBoth ? 1 : 0);
+  const showFable = W >= BAR_START + (others + 1) * FABLE_BAR_MIN_W + others * BAR_GAP;
+  const bars = others + (showFable ? 1 : 0);
+  const free = W - BAR_START - (bars - 1) * BAR_GAP;
+  const fit = Math.floor(free / bars);
+  const maxW = bars === 3 ? THREE_BAR_MAX_W : BAR_MAX_W;
+  const bw = Math.max(BAR_MIN_W, Math.min(maxW, fit));
+  return { showSession, showBoth, showFable, bw };
+}
+
+/** True when the account's first bar (Ses, or Tok for an API key) has a reading. */
+function hasSessionReading(a) {
+  const q = a?.quota || {};
+  if (a?.type === 'provider') return q.providerSes != null;
+  return q.unified5h != null || (q.tokensLimit != null && q.tokensRemaining != null);
 }
 
 function rpad(s, w) {
@@ -108,6 +268,11 @@ function truncate(s, w) {
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
+/** Truncate only when too wide (no padding) — for header lines. */
+function truncLine(s, w) {
+  return vw(s) > w ? truncate(s, w) : s;
+}
+
 function fitLine(s, w) {
   const v = vw(s);
   if (v > w) return truncate(s, w);
@@ -199,19 +364,33 @@ function countdown(ts) {
  *  "how long each request takes" is not something the owner acts on. An idle
  *  account renders NOTHING.
  *
- *    2 live · 17 req/hr · 1 failed
+ *    2 live · 17 req/hr · 1 failed · 3 link drops
  *    17 req/hr                 working, idle this second
  *    (blank)                   resting — nothing to say
+ *
+ *  "link drops" (2026-11-12): the link to a team pool gave up, not the account —
+ *  yellow, never folded into "failed".
  */
 function loadText(load) {
   const inflight = load?.current?.inFlight || 0;
   const hourReq = load?.last1h?.requests || 0;
   const failed = load?.last15m?.failed || 0;
-  if (!inflight && !hourReq && !failed) return '';
+  const linkFailed = load?.last15m?.linkFailed || 0;
+  const bounced = load?.last15m?.bounced || 0;
+  const eff = load?.last15m?.efficiency;
+  // Dim below the volume floors (too few turns to mean much). A cloud row's figure is the
+  // serving pool's own, team-wide on that account — tagged (team).
+  const cacheTxt = eff && eff.hit != null ? `cache ${Math.round(eff.hit * 100)}%` : null;
+  const cache = cacheTxt
+    ? `${eff.lowVolume ? dim(cacheTxt) : cacheTxt}${load.last15m.team ? dim(' (team)') : ''}` : null;
+  if (!inflight && !hourReq && !failed && !linkFailed && !bounced && !cache) return '';
   const parts = [];
   if (inflight) parts.push(`${inflight} live`);
   if (hourReq) parts.push(`${hourReq} req/hr`);
+  if (cache) parts.push(cache);
+  if (bounced) parts.push(dim(`${bounced} bounced`));
   if (failed) parts.push(red(`${failed} failed`));
+  if (linkFailed) parts.push(yellow(`${linkFailed} link drop${linkFailed === 1 ? '' : 's'}`));
   return parts.join(' · ');
 }
 
@@ -425,6 +604,22 @@ function emptyBar(label, w = 10) {
   return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
 }
 
+/**
+ * The "Fbl" bar: one model family's weekly limit, which Anthropic counts separately
+ * from the account-wide weekly. Drawn with the same bar() as Ses and Wk, so it reads
+ * the same way (used% and time to reset). Shows the empty dash cell when there is
+ * nothing to show: a provider row, no probe result yet, or a limit Anthropic marks
+ * as inactive. Routing
+ * and the "Fable NN%" tag ignore an inactive limit too, so the bar stays quiet as well.
+ */
+function scopedWeeklyBar(quota, family, w) {
+  const e = quota?.scopedWeekly?.[family];
+  // is_active=false still carries a REAL reading (percent + reset days out): the
+  // limit exists and counts. Only a MISSING reading dashes.
+  if (!e || e.utilization == null) return emptyBar('—', w);
+  return bar(e.utilization, w, e.resetAt);
+}
+
 /** Write a provider's enabled flag into the CONFIG entry `loadConfigProviders` reads.
  *
  *  A config-sourced provider is re-created from config on every reload
@@ -446,7 +641,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -454,15 +649,42 @@ function timestamp() {
 
 // ── TUI class ────────────────────────────────────────────────
 
+/** Compact plan cell: "Max Q $134/mo". '--' when no plan is configured (no guessing). */
+function planLabel(plan) {
+  if (!plan) return '--';
+  const cad = { monthly: 'M', quarterly: 'Q', annual: 'A', annually: 'A', yearly: 'A' }[plan.cadence] || '';
+  const tier = (plan.tier || '').replace(/^(claude|glm coding)\s+/i, '');
+  const monthly = plan.priceUsd != null && plan.billingMonths ? plan.priceUsd / plan.billingMonths : null;
+  return [tier, cad, monthly != null ? `$${Math.round(monthly)}/mo` : ''].filter(Boolean).join(' ') || '--';
+}
+
+/** Where a finished browser login goes. mirror → that team pool; a brand-new
+ *  account (no mirror, not already local) with a keyed linked pool → ask (first
+ *  keyed link); else local. */
+export function decideLoginTarget({ mirror, links, existing, accountUuid }) {
+  if (mirror) return { kind: 'mirror', mirror };
+  if (existing) return { kind: 'local' };
+  const link = (Array.isArray(links) ? links : []).find(l => l && l.url && l.key);
+  if (!link) return { kind: 'local' };
+  // The team pool dedupes by account id; without it a re-login would ADD a duplicate.
+  if (!accountUuid) return { kind: 'no-uuid' };
+  return { kind: 'ask-team', link };
+}
+
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, controlService = null, onQuit, onRestart }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, controlService = null, onQuit, onRestart, spawnDetached }) {
     this.am = accountManager;
+    // Runs the tmux detach for q in service mode; a seam so tests never start tmux.
+    this._spawnDetached = spawnDetached || ((cmd, args) => {
+      try { spawn(cmd, args, { stdio: 'ignore', detached: true }).on('error', () => {}).unref(); } catch { /* no tmux */ }
+    });
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.control = controlService;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
+    this._startedAt = Date.now();   // the efficiency line's "since restart" window
     // Set by index.js after construction (a deferred closure, not a constructor literal —
     // avoids the const TDZ on applyUpdateIfReady, which is defined after `new TUI`).
     this.checkNow = null;
@@ -490,24 +712,60 @@ export class TUI {
     this.timer = null;
     this._origLog = null;
     this._origErr = null;
+    // Terminal output state (2026-11-12 freeze fix): _nb = stdout made non-blocking by
+    // start(); _renderTimer = the one scheduled coalesced render; _lastFrame /
+    // _lastFullWriteAt = what the terminal last got and when; _forceNext = the next
+    // frame must be sent even if unchanged; _drainArmed = one 'drain' listener pending.
+    this._nb = false;
+    this._renderTimer = null;
+    this._lastRenderAt = 0;
+    this._lastFrame = null;
+    this._lastFullWriteAt = 0;
+    this._forceNext = false;
+    this._drainArmed = false;
+    this._onDrain = () => { this._drainArmed = false; if (this.running) this.render(); };
   }
 
   // ── lifecycle ──────────────────────────────────────
 
-  start() {
-    try {
-      process.stdin.setRawMode(true);
-    } catch (err) {
-      process.stderr.write(`[alPool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
-      return false;
+  /** `rawWhenDrained` (a worker that is already serving — reload takeover, a respawn):
+   *  enter raw mode only once the terminal has taken our first frame. setRawMode is
+   *  tcsetattr(TCSADRAIN) and blocks the WHOLE process until the terminal has read
+   *  everything queued; on a terminal that is not reading that is forever, and the port
+   *  goes dead with it (2026-11-13). So the dashboard is drawn non-blocking first and the
+   *  mode switch waits for the terminal (reclaimRawMode) — the keyboard, not the serving,
+   *  is what a stalled terminal delays. A terminal that took the frame at once gets raw
+   *  mode synchronously, so a broken one still falls back to plain logs (returns false). */
+  start({ rawWhenDrained = false, modeSwitcher = null } = {}) {
+    const rawError = err => `[Maxpool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`;
+    if (rawWhenDrained) {
+      if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== 'function') {
+        process.stderr.write(rawError({ message: 'stdin is not a terminal' }));
+        return false;
+      }
+    } else {
+      try {
+        process.stdin.setRawMode(true);
+      } catch (err) {
+        process.stderr.write(rawError(err));
+        return false;
+      }
     }
 
     this.running = true;
+    // Never block the pool on its own terminal (2026-11-12): Node writes a TTY
+    // synchronously, so a terminal that fell behind stopped EVERY request for up to 60s.
+    // Real TTYs only (r2 S3); a later stop() leaves it non-blocking (the exit path alone
+    // turns blocking back on — writeTerminalSync).
+    if (!this._nb && isatty(process.stdout.fd) && typeof process.stdout._handle?.setBlocking === 'function') {
+      process.stdout._handle.setBlocking(false);
+      this._nb = true;
+    }
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
-    this._resizeHandler = () => this.render();
+    this._resizeHandler = () => this.forceRender();
     process.stdin.on('data', this._dataHandler);
     process.stdout.on('resize', this._resizeHandler);
 
@@ -517,35 +775,123 @@ export class TUI {
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
 
-    this.render();
+    this.forceRender();
     this.timer = setInterval(() => {
       this.frame = (this.frame + 1) % SPINNER.length;
-      this.render();
+      this.requestRender();
     }, 500);
+    if (rawWhenDrained && modeSwitcher) {
+      // Off this thread (terminal-mode.js): the pool keeps serving however long the
+      // terminal takes to read. Without a helper (no controlling terminal) fall back.
+      modeSwitcher.setRaw(true).then(r => {
+        if (r.ok) {
+          if (r.ms >= 100) appendEventLog(`[Maxpool] TUI: keyboard ready after the terminal caught up (${r.ms}ms)`);
+          return;
+        }
+        if (!this.running) return;
+        appendEventLog(`[Maxpool] TUI: terminal helper unavailable (${r.error}); keyboard waits for the terminal to read`);
+        reclaimRawMode({ flush: o => this.flushOutput(o), guard: () => this.running }).catch(() => {});
+      }).catch(() => {});
+    } else if (rawWhenDrained) {
+      if (!process.stdout.writableLength) {
+        // The terminal took the whole frame: it is reading, so the drain wait is short.
+        try {
+          process.stdin.setRawMode(true);
+        } catch (err) {
+          this.stop({ keepRaw: true });
+          console.error(rawError(err).trim());
+          return false;
+        }
+      } else {
+        reclaimRawMode({ flush: o => this.flushOutput(o), guard: () => this.running })
+          .then(now => { if (!now) appendEventLog('[Maxpool] TUI: keyboard waits for the terminal to read (raw mode deferred to drain)'); })
+          .catch(() => {});
+      }
+    }
     return true;
   }
 
-  stop() {
+  /** Stop drawing frames (no more renders, no drain wake-up) and stop taking keys, so
+   *  nothing typed during a hand-off wait acts; the screen stays as is. */
+  _haltRendering() {
     this.running = false;
+    if (this._dataHandler) process.stdin.removeListener('data', this._dataHandler);
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
+    if (this._drainArmed) { process.stdout.removeListener('drain', this._onDrain); this._drainArmed = false; }
+  }
+
+  /** `exiting`: called from the process-exit path — the exit sequence must be written
+   *  synchronously or it is lost with the non-blocking stream's queue (r2 B1).
+   *  `keepRaw`: leave the terminal's raw mode as is. Node switches it with
+   *  tcsetattr(TCSADRAIN), which BLOCKS the whole process until the terminal has read
+   *  everything already sent (measured: 2.8s for a terminal that read nothing for 3s) —
+   *  so a process that keeps serving after stop() must not switch it while the
+   *  terminal may be behind. */
+  stop({ exiting = false, keepRaw = false } = {}) {
+    this._haltRendering();
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     process.stdin.removeListener('data', this._dataHandler);
     process.stdout.removeListener('resize', this._resizeHandler);
-    process.stdout.write(`${ESC}?25h${ESC}?1049l`);
-    try { process.stdin.setRawMode(false); } catch {}
+    if (exiting) writeTerminalSync(EXIT_SEQ);
+    else process.stdout.write(EXIT_SEQ);
+    if (!keepRaw) { try { process.stdin.setRawMode(false); } catch {} }
     process.stdin.pause();
+  }
+
+  /** Give the terminal up to someone else (a self-update's new worker, a login prompt)
+   *  while this process keeps running (r2 B2): let the frames a slow terminal is still
+   *  taking land, then the exit sequence, each bounded by timeoutMs — so the next
+   *  writer never interleaves with our queue, and blocking is never turned back on. */
+  async handOff({ timeoutMs = 1500, flushing = null, keepRaw = false } = {}) {
+    await (flushing || this.beginHandOff({ timeoutMs }));
+    this.stop({ keepRaw });
+    await this.flushOutput({ timeoutMs });
+  }
+
+  /** First half of handOff, started early so the terminal catches up while the caller
+   *  does other work: stop drawing and taking keys, and return the flush (pass it to
+   *  handOff as `flushing`). Gate on that promise — `running` is already false. */
+  beginHandOff({ timeoutMs = 1500 } = {}) {
+    this._haltRendering();
+    return this.flushOutput({ timeoutMs });
+  }
+
+  /** Resolve once the terminal has taken everything queued for it: true when drained,
+   *  false at timeoutMs. 'drain' fires only after a write hit the high-water mark, so
+   *  the queue length is polled too. */
+  flushOutput({ timeoutMs = 1500 } = {}) {
+    const out = process.stdout;
+    if (!out.writableLength) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const finish = drained => {
+        clearTimeout(deadline); clearInterval(poll);
+        out.removeListener('drain', onDrain);
+        resolve(drained);
+      };
+      const onDrain = () => { if (!out.writableLength) finish(true); };
+      const deadline = setTimeout(() => finish(false), timeoutMs);
+      const poll = setInterval(onDrain, 25);
+      out.on('drain', onDrain);
+    });
   }
 
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
-    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null, caller: info.caller || null });
-    this.render();
+    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null, caller: info.caller || null, conversation: info.conversation || null });
+    this.requestRender();
   }
 
   onRequestRouted(id, info) {
     const r = this.active.get(id);
     if (r) r.account = info.account;
+  }
+
+  /** First response byte reached the client (server.js markFirstByte). */
+  onRequestFirstByte(id) {
+    const r = this.active.get(id);
+    if (r && r.firstByteAt == null) r.firstByteAt = Date.now();
   }
 
   onRequestEnd(id, info) {
@@ -562,8 +908,35 @@ export class TUI {
     // then `ps eww -p <pid> | grep x-maxpool-session` to find the terminal. Truthiness
     // guard — a header-less request has sessionKey '' (server.js headerValue) → no tag.
     const isProvider = this.am.accounts.find(a => a.name === acct)?.type === 'provider';
-    const tag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
-    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tag}`);
+    // Turn tags (2026-11-08): [sess <terminal>] on provider rows (unchanged), and
+    // [cv <conversation> <terminal>] on every row — the exact join a cache analysis
+    // needs between a transcript turn and the ACCOUNT that served it (previously
+    // only a timestamp window, too noisy to separate an account switch from cache
+    // expiry; peer audit 2026-11-08). Short: log stays scannable.
+    const provTag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
+    const cv = info.conversation || r?.conversation;
+    const cvTag = cv ? `  [cv ${cv.slice(0, 8)} ${String(info.sessionKey || r?.sessionKey || '').slice(0, 8)}]` : '';
+    // ttfb LAST: the UPSTREAM wait of the attempt that served — its fetch resolve
+    // minus its own forward start (D, 2026-11-10). Never measured from arrival:
+    // that would add queue wait and earlier failover attempts. Falls back to the
+    // client-write stamp from arrival when no upstream pair exists (a request that
+    // never reached upstream, the link path). Omitted when no byte was ever sent.
+    let ttfbMs = null;
+    if (info.firstUpstreamByteAt != null && info.upstreamForwardStartAt != null) {
+      ttfbMs = info.firstUpstreamByteAt - info.upstreamForwardStartAt;
+    } else if (r?.firstByteAt != null) {
+      ttfbMs = r.firstByteAt - r.started;
+    }
+    const ttfbTag = ttfbMs != null ? ` ttfb=${(Math.max(0, ttfbMs) / 1000).toFixed(1)}s` : '';
+    // B8: ' ns' = a non-streaming request (strict false: the oauth relay carries no shape, so no tag).
+    const nsTag = info.stream === false ? ' ns' : '';
+    // The served attempt's cache figures (~25B, well inside the 480B line cap): whether
+    // the cache held is the one thing a request line could not say (#642 port).
+    const cacheLabel = cacheUsageLabel(info.cacheUsage);
+    const cacheTag = cacheLabel ? ` ${CACHE_PAINT[cacheUsageState(info.cacheUsage)](cacheLabel)}` : '';
+    // ttfb= stays the LAST field — the request-line contract (reset-count-stale-and-ttfb
+    // test 13); the cache tag goes just before it.
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${nsTag}${provTag}${cvTag}${cacheTag}${ttfbTag}`);
   }
 
   _addLog(msg) {
@@ -573,7 +946,8 @@ export class TUI {
     appendEventLog(msg);
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
-    if (this.running) this.render();
+    // Scheduled, not drawn: a burst of N lines is ONE frame (was N full screens).
+    this.requestRender();
   }
 
   // ── input handling ─────────────────────────────────
@@ -609,7 +983,7 @@ export class TUI {
         .split('')
         .filter(c => c >= ' ' && c !== '\x7f')
         .join('');
-      if (typed) { this.inputBuf += typed; this.render(); }
+      if (typed) { this.inputBuf += typed; this.forceRender(); }
       if (nlIdx !== -1) { this._pendingPaste = ''; return this._key('enter'); }
       return;
     }
@@ -633,11 +1007,22 @@ export class TUI {
       case 'input':  this._keyInput(k); break;
       case 'confirm': this._keyConfirm(k); break;
     }
-    this.render();
+    this.forceRender();
+  }
+
+  /** Close every viewer of the service dashboard (viewers are view-only); the pool
+   *  keeps running. `-s pool` detaches all clients of the session, deterministically. */
+  detachView() {
+    const sock = process.env.MAXPOOL_TMUX_SOCK;
+    this._spawnDetached('tmux', [...(sock ? ['-S', sock] : []), 'detach-client', '-s', 'pool']);
   }
 
   _keyNormal(k) {
-    if (k === 'q') {
+    if (k === 'q' && serviceMode()) {
+      // Under the background service the pool lives in a tmux pane launchd owns:
+      // stopping it here would only make launchd cold-restart it. q closes the view.
+      this.detachView();
+    } else if (k === 'q') {
       this._confirm(
         'Stop alPool?',
         'New requests will stop; active requests will drain before the server exits.',
@@ -705,14 +1090,14 @@ export class TUI {
       if (!this.checkNow) { this._addLog('Update check unavailable on this worker'); return; }
       if (this.updateBusy) return;                       // already running
       this.updateBusy = 'Checking for updates…';
-      this.render();
+      this.forceRender();
       Promise.resolve(this.checkNow())
         .catch(() => {})
         .finally(() => {
           // If an update was found+applied, the seamless reload replaces this worker and
           // this never renders. Otherwise report the outcome in place.
           this.updateBusy = null;
-          if (this.mode === 'updates') this.render();
+          if (this.mode === 'updates') this.forceRender();
         });
     } else if (k === 't') {
       this._toggleAutoUpdate();
@@ -793,6 +1178,87 @@ export class TUI {
     return ` Routing  ${cyan(routing)}${xpText}`;
   }
 
+  /** EFFICIENCY line (2026-11-15), directly under Routing: is the prompt cache holding,
+   *  and what are moves costing — Claude and GLM never blended. null with no traffic.
+   *  Colours are WARN-only proposals until a one-day baseline exists; a red names the
+   *  cause and the account. */
+  _efficiencyLine(W = 80, now = Date.now()) {
+    const eff = this.am.efficiencyOverall?.('last15m', now);
+    if (!eff) return null;
+    const { claude: c, glm: g } = eff;
+    const served = c.served + g.served;
+    const bounced = c.bounced + g.bounced;
+    if (served + bounced === 0) return null;
+    const sinceMs = now - (this._startedAt ?? now);
+    const since = sinceMs < 15 * 60_000 ? dim(`  since restart ${Math.max(1, Math.round(sinceMs / 60_000))}m`) : '';
+    if (c.lowVolume && g.lowVolume) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
+    const pctTxt = x => `${Math.round(x * 100)}%`;
+    const parts = [];
+    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}`);
+    if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)}`);
+    const miss = c.missTokens + g.missTokens;
+    parts.push(`miss ${miss >= 1e6 ? `${(miss / 1e6).toFixed(1)}M` : `${Math.round(miss / 1000)}k`} tok`);
+    const cause = k => c.movedByCause[k] + g.movedByCause[k];
+    const per100 = n => (served ? Math.round(n * 100 / served) : 0);
+    parts.push(`moves ${per100(c.moved + g.moved)}/100 (busy ${cause('busy')} · balance ${cause('balance')} · wall ${cause('wall')}${cause('link') ? ` · link ${cause('link')}` : ''}${cause('other') ? ` · other ${cause('other')}` : ''})`);
+    const bounceShare = bounced / (served + bounced);
+    if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
+    const waited = c.waited + g.waited;
+    if (waited) parts.push(`waited ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
+
+    // RED — the first cause that applies, named with the account behind it.
+    const forced = cause('busy') + cause('wall') + cause('link');
+    const wtm = c.waitThenMoved + g.waitThenMoved;
+    let red_ = null;
+    if (!c.lowVolume && c.hit != null && c.hit < 0.5) red_ = `Claude ${pctTxt(c.hit)} on ${this._worstCacheAccount() || '?'}`;
+    else if (per100(forced) > 2) red_ = `${per100(forced)} forced moves/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
+    else if (bounceShare > 0.1) red_ = `${pctTxt(bounceShare)} bounced — most on ${this._mostBouncedAccount(now) || '?'}`;
+    else if (wtm * 100 / Math.max(1, served) > 0.5) red_ = `${wtm} waits still moved — on ${this._mostBouncedAccount(now) || '?'}`;
+    if (red_) return truncLine(` ${red('Cache')}    ${red(`⚠ ${red_}`)} ${dim('·')} ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+    // YELLOW — Claude below 70%, drifting 15+ points under its hour, or waits are common.
+    const hour = this.am.efficiencyOverall('last1h', now).claude;
+    const drift = !c.lowVolume && !hour.lowVolume && c.hit != null && hour.hit != null && hour.hit - c.hit >= 0.15;
+    const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7) || drift || waited > 0.25 * served;
+    return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+  }
+
+  /** The Claude row with the lowest cache share in the window (enough volume only). */
+  _worstCacheAccount() {
+    let worst = null;
+    for (const a of this.am.accounts) {
+      if (a.enabled === false || a.type === 'provider') continue;
+      const e = this._accountLoad(a)?.last15m?.efficiency;
+      if (e && !e.lowVolume && e.hit != null && (!worst || e.hit < worst.hit)) worst = { name: a.name, hit: e.hit };
+    }
+    return worst?.name || null;
+  }
+
+  /** The row with the most pinned refusals (bounces) seen by this pool in the window. */
+  _mostBouncedAccount(now = Date.now()) {
+    let best = null;
+    for (const a of this.am.accounts) {
+      const n = this.am._loadSummary(a, 15 * 60_000, now).bounced;
+      if (n > 0 && (!best || n > best.n)) best = { name: a.name, n };
+    }
+    return best?.name || null;
+  }
+
+  /** One line per unreachable team pool, so a lost connection reads as ONE cause
+   *  instead of every cloud row turning red. '' lines are skipped by the caller. */
+  _cloudLinkLines(W = 80, now = Date.now()) {
+    const out = [];
+    for (const l of this.am.poolLinks || []) {
+      if (!l.lastError && l.lastOkAt != null) continue;
+      const since = l.downSince ?? l.lastOkAt;
+      const forTxt = since ? ` for ${formatAge(now - since)}` : '';
+      const synced = l.lastOkAt ? ` · last synced ${new Date(l.lastOkAt).toLocaleTimeString()}` : '';
+      const why = l.lastOkAt == null && !l.lastError ? 'connecting…' : describeLinkError(l.lastError);
+      const line = ` Cloud    ${yellow(`⟐ ${l.name} unreachable${forTxt}`)} ${dim('—')} ${why}${dim(`. Cloud accounts paused; local accounts still serving${synced}.`)}`;
+      out.push(fitLine(line, W));
+    }
+    return out;
+  }
+
   _renderUpdatesDetail() {
     const v = this.am.versionInfo;
     const running = v?.current ? `v${v.current}` : 'unknown';
@@ -867,7 +1333,7 @@ export class TUI {
     } else if (k === 'l') {
       this._confirm(
         'Log in / re-authenticate via browser?',
-        'Opens a browser. Logging into an account that\'s already added RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Otherwise a new account is added.',
+        'Opens a browser. Logging into an account that\'s already added (same user, same organization) RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Another organization of the same user, or a new user, is added as a new account.',
         () => this._doLogin(),
       );
     } else if (k === 'n' && this.am.accounts.length > 0) {
@@ -907,7 +1373,7 @@ export class TUI {
       this.mode = 'accounts';
       this._confirm(
         'Log in / re-authenticate via browser?',
-        'Opens a browser. Logging into an account that is already added RE-AUTHENTICATES it in place — no duplicate.',
+        'Opens a browser. Logging into an account that is already added (same user, same organization) RE-AUTHENTICATES it in place — no duplicate. Another organization of the same user is added as a new account.',
         () => this._doLogin(),
       );
       return;
@@ -939,7 +1405,7 @@ export class TUI {
     const looksLikeSecretName = /^[A-Z][A-Z0-9_-]{2,60}$/.test(input) && !input.includes('.');
     if (!looksLikeSecretName) return input;   // a pasted key
     this._addLog(`Resolving GCP secret "${input}"…`);
-    this.render();
+    this.forceRender();
     try {
       const { resolveSecret } = await import('../secret-resolver.js');
       const v = await resolveSecret(input);
@@ -1041,7 +1507,7 @@ export class TUI {
     this.mode = 'accounts';
     if (secretName) this._addLog(`Resolving secret "${secretName}" from GCP…`);
     else this._addLog(`Adding "${name}" with direct API key…`);
-    this.render();
+    this.forceRender();
     try {
       let token = null;
       if (secretName) {
@@ -1104,6 +1570,10 @@ export class TUI {
       // mode — under balance/prefer-* the mode itself controls eligibility. Still
       // safe to set (it'll apply if you switch back to sticky).
       this._cycleProviderClaudeFallback(k === 'g' ? 'zai' : 'kimi');
+    } else if (k === 'b' || k === 'B') {
+      // STICKY BUSY WAIT (2026-11-15): how long a conversation waits for its own busy
+      // account before moving (a move re-writes its whole prompt cache).
+      this._cycleStickyBusyBudget();
     } else if (k === 'w' || k === 'W') {
       // WEEKLY-AWARE SCORING (2026-09-16): fold weekly utilization into the routing
       // score, not just the 5h session. Without it, an account at 89% weekly with a
@@ -1229,6 +1699,42 @@ export class TUI {
     this._addLog(next
       ? 'Weekly-aware routing: ON — accounts near their weekly limit rank last, all day'
       : 'Weekly-aware routing: OFF — score sees only the 5h session window again');
+  }
+
+  static STICKY_BUSY_STEPS = [15_000, 30_000, 60_000, 120_000, 0];
+
+  _stickyBusyLabel() {
+    // The value IN FORCE — the server's own resolver, so an env override shows as such.
+    const { ms, fromEnv } = resolveStickyBusyBudget(this.am.scheduler);
+    const txt = ms > 0 ? `${Math.round(ms / 1000)}s` : 'off';
+    return fromEnv ? `${txt} (env)` : txt;
+  }
+
+  /** Cycle the busy-account wait. Live: the server reads it per request, so the next
+   *  request uses the new value; saved so it survives a restart. */
+  async _cycleStickyBusyBudget() {
+    if (resolveStickyBusyBudget(this.am.scheduler).fromEnv) {
+      // Saving a setting the server ignores would make the screen lie about the wait.
+      this._addLog('Wait for busy account is pinned by MAXPOOL_STICKY_BUSY_BUDGET_MS — unset it to change it here');
+      return;
+    }
+    const steps = TUI.STICKY_BUSY_STEPS;
+    const cur = this.am.scheduler.stickyBusyBudgetMs ?? 60_000;
+    const next = steps[(steps.indexOf(cur) + 1) % steps.length];
+    this.am.scheduler.stickyBusyBudgetMs = next;
+    const prevSched = this.config.scheduler;
+    this.config.scheduler = { ...(prevSched || {}), stickyBusyBudgetMs: next };
+    try {
+      await this.saveConfig(this.config);
+    } catch (e) {
+      this.am.scheduler.stickyBusyBudgetMs = cur;
+      this.config.scheduler = prevSched;
+      this._addLog(`Could not save: ${e.message}`);
+      return;
+    }
+    this._addLog(next > 0
+      ? `Wait for busy account: up to ${Math.round(next / 1000)}s before a conversation moves to another account`
+      : 'Wait for busy account: off — a busy account moves the conversation at once');
   }
 
   async _cycleRoutingMode() {
@@ -1453,19 +1959,21 @@ export class TUI {
   }
 
   // Browser OAuth login — the SAME flow re-authenticates an existing account (matched
-  // by accountUuid) or adds a new one. When the login is for an account already added,
+  // by user + organization) or adds a new one. When the login is for an account already added,
   // we say so, keep its name, and skip the "name this account" prompt — so it's clear
   // it's a RE-AUTH in place (revives a dead-refresh/reauth account), not a duplicate.
   async _doLogin() {
     const wasRunning = this.running;
-    if (wasRunning) this.stop();
     // Mute the console-log MIRROR to stdout during the interactive prompt so routing
     // logs (console.log, e.g. the glm-fallback 429 churn) don't flood over the readline
     // "Name this account" prompt. The prompts + errors use process.stdout.write, which
     // BYPASSES the mirror, so they stay visible. Login runs only on the terminal-owning
-    // primary (mirror baseline false), so the finally restores it to false.
+    // primary (mirror baseline false), so the finally restores it to false. Muted BEFORE
+    // the hand-off: its stop() hands console.log back to the mirror while the second
+    // flush still waits, and those lines would print onto the user's normal screen.
     setConsoleStdoutSuppressed(true);
     try {
+      if (wasRunning) await this.handOff();   // r2 B2: bounded flush + exit sequence before the prompt
       process.stdout.write('\nOpening browser to log into Claude…\n');
       const creds = await loginOAuth();
       const profile = await fetchProfile(creds.accessToken);
@@ -1474,35 +1982,7 @@ export class TUI {
       // there — never persisted locally (single writer: one account, one home).
       // Same keystroke as a local re-auth; the routing is by where the account
       // lives, so nothing is selected and no menu appears.
-      const mirror = this._findRemoteMirrorFor(profile);
-      if (mirror) {
-        setConsoleStdoutSuppressed(false);
-        await this._sendLoginToRemote(mirror, creds, profile);
-        return;
-      }
-      const existing = this._findExistingOAuthAccount(profile);
-      let name;
-      if (existing) {
-        process.stdout.write(`\nThis Claude account is already added as "${existing.name}" — re-authenticating it in place (no duplicate).\n`);
-        name = existing.name;
-      } else {
-        const suggested = profile?.email
-          || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
-        const answer = await new Promise(resolve => rl.question(`Name this NEW account [${suggested}]: `, resolve));
-        rl.close();
-        name = String(answer || '').trim() || suggested;
-      }
-      // Lift the mute BEFORE the upsert so its persist-confirmation (a console.log,
-      // deliberately visible during the stopped-TUI login) reaches the user.
-      setConsoleStdoutSuppressed(false);
-      // Message honors the ACTUAL result: if a manually-typed name collided with a
-      // different existing account, upsert updates in place → "Re-authenticated", never
-      // a false "Added new account".
-      const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
-      process.stdout.write(updated
-        ? `\nRe-authenticated "${name}". Returning to alPool…\n`
-        : `\nAdded new account "${name}". Returning to alPool…\n`);
+      await this._routeLogin(creds, profile);
     } catch (e) {
       if (isLoginCancelled(e)) {
         process.stdout.write('\nLogin cancelled.\n');
@@ -1515,12 +1995,79 @@ export class TUI {
     }
   }
 
+  // Where a finished browser login goes. Pure decision (see decideLoginTarget):
+  // a mirror match → that team pool; a brand-new account with a linked team pool →
+  // ask once (default team pool); otherwise the local save path.
+  async _routeLogin(creds, profile) {
+    const mirror = this._findRemoteMirrorFor(profile);
+    const existing = mirror ? null : await this._matchLogin(profile);
+    const decision = decideLoginTarget({ mirror, links: this.am.poolLinks, existing, accountUuid: profile?.accountUuid });
+    if (decision.kind === 'no-uuid') {
+      setConsoleStdoutSuppressed(false);
+      process.stdout.write("\nCould not read this account's id — the team pool needs it. Nothing was saved; try again.\n");
+      return;
+    }
+    if (decision.kind === 'mirror') {
+      setConsoleStdoutSuppressed(false);
+      await this._sendLoginToRemote(decision.mirror, creds, profile);
+      return;
+    }
+    let name;
+    if (existing) {
+      process.stdout.write(`\nThis Claude account is already added as "${existing.name}" — re-authenticating it in place (no duplicate).\n`);
+      name = existing.name;
+    } else {
+      const sibling = this._oauthAccounts().find(a => sameUser(a, profile));
+      if (sibling) process.stdout.write(`\nSame Claude user as "${sibling.name}": adding a second account.\n`);
+      const suggested = suggestAccountName(this.config.accounts, profile);
+      let toTeam = false;
+      if (decision.kind === 'ask-team') {
+        const where = String(await this._ask(`\nThis is a new account. Add it to the team pool "${decision.link.name}" (recommended) or this laptop only? [T/l]: `) || '').trim().toLowerCase();
+        toTeam = where !== 'l';
+      }
+      const answer = await this._ask(`Name this NEW account [${suggested}]: `);
+      name = String(answer || '').trim() || suggested;
+      if (toTeam) {
+        setConsoleStdoutSuppressed(false);
+        await this._sendLoginToTarget(
+          { url: decision.link.url, key: decision.link.key, linkName: decision.link.name },
+          name, creds, profile, { newAccount: true });
+        return;
+      }
+    }
+    // Lift the mute BEFORE the upsert so its persist-confirmation (a console.log,
+    // deliberately visible during the stopped-TUI login) reaches the user.
+    setConsoleStdoutSuppressed(false);
+    // Message honors the ACTUAL result: if a manually-typed name collided with a
+    // different existing account, upsert updates in place → "Re-authenticated", never
+    // a false "Added new account".
+    const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
+    process.stdout.write(updated
+      ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
+      : `\nAdded new account "${name}". Returning to maxpool…\n`);
+  }
+
+  // One readline question → answer string.
+  async _ask(question) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise(resolve => rl.question(question, resolve));
+    rl.close();
+    return answer;
+  }
+
   // The browser login belongs to a linked team pool iff a mirror row carries the
   // same account uuid (M2: mirrors hold remoteUuid, never accountUuid, so a
   // uuid-first matcher cannot alias onto a local account).
   _findRemoteMirrorFor(profile) {
     if (!profile?.accountUuid) return null;
-    return this.am.accounts.find(a => a.remote && a.remoteUuid === profile.accountUuid) || null;
+    // Exact match first (user + org). A mirror whose org is unknown (the cloud
+    // pool saved the account before organizations were recorded) still owns the
+    // login when it is the only same-user mirror: re-authenticate it rather than
+    // add a second row. Two known orgs never alias.
+    const mirrors = this.am.accounts.filter(a => a.remote && a.enabled !== false && sameUser({ accountUuid: a.remoteUuid }, profile));
+    return mirrors.find(a => sameAccountIdentity({ accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid }, profile))
+      || (profile.organizationUuid && mirrors.filter(a => !a.remoteOrganizationUuid).length === 1
+        ? mirrors.find(a => !a.remoteOrganizationUuid) : null);
   }
 
   // Send a fresh browser login to the linked team pool that OWNS this account
@@ -1529,36 +2076,23 @@ export class TUI {
   async _sendLoginToRemote(mirror, creds, profile) {
     const remote = mirror.remote;
     const name = remote.remoteName || mirror.name;
-    process.stdout.write(`\n"${name}" lives in the team pool (${remote.linkName}) — sending the fresh login there…\n`);
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 20_000);
-    try {
-      const res = await fetch(`${String(remote.url).replace(/\/+$/, '')}/maxpool/accounts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': remote.key || '' },
-        body: JSON.stringify({
-          account: {
-            name, type: 'oauth',
-            accountUuid: profile?.accountUuid,
-            accessToken: creds.accessToken,
-            refreshToken: creds.refreshToken,
-            expiresAt: creds.expiresAt,
-            source: 'remote-login',
-          },
-        }),
-        signal: ctl.signal,
-      });
-      const json = await res.json().catch(() => ({}));
-      if (res.ok && json.ok) {
-        process.stdout.write(`\nDone: "${name}" ${json.result === 'added' ? 'added to' : 're-authenticated in'} the team pool. Nothing was saved on this laptop.\n`);
-        this._addLog(`Remote login: "${name}" → team pool ${remote.linkName} (${json.result})`);
-      } else {
-        process.stdout.write(`\nTeam pool rejected the login (HTTP ${res.status}: ${json?.message || json?.error || 'unknown error'}). NOTHING was saved on this laptop — not retried locally.\n`);
-      }
-    } catch (e) {
-      process.stdout.write(`\nCould not reach the team pool (${e?.name === 'AbortError' ? 'timed out' : e?.message}). NOTHING was saved on this laptop — try again in a moment.\n`);
-    } finally {
-      clearTimeout(t);
+    return this._sendLoginToTarget(remote, name, creds, profile, { newAccount: false });
+  }
+
+  // Shared sender. target = {url, key, linkName}. Same single-writer rule for a
+  // NEW account: a failure never falls back to a local save.
+  async _sendLoginToTarget(remote, name, creds, profile, { newAccount }) {
+    process.stdout.write(newAccount
+      ? `\nSending new account "${name}" to the team pool (${remote.linkName})…\n`
+      : `\n"${name}" lives in the team pool (${remote.linkName}) — sending the fresh login there…\n`);
+    const r = await sendLoginToPool({ url: remote.url, key: remote.key, name, profile, creds });
+    if (r.ok) {
+      process.stdout.write(`\nDone: "${name}" ${r.result === 'added' ? 'added to' : 're-authenticated in'} the team pool${newAccount ? ` (${remote.linkName})` : ''}. Nothing was saved on this laptop.\n`);
+      this._addLog(`Remote login: "${name}" → team pool ${remote.linkName} (${r.result})`);
+    } else if (r.kind === 'unreachable') {
+      process.stdout.write(`\n${r.error}. NOTHING was saved on this laptop — try again in a moment.\n`);
+    } else {
+      process.stdout.write(`\n${r.error}. NOTHING was saved on this laptop — not retried locally.\n`);
     }
   }
 
@@ -1660,24 +2194,23 @@ export class TUI {
   }
 
   // Upsert an OAuth account into config + the running manager. Dedupes by
-  // accountUuid, then name. Shared by import and browser login.
+  // user + organization, then name. Shared by import and browser login.
   async _upsertOAuthAccount({ creds, profile, name, source, verb = 'Added' }) {
-    if (!name) {
-      name = profile?.email
-        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
-    }
+    if (!name) name = suggestAccountName(this.config.accounts, profile);
     const entry = {
       name, type: 'oauth', source,
       accountUuid: profile?.accountUuid || null,
+      organizationUuid: profile?.organizationUuid || null,
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
     };
 
-    let idx = entry.accountUuid
-      ? this.config.accounts.findIndex(a => a.accountUuid === entry.accountUuid)
-      : -1;
-    if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+    // Identity first; the name only picks up rows that cannot carry an identity
+    // (saved before uuids were stored). A row of the SAME USER with a KNOWN,
+    // DIFFERENT organization never matches by name: its tokens are its own.
+    let idx = this.config.accounts.findIndex(a => sameAccountIdentity(a, entry));
+    if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name && !knownDifferentOrg(a, entry));
 
     if (idx >= 0) {
       const previous = this.config.accounts[idx];
@@ -1692,13 +2225,14 @@ export class TUI {
       // heal disk (persistTokenRefresh's generation guard skips a disk token that
       // != _refreshedFrom), so disk must be made correct right here.
       const amAcct = this.am.accounts.find(account =>
-        (entry.accountUuid && account.accountUuid === entry.accountUuid) || account.name === name
+        sameAccountIdentity(account, entry) || (account.name === name && !knownDifferentOrg(account, entry))
       );
       if (amAcct) {
         amAcct.credential = creds.accessToken;
         amAcct.refreshToken = creds.refreshToken;
         amAcct.expiresAt = creds.expiresAt;
         amAcct.accountUuid = entry.accountUuid;
+        amAcct.organizationUuid = entry.organizationUuid;
         amAcct.name = name;
         // Fresh tokens from re-auth revive a dead-refresh account. This in-place
         // update is the actual re-login path (the index.js reconcile sees no change
@@ -1740,15 +2274,84 @@ export class TUI {
     }
   }
 
+  // Decide what a fresh browser-login profile is: an account already in the pool
+  // (re-authenticate in place) or a new one. Same-user entries that do not know
+  // their organization are read first; when one still cannot be read, the user decides.
+  async _matchLogin(profile) {
+    await this._resolveOrganizations(profile);
+    const existing = this._findExistingOAuthAccount(profile);
+    if (this._organizationUnknown(existing, profile)) return this._confirmReauth(existing);
+    return existing;
+  }
+
+  // Fill in the organization of same-user entries that lack one, reading each with
+  // the running account's live token (read only, never refreshed), and mirror the
+  // result to the manager. The upsert that follows persists it.
+  async _resolveOrganizations(profile) {
+    if (!profile?.accountUuid) return;
+    await resolveOrganizations(this._oauthAccounts(), profile.accountUuid, entry => this._liveCredentials(entry));
+    this._mirrorOrganizations(profile);
+  }
+
+  _liveCredentials(entry) {
+    const live = this._runningAccount(entry);
+    return live ? { accessToken: live.credential, expiresAt: live.expiresAt } : entry;
+  }
+
+  _mirrorOrganizations(profile) {
+    const known = this._oauthAccounts().filter(a => sameUser(a, profile) && a.organizationUuid);
+    for (const entry of known) this._mirrorOrganization(entry);
+  }
+
+  _mirrorOrganization(entry) {
+    const live = this._runningAccount(entry);
+    if (live) live.organizationUuid = entry.organizationUuid;
+  }
+
+  _runningAccount(entry) {
+    return this.am.accounts.find(a => a.name === entry.name);
+  }
+
+  _oauthAccounts() {
+    return this.config.accounts.filter(a => a.type === 'oauth');
+  }
+
   // Find an already-configured OAuth account matching a fresh browser-login profile —
-  // by accountUuid (primary), then name===email — the SAME precedence _upsertOAuthAccount
-  // dedupes on, so the login flow can honestly say "re-authenticating" vs "adding new".
+  // the same user in the same organization; else a same-user entry that does not know
+  // its organization (the login then asks); else, for a profile without a uuid,
+  // name===email; else an entry saved before uuids were stored. The SAME precedence
+  // _upsertOAuthAccount dedupes on, so the login flow can honestly say
+  // "re-authenticating" vs "adding new".
   _findExistingOAuthAccount(profile) {
-    const uuid = profile?.accountUuid || null;
+    const accounts = this._oauthAccounts();
     const email = profile?.email || null;
-    let acct = uuid ? this.config.accounts.find(a => a.type === 'oauth' && a.accountUuid === uuid) : null;
-    if (!acct && email) acct = this.config.accounts.find(a => a.type === 'oauth' && a.name === email);
-    return acct || null;
+    if (!profile?.accountUuid) return (email && accounts.find(a => a.name === email)) || null;
+    return accounts.find(a => sameAccountIdentity(a, profile))
+      || organizationUnknownMatch(accounts, profile)
+      || accounts.find(a => !a.accountUuid && a.name === email)
+      || null;
+  }
+
+  // True when the match rests on the user alone: the entry's organization is unknown
+  // while the login names one.
+  _organizationUnknown(existing, profile) {
+    return Boolean(existing?.accountUuid && profile?.organizationUuid && !existing.organizationUuid);
+  }
+
+  // The user decides a same-user login whose organization could not be read: Enter
+  // or r re-authenticates the entry, a adds a second account; anything else asks again.
+  async _confirmReauth(existing) {
+    const choice = await this._askReauthOrAdd(existing.name);
+    if (choice === 'add') return null;
+    if (choice === 'reauth') return existing;
+    return this._confirmReauth(existing);
+  }
+
+  async _askReauthOrAdd(name) {
+    const raw = await this._ask(`Same Claude user as "${name}", organization unknown. Re-authenticate it (r) or add a second account (a)? [r] `);
+    const answer = String(raw || '').trim().toLowerCase();
+    if (['', 'r', 're-authenticate'].includes(answer)) return 'reauth';
+    return ['a', 'add'].includes(answer) ? 'add' : null;
   }
 
   async _doAddKey(apiKey) {
@@ -1809,7 +2412,7 @@ export class TUI {
   _configAccountIndex(account) {
     if (!account) return -1;
     if (account.accountUuid) {
-      const byUuid = this.config.accounts.findIndex(candidate => candidate.accountUuid === account.accountUuid);
+      const byUuid = this.config.accounts.findIndex(candidate => sameAccountIdentity(candidate, account));
       if (byUuid >= 0) return byUuid;
     }
     return this.config.accounts.findIndex(candidate => candidate.name === account.name);
@@ -1955,9 +2558,30 @@ export class TUI {
 
   // ── rendering ──────────────────────────────────────
 
+  /** Draw on the next tick at the latest — N calls inside one tick draw ONE frame
+   *  (2026-11-12: every log line used to redraw the full screen synchronously and the
+   *  pool froze on a terminal that fell behind). */
+  requestRender() {
+    if (!this.running || this._renderTimer) return;
+    const wait = Math.max(0, RENDER_MIN_INTERVAL_MS - (Date.now() - this._lastRenderAt));
+    this._renderTimer = setTimeout(() => {
+      this._renderTimer = null;
+      this.render();
+    }, wait);
+    this._renderTimer.unref?.();
+  }
+
+  /** Draw NOW (keystroke, resize, takeover): the user is waiting on this frame. */
+  forceRender() {
+    if (!this.running) return;
+    if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
+    this._forceNext = true;
+    this.render();
+  }
+
   render() {
     if (!this.running) return;
-    // Guard against re-entry: clearing an expired quota logs, and _addLog calls
+    // Guard against re-entry: clearing an expired quota logs, and _addLog schedules
     // render() again — without this the nested call would render twice.
     if (this._rendering) return;
     this._rendering = true;
@@ -1976,7 +2600,7 @@ export class TUI {
     const H = process.stdout.rows || 24;
 
     if (W < 40 || H < 8) {
-      process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
+      this._writeScreen(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
       return;
     }
 
@@ -2083,6 +2707,9 @@ export class TUI {
       if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
     lines.push(this._routingLine(routing, xpText));
+    const effLine = this._efficiencyLine(W);
+    if (effLine != null) lines.push(effLine);
+    lines.push(...this._cloudLinkLines(W));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     // Throttle and WAITING are different things and used to share one line labelled
     // "Anthropic upstream throttled" — so a request parked purely because every account
@@ -2139,18 +2766,21 @@ export class TUI {
     } else {
       lines.push('');
       // Aligned column header (dim + underline so it reads as chrome, not data). It
-      // labels the fixed columns that have no inline label; the Ses/Wk/Tok/Req and
+      // labels the fixed columns that have no inline label; the Ses/Fbl/Wk/Tok/Req and
       // Now/15m/1h labels stay inline per row. It sits DIRECTLY above the rows — the
       // abbreviation glossary is a FOOTER below the rows (a caption), never between
       // the header and the data (a left-aligned sentence there reads as a broken,
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
-      const showBoth = W >= 70;
-      // 65/54 = the fixed pre-bar column span (prefix + Account + Provider + Status +
-      // gaps); grew by +4 with the wider 20-col Account column (was 61/50 at NAME_W 16).
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 65) / 2)))
-        : Math.max(5, Math.min(20, W - 54));
+      // Sticky: once any account has reported a session window in this run, keep the
+      // Ses column. A window that simply expires on an idle pool nulls its reading
+      // until the next request or probe; dropping and re-adding the column then
+      // would make every bar jump width. Pools that never report one keep it hidden.
+      this._sessionColumnSeen = this._sessionColumnSeen || this.am.accounts.some(hasSessionReading);
+      // Below 70 columns only ONE bar fits: Wk (real data) wins over a latched-but-
+      // expired Ses, so the collapse logic still applies at narrow widths.
+      const latch = W >= 70 ? this._sessionColumnSeen : this.am.accounts.some(hasSessionReading);
+      const { showSession, showBoth, showFable, bw } = barLayout(W, latch);
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so
@@ -2163,7 +2793,7 @@ export class TUI {
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
         if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
-        lines.push(this._renderAcct(i, bw, showBoth));
+        lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession));
       }
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
@@ -2249,19 +2879,37 @@ export class TUI {
   }
 
   /** Full-screen buffer write: cursor home, H rows fitted to W, then hide the cursor
-   *  (shown only in input mode). */
+   *  (shown only in input mode). The ONLY frame writer: it coalesces (an unchanged
+   *  frame is skipped unless forced / REPAINT_MS-old) and never writes into a terminal
+   *  that has not drained the last frame — it owes one render on 'drain' instead
+   *  (2026-11-12 freeze fix). Memory stays bounded: the stream's own high-water mark
+   *  stops us, and at most one frame is owed. */
   _writeScreen(lines, W, H) {
-    let buf = `${ESC}H`;
-    for (let i = 0; i < H; i++) {
-      buf += fitLine(lines[i] || '', W);
-      if (i < H - 1) buf += '\r\n';
+    let buf;
+    if (typeof lines === 'string') {
+      buf = lines;   // pre-built screen (e.g. "Terminal too small")
+    } else {
+      buf = `${ESC}H`;
+      for (let i = 0; i < H; i++) {
+        buf += fitLine(lines[i] || '', W);
+        if (i < H - 1) buf += '\r\n';
+      }
+      // Show cursor only in input mode
+      buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
     }
-    // Show cursor only in input mode
-    buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
+    this._lastRenderAt = Date.now();
+    if (!this._forceNext && this._lastFrame === buf && Date.now() - this._lastFullWriteAt < REPAINT_MS) return;
+    if (this._nb && process.stdout.writableNeedDrain) {
+      if (!this._drainArmed) { this._drainArmed = true; process.stdout.once('drain', this._onDrain); }
+      return;   // frame owed: written once, on 'drain'
+    }
+    this._forceNext = false;
+    this._lastFrame = buf;
+    this._lastFullWriteAt = Date.now();
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth) {
+  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true) {
     let a = this.am.accounts[idx];
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity
@@ -2269,12 +2917,33 @@ export class TUI {
     const live = a?.poolBenchedBy ? this.am.remoteRowFor?.(a) : null;
     if (live) {
       const r = live.row;
+      // B2 (2026-11-10): the overlay also carries the cloud twin's RESETS via the
+      // same normalizeRemoteResets the mirror rows use. When the twin's snapshot is
+      // MISSING the reset fields (one failed link poll — the "2 → gone → back"
+      // flicker through a new path), keep the PREVIOUS overlay marked not-fresh,
+      // never 0.
+      let resetsOverlay;
+      if (r.resetGrants != null || r.resetCards != null || r.capLift != null) {
+        const nr = normalizeRemoteResets(r);
+        resetsOverlay = { resetGrants: nr.resetGrants, resetCards: nr.resetCards, capLift: nr.capLift };
+      } else {
+        const prev = a._twinResetsOverlay || {};
+        resetsOverlay = {
+          resetGrants: prev.resetGrants ? { ...prev.resetGrants, stale: true } : null,
+          resetCards: prev.resetCards ? { ...prev.resetCards, stale: true } : null,
+          capLift: prev.capLift ?? null,
+        };
+      }
+      a._twinResetsOverlay = resetsOverlay;   // remember for the next frame's fallback
       a = Object.assign(Object.create(Object.getPrototypeOf(a)), a, {
         quota: { ...a.quota, ...(r.quota || {}) },
         inFlight: r.inFlight ?? 0,
         completedRequests: r.completedRequests ?? a.completedRequests,
         refreshDead: Boolean(r.refreshDead),
         rateLimitedUntil: r.rateLimitedUntil ? Date.parse(r.rateLimitedUntil) : null,
+        resetGrants: resetsOverlay.resetGrants,
+        resetCards: resetsOverlay.resetCards,
+        capLift: resetsOverlay.capLift,
       });
     }
 
@@ -2374,7 +3043,8 @@ export class TUI {
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
       case 'pool-benched': status = gray('in cloud'); break;
-      case 'cloud-down': status = red('⟐ cloud ✕'); break;
+      // The banner above names the cause once; each row just says it is out of reach.
+      case 'cloud-down': status = yellow('⟐ offline'); break;
       // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
       // The owner's question that drove this (2026-09-30): "when I disable the account
       // and then the token expires, does it show disabled or reauth? It needs to
@@ -2405,49 +3075,113 @@ export class TUI {
     // Widened from 10 to fit "throttled 59s" so the quota bars stay column-aligned.
     status = rpad(status, STATUS_W);
 
-    // Rst column — banked limit resets (owner request 2026-09-30: a separate
+    // MRst/ARst columns — banked limit resets (owner request 2026-09-30: a separate
     // column showing 0 or the count). z.ai cards + Claude cedar_ember grants,
     // not-yet-expired, on ENABLED accounts only: a disabled account's resets are
     // not ours to spend, and showing a count there would imply otherwise.
+    //
+    // B3 grammar (2026-11-10), split into two cells 2026-11-15:
+    //   MRst (width MRST_W)  model-scoped  nFable~Xd  e.g. 2Fable~114d ('-' when none)
+    //   ARst (width ARST_W)  account-level n~Xd       e.g. 1~29d ('0' when none)
+    //   unknown  n?   scope unknown (ARst only) — count shown, never claimed
+    //   not-fresh = gray + trailing '?' when it fits (stale listing, dead account, old check)
+    // Count = SUM of resetsLeft over spendable grants + live cards (not entries).
+    // Overflow order: drop the suffix first, then collapse to total+'*'.
+    // Expiry is checked LIVE here: grants endsAt>now, cards !expired &&
+    // (expiresAt==null || expiresAt>now) — a frozen `expired` flag never keeps a
+    // dead reset on screen (pre-mortem #18).
     let resetsCell;
     {
-      let n = 0;
+      const now = Date.now();
+      let general = 0;       // resetsLeft of general-weekly grants + live cards
+      let scoped = 0;        // resetsLeft of model-scoped grants (tagged F)
+      let unknown = 0;       // resetsLeft of scope-unknown grants
+      let soonestG = Infinity;  // soonest expiry among account-level (general/unknown) resets
+      let soonestS = Infinity;  // soonest expiry among model-scoped resets
       if (a.enabled !== false) {
+        const liveCard = c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now);
         const rc = a.resetCards;
-        if (rc) n += (rc.fiveHour || []).filter(c => !c.expired).length
-                 + (rc.weekly || []).filter(c => !c.expired).length;
-        const rg = a.resetGrants;
-        if (rg?.eligible) n += (rg.grants || []).filter(g => g.usableNow && !g.expired).length;
-      }
-      // Expiry rides with the count when it's tight: "1~2d" = 1 reset, expires in ~2 days.
-      // Claude grants end mid-Oct (weeks out) — a day-count would be noise; only the
-      // SOONEST-expiring card under 7 days gets a suffix, so the column stays narrow
-      // and the number it carries still answers "use it or lose it?".
-      let suffix = '';
-      if (n > 0) {
-        let soonest = Infinity;
-        const rc = a.resetCards;
-        if (rc) for (const c of [...(rc.fiveHour || []), ...(rc.weekly || [])]) {
-          if (!c.expired && c.expiresAt != null && c.expiresAt < soonest) soonest = c.expiresAt;
+        if (rc) {
+          for (const c of [...(rc.fiveHour || []), ...(rc.weekly || [])]) {
+            if (liveCard(c)) { general += 1; if (c.expiresAt != null && c.expiresAt < soonestG) soonestG = c.expiresAt; }
+          }
         }
         const rg = a.resetGrants;
-        if (rg?.eligible) for (const g of (rg.grants || [])) {
-          if (g.usableNow && !g.expired && g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
-        }
-        // Expiry is ALWAYS shown when a reset exists (owner 2026-10-01: "what is the
-        // proper way to communicate if we have a reset, and when does it expire" —
-        // both facts, always). Hours under 24h, days at or above.
-        const days = soonest === Infinity ? null : (soonest - Date.now()) / 86400_000;
-        if (days != null) {
-          suffix = days < 1 ? '~' + Math.max(1, Math.round(days * 24)) + 'h'
-                            : '~' + Math.max(1, Math.round(days)) + 'd';
+        if (rg?.eligible !== false && rg) {
+          for (const g of (rg.grants || [])) {
+            if (!g || g.usableNow === false || g.paused || g.expired) continue;
+            if (g.endsAt != null && g.endsAt <= now) continue;            // live expiry
+            // Display counts GRANTS by identity, not capabilities (owner
+            // 2026-11-11: the screen showed "3Fable" while Anthropic's own screen
+            // says "two fable and one regular weekly"). A grant that directly
+            // clears the general weekly (full-reset shape: clears includes
+            // 'seven_day') IS a weekly reset however much else it also clears —
+            // count it general, once. Model-only grants count scoped; the
+            // give-back side effect adds no display count (B3.1 nuance, 2026-11-10).
+            // Claim and lift still read appliesTo() — the full reset stays eligible
+            // at a model wall, and narrow-first spending (2026-11-11) keeps it for
+            // the weekly wall.
+            const scopes = appliesTo(g);
+            const clearsWeekly = (Array.isArray(g.clears) ? g.clears : []).includes('seven_day');
+            const hasScoped = scopes.some(x => x !== 'general' && x !== 'session');
+            const left = Math.max(0, Math.floor(g.resetsLeft ?? 1));
+            let isScoped = false;
+            if (clearsWeekly) general += left;
+            else if (hasScoped) { scoped += left; isScoped = true; }
+            else if (scopes.includes('general')) general += left;
+            else unknown += left;
+            if (g.endsAt != null) {
+              if (isScoped) { if (g.endsAt < soonestS) soonestS = g.endsAt; }
+              else if (g.endsAt < soonestG) soonestG = g.endsAt;
+            }
+          }
         }
       }
-      resetsCell = rpad(n > 0 ? green(String(n) + suffix) : gray('0'), RESETS_W);
+      const total = general + scoped + unknown;
+      // Not-fresh (pre-mortem #15): stale listing, a dead account, or a check older
+      // than 3x the grants cadence. An account that stopped being probed never gets
+      // re-listed, so checkedAt alone would show a green count forever.
+      const freshGrants = a.resetGrants && a.resetGrants.stale !== true
+        && (a.resetGrants.checkedAt == null || now - a.resetGrants.checkedAt <= LISTING_FRESH_MS);
+      const freshCards = !a.resetCards || (a.resetCards.stale !== true
+        && (a.resetCards.checkedAt == null || now - a.resetCards.checkedAt <= LISTING_FRESH_MS));
+      const notFresh = total > 0 && (!freshGrants || !freshCards || a.refreshDead || a.subscriptionGone);
+
+      // Two cells (owner 2026-11-15): MRst = model-scoped resets, ARst = account-level.
+      // Each cell has its OWN count, expiry and fit; the staleness flag is shared.
+      const expirySuffix = (n, soonest) => {
+        if (!(n > 0) || soonest === Infinity) return '';
+        const days = (soonest - now) / 86400_000;
+        return days < 1 ? `~${Math.max(1, Math.round(days * 24))}h` : `~${Math.max(1, Math.round(days))}d`;
+      };
+      // Fit to EXACTLY w: full form, then drop the suffix, then n+'*'. Not-fresh:
+      // append '?' only when it fits; otherwise gray carries the staleness (a
+      // '1+2Fable' -> '3?' collapse flipped the count on every self-update,
+      // owner 2026-11-10).
+      const renderCell = (core, suffix, n, w, sticky) => {
+        let text = core + suffix;
+        if (text.length > w) text = core;
+        if (text.length > w) text = `${n}*`.slice(0, w);
+        if (notFresh && n > 0 && !sticky && (text + '?').length <= w) text += '?';
+        return rpad(n > 0 && !notFresh ? green(text) : gray(text), w);
+      };
+      // MRst: model-scoped grants spell the model ('2Fable'), never a bare F
+      // (owner 2026-11-10: "What does the letter F mean?"). Nothing -> a dim dash.
+      const mCell = scoped > 0
+        ? renderCell(`${scoped}Fable`, expirySuffix(scoped, soonestS), scoped, MRST_W, false)
+        : rpad(gray('-'), MRST_W);
+      // ARst: account-level count; scope-unknown grants show 'n?' when they are all there is.
+      const unknownOnly = unknown > 0 && general === 0;
+      const aN = unknownOnly ? unknown : general;
+      const aCore = unknownOnly ? `${unknown}?` : `${general}`;
+      const aCell = aN > 0
+        ? renderCell(aCore, expirySuffix(aN, soonestG), aN, ARST_W, unknownOnly)
+        : rpad(gray('0'), ARST_W);
+      resetsCell = mCell + ' ' + aCell;
     }
 
     if (a.type === 'provider') {
-      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth);
+      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth, showFable, showSession);
     }
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
@@ -2470,15 +3204,20 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
+    const bars = [];
+    // The Fable bar comes first, before the session and weekly bars, on every row
+    // type, so each bar starts at the same offset on OAuth, API-key and provider rows.
+    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+    if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
       // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
-      line += (r2 == null && q.weeklyAbsent)
-        ? `  ${l2} ${emptyBar('none', bw)}`
-        : `  ${l2} ${bar(r2, bw, t2)}`;
+      bars.push((r2 == null && q.weeklyAbsent)
+        ? `${l2} ${emptyBar('none', bw)}`
+        : `${l2} ${bar(r2, bw, t2)}`);
     }
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${bars.join('  ')}`;
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
     // Per-account SETTINGS (preferred pin, usage cap), whatever the account is
@@ -2499,7 +3238,7 @@ export class TUI {
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85;
     const scopedTags = [];
     for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {
-      if (!e || e.isActive === false || e.utilization == null) continue;
+      if (!e || e.utilization == null) continue;
       if (e.utilization < reserveFloor) continue;
       const Fam = fam.charAt(0).toUpperCase() + fam.slice(1);
       scopedTags.push(e.utilization >= exhaustedFloor
@@ -2511,7 +3250,7 @@ export class TUI {
     // headers don't carry them). If the probe has gone stale, say so — and name the
     // cause (e.g. rate-limited) when a probe failure is on record — rather than imply
     // the last-known value is current.
-    line += this._probeHealthNote(a);
+    line += this._probeHealthNote(a, showFable);
     const act = loadText(this._accountLoad(a));
     if (act) line += `  ${dim(act)}`;
     return line;
@@ -2521,7 +3260,7 @@ export class TUI {
    *  stale, names the cause from the last recorded probe failure (e.g. a 429 from
    *  the usage endpoint) so a self-throttling probe reads as "rate-limited" rather
    *  than an unexplained "stale". Leading spaces included so callers append raw. */
-  _probeHealthNote(a) {
+  _probeHealthNote(a, showFable = false) {
     // A dead account (reauth / disabled) already surfaces its state in the status
     // column, and its quota reading is frozen and moot — the prober skips it, so a
     // "stale·probe 401" here is just the perpetual echo of the 401 that killed it.
@@ -2535,11 +3274,15 @@ export class TUI {
     // so a BUSY oauth account with a header-fresh reading and no probe-only scoped
     // cap is NOT stale, even if its background probe is 429-throttled. Provider bars
     // and per-model scoped caps ARE probe-only, so for those a stale probe genuinely
-    // means stale data → keep flagging.
+    // means stale data → keep flagging. A scoped reading is DISPLAYED when its tag
+    // shows (at or above the reserve floor) or, for Fable, whenever the Fbl bar is on
+    // screen: the bar draws the reading at any level, so a stale low Fbl value must
+    // carry the age marker too.
     const q = a.quota || {};
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85; // mirrors _renderAcct's scoped-tag gate
-    const hasDisplayedScopedCap = Object.values(q.scopedWeekly || {}).some(
-      e => e && e.isActive !== false && e.utilization != null && e.utilization >= reserveFloor);
+    const hasDisplayedScopedCap = Object.entries(q.scopedWeekly || {}).some(([family, e]) =>
+      e && e.isActive !== false && e.utilization != null
+      && (e.utilization >= reserveFloor || (showFable && family === 'fable')));
     if (a.type !== 'provider' && !hasDisplayedScopedCap) {
       const interval = this.am.quotaProbeIntervalMs; // > 0 here (else _quotaProbeStale returned false)
       const headerFresh = q.lastHeaderQuotaAt && (Date.now() - q.lastHeaderQuotaAt) <= Math.max(3 * interval, 180_000);
@@ -2576,7 +3319,7 @@ export class TUI {
     return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
   }
 
-  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
+  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true, showFable = showBoth, showSession = true) {
     const q = a.quota || {};
 
     // Ses/Wk bars in the SAME columns as OAuth rows (right after status) so the
@@ -2622,6 +3365,12 @@ export class TUI {
     } else if (!this.am.quotaProbeIntervalMs || this.am.quotaProbeIntervalMs <= 0) {
       sesCell = emptyBar('quota off', bw);
       wkCell = emptyBar('quota off', bw);
+    } else if (q.noPlan) {
+      // z.ai answered: this key's account has no coding plan (cancelled/expired).
+      // Name it — "probing" here read as a pool fault for days (owner, 2026-11-08).
+      sesCell = emptyBar('no plan', bw);
+      wkCell = emptyBar('no plan', bw);
+      note = `  ${red('z.ai says no coding plan — check billing')}`;
     } else {
       sesCell = emptyBar('probing', bw);
       wkCell = emptyBar('probing', bw);
@@ -2631,8 +3380,11 @@ export class TUI {
     // setting whenever the probe is quiet is how a shipped feature reads as absent.
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
-    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} Ses ${sesCell}`;
-    if (showBoth) line += `  Wk  ${wkCell}`;
+    const bars = [];
+    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+    if (showSession) bars.push(`Ses ${sesCell}`);
+    if (showBoth) bars.push(`Wk  ${wkCell}`);
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${bars.join('  ')}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),
     // plus a compact Last <status> <ms> — the one signal that matters for a
@@ -2660,13 +3412,25 @@ export class TUI {
     if (account.load) return account.load;
     if (!this.am?._loadSummary) return null;
     const now = Date.now();
+    const base = w => {
+      const load = this.am._loadSummary(account, w, now);
+      const key = w === 15 * 60_000 ? 'last15m' : 'last1h';
+      // A cloud row merges both pools' halves (rowEfficiencySummary): cache + served
+      // from the serving pool's export (team-wide on that account), bounces / waits /
+      // moves from this Mac's own events — the parts the cloud cannot see.
+      const team = Boolean(account.remote && account._remoteLoad?.[key]?.efficiency);
+      const efficiency = this.am.rowEfficiencySummary
+        ? this.am.rowEfficiencySummary(account, key, now)
+        : this.am._efficiencySummary(account, w, now);
+      return team ? { ...load, efficiency, team: true } : { ...load, efficiency };
+    };
     return {
       current: {
         inFlight: account.inFlight,
         activeWeight: account.activeWeight,
       },
-      last15m: this.am._loadSummary(account, 15 * 60 * 1000, now),
-      last1h: this.am._loadSummary(account, 60 * 60 * 1000, now),
+      last15m: base(15 * 60 * 1000),
+      last1h: base(60 * 60 * 1000),
     };
   }
 
@@ -2762,27 +3526,44 @@ export class TUI {
     if (!ledger) { out.push(yellow('  Capacity ledger unavailable on this worker.')); return out; }
 
     // Owner-specified table (2026-08-26): the same shape for BOTH views —
-    //   Current cycle (tokens + % used) · Prev cycle · Avg across all cycles · N cycles.
+    //   Current cycle (tokens + % used) · Prev cycle · Med (median) across all cycles · N cycles.
     // Current is the live window (estimate while it runs; frozen into the columns at
     // close). Prev/Avg/N are the completed-cycle history. The no-weekly account's
     // weekly view approximates capacity as avg session tank × 33.6 (7×24/5h windows).
-    const ALL_COLS = ['Current', 'Prev', 'Avg', 'N', '$/1M'];
+    // Plan/Where are the leftmost extras and drop first when the terminal is narrow
+    // (the numeric columns are the point of the page). Where = which pool's ledger holds
+    // this account's cycles (cloud / laptop / both) — ONE row per account identity.
+    const ALL_COLS = ['Current', 'Prev', 'Med-3', 'Med-all', 'N', '$/1M'];
+    // Narrow terminals drop from the right, but Med-3 goes before Med-all.
+    const DROP_ORDER = ['$/1M', 'N', 'Med-3', 'Med-all', 'Prev', 'Current'];
     const CW = 11;
     const nameW = 12;
+    const WHERE_W = 7, PLAN_W = 16;
     let COLS = ALL_COLS;
     while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 22) > W) {
-      COLS = COLS.slice(0, -1);
+      const drop = DROP_ORDER.find(c => COLS.includes(c));
+      COLS = COLS.filter(c => c !== drop);
     }
+    const showWhere = (nameW + PROVIDER_W + 2 + COLS.length * CW + WHERE_W + 1 + 22) <= W;
+    const showPlan = showWhere && (nameW + PROVIDER_W + 2 + COLS.length * CW + WHERE_W + PLAN_W + 2 + 22) <= W;
     const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
+      + (showWhere ? 'Where'.padEnd(WHERE_W) : '')
+      + (showPlan ? 'Plan'.padEnd(PLAN_W) + ' ' : '')
       + COLS.map(c => c.padStart(CW)).join('');
     out.push(dimUnderline(fitLine(header, W)));
 
-    for (const i of this._displayOrder()) {
+    const capRows = this.am.capacityRows
+      ? this.am.capacityRows(this._displayOrder(), { hideDisabled: this.hideDisabled })
+      : this._displayOrder().map(i => ({ index: i, group: [i], unresolved: false, displayName: this.am.accounts[i]?.name, where: null, priceAccount: this.am.accounts[i], plan: null, cache: null }));
+    for (const cr of capRows) {
+      const i = cr.index;
       const a = this.am.accounts[i];
       if (!a) continue;
-      if (this.hideDisabled && a.enabled === false) continue;
-      const name = truncate(a.name, nameW).padEnd(nameW);
+      const name = truncate(cr.displayName + (cr.unresolved ? '?' : ''), nameW).padEnd(nameW);
       const prov = gray(providerLabel(a).padEnd(PROVIDER_W));
+      const whereCell = showWhere ? gray((cr.where || '--').padEnd(WHERE_W)) : '';
+      const planCell = showPlan ? gray(planLabel(cr.plan, cr.priceAccount, this.am).padEnd(PLAN_W) + ' ') : '';
+      const lead = name + ' ' + prov + ' ' + whereCell + planCell;
 
       // The no-weekly plan has NO weekly window to complete — its weekly "capacity" is
       // derived: avg session tank × 33.6 (the number of 5h windows in 7 days). Shown
@@ -2792,13 +3573,13 @@ export class TUI {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
           ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
-        const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
+        const cellsByName = { Current: cyan(approx), Prev: '--', 'Med-3': '--', 'Med-all': '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         // Same price cell as the main path: this account's weekly capacity IS the
         // derived tank (avg 5h × 33.6) — the price column must not go blank here.
-        const p2 = this.am.monthlyPriceFor?.(a);
+        const p2 = this.am.monthlyPriceFor?.(cr.priceAccount);
         cellsByName['$/1M'] = gray((sesTank?.avg && p2)
           ? ('$' + (p2 / (Math.round(sesTank.avg * (7 * 24) / 5) / 1e6)).toFixed(2)).padStart(CW) : '--'.padStart(CW));
-        out.push('  ' + name + ' ' + prov + ' '
+        out.push('  ' + lead
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
           + dim('  no weekly limit · avg 5h × 33.6'));
         continue;
@@ -2826,8 +3607,11 @@ export class TUI {
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
         Prev: (tank?.source === 'cycles' && tank.prev != null ? formatTokens(tank.prev) : '--'),
-        Avg: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
-        N: (tank?.source === 'cycles' ? String(tank.n) : '--'),
+        'Med-3': (tank?.source === 'cycles' && tank.recent != null ? formatTokens(tank.recent) : '--'),
+        'Med-all': (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
+        // `n*` = at least one contributing cycle is a two-pool merge (no per-reading
+        // samples survive a merge, so it is estimated from close-time tokens only).
+        N: (tank?.source === 'cycles' ? String(tank.n) + (tank.mergedCount > 0 ? '*' : '') : '--'),
       };
       // $/1M (owner 2026-10-31 "price per token, not per subscription"): the measured
       // weekly tank divided by the plan's monthly-normalized price. Weekly in BOTH
@@ -2844,18 +3628,21 @@ export class TUI {
         ? (sesTankObj?.avg ? Math.round(sesTankObj.avg * (7 * 24) / 5) : null)
         : (this.am.capacityTank?.(i, 'wk')?.avg
           ?? (a.type === 'provider' && sesTankObj?.avg ? Math.round(sesTankObj.avg * WK_PER_SES) : null));
-      const price = this.am.monthlyPriceFor?.(a);
+      const price = this.am.monthlyPriceFor?.(cr.priceAccount);
       const priceCell = (wkTank && price)
         ? '$' + (price / (wkTank / 1e6)).toFixed(2)
         : '--';
       cellsByName['$/1M'] = gray(priceCell.padStart(CW));
-      const row = '  ' + name + ' ' + prov + ' '
+      const row = '  ' + lead
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');
       out.push(row + (curPct ? ' ' + curPct : ''));
     }
 
     out.push('');
-    out.push(' ' + dim('Capacity = tokens ÷ how full the provider said the window was, at close.'));
+    out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle. Med-3 = median of last 3 cycles, Med-all = every cycle.'));
+    out.push(' ' + dim('One row per account. Where = which side holds its history: cloud, laptop or both. ? = identity unknown.'));
+    out.push(' ' + dim('Tokens = everything the provider processed (input + cached + output), same for Claude and GLM.'));
+    out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
     out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized). -- = no price or tank yet.'));
     return out;
@@ -2883,6 +3670,7 @@ export class TUI {
     if (hasPeak) {
       out.push(` ${bold('c')} GLM peak cap ${dim('— GLM accounts only, in GLM peak hours. Not Claude.')}`);
     }
+    out.push(` ${bold('b')} Wait for busy account  ${cyan(this._stickyBusyLabel())}`);
     // Where the per-account cap actually is.
     out.push(` ${dim('Usage cap for ONE account:')} ${bold('Esc')} ${dim('then')} ${bold('a')} ${dim('→')} ${bold('u')} ${dim('(Claude or GLM)')}`);
     const capped = this.am.accounts.filter(a => a.capUtilization != null && a.enabled !== false);
@@ -2895,7 +3683,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} ${serviceMode() ? 'Close view' : 'Stop server'}`;
       case 'capacity': {
         const other = this.capacityWindow === 'wk' ? '5h session' : 'weekly (7d)';
         return ` ${bold('w')} Show ${cyan(other)}  ${bold('Esc')} Back`;

@@ -1170,7 +1170,10 @@ test('capacity failures use capacity queue window instead of long quota window',
       body: JSON.stringify({ model: 'test', messages: [] }),
     });
     assert.equal(res.status, 503);
-    assert.ok(Date.now() - startedAt < 500);
+    // Order-of-magnitude check (the window is 50ms vs the 2000ms quota window it must
+    // NOT use). A hard 500ms bound flakes on a loaded Mac (v1.24.68 release run
+    // 2026-11-06: failed once under full-suite load, 3/3 green in isolation).
+    assert.ok(Date.now() - startedAt < 1500, `capacity window took ${Date.now() - startedAt}ms`);
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1926,9 +1929,13 @@ test('bug A: resumed stream has NO heartbeat comment interleaved between real ev
     assert.equal(res.status, 200);
     const body = await res.text();
     assert.match(body, /message_stop/, 'the resumed stream completed');
-    // Heartbeat comments may appear BEFORE the first real event (while queued),
-    // but NEVER after — interleaving mid-stream is the corruption bug.
-    const after = body.slice(body.indexOf('data:'));
+    // Heartbeat pings may appear BEFORE the first real event (while queued, and —
+    // since review r2 D — until the first real byte is written), but NEVER after:
+    // interleaving mid-stream is the corruption bug. Cut at the first REAL event (a
+    // ping's own `data: {}` line is not one).
+    const firstReal = body.indexOf('data: {"type"');
+    assert.ok(firstReal >= 0, 'a real event arrived');
+    const after = body.slice(firstReal);
     assert.ok(!after.includes('event: ping'),
       'no heartbeat comment interleaved into the live SSE body after the first event');
   } finally {

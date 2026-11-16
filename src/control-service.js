@@ -1,3 +1,5 @@
+import { sameAccountIdentity } from './oauth.js';
+
 const ROUTING_MODES = new Set([
   'balance',
   'prefer-claude',
@@ -163,7 +165,7 @@ export class ControlService {
 
   _configLocation(account) {
     if (account.accountUuid) {
-      const index = this.config.accounts.findIndex(item => item.accountUuid === account.accountUuid);
+      const index = this.config.accounts.findIndex(item => sameAccountIdentity(item, account));
       if (index >= 0) return { array: 'accounts', index };
     }
     const accountIndex = this.config.accounts.findIndex(item => item.name === account.name);

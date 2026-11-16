@@ -1,8 +1,18 @@
-import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
-import { computeDuplicates, credentialFp } from './pool-link.js';
+import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
+import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
-import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
+import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
+// A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
+import { appliesTo, clearsGeneralWeekly, forgetClaimOrg } from './claude-reset-grants.js';
+import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM } from './reset-policy.js';
+import {
+  LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
+  CLAIM_BACKOFF_CAP_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
+} from './reset-timing.js';
+
+// Review r2 A: consecutive request-scoped faults before they count against the account.
+const REQUEST_FAULT_ESCALATE = 3;
 
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
 // local table so account-manager does not import a private constant).
@@ -92,6 +102,7 @@ function emptyQuota() {
     // marker — a swallowed failing probe no longer silently freezes a stale tag.
     // Header-driven updates do NOT stamp this (headers can't refresh scoped/provider).
     lastProbeOkAt: null,        // ms
+    lastProbeOkSentAt: null,    // ms — SEND time of that probe (claim ordering, C1)
     // Last background probe FAILURE — surfaced in the TUI/status so a persistently
     // failing probe (e.g. the usage endpoint rate-limiting us) is VISIBLE instead of
     // silently swallowed (which let a stale weekly keep looking fresh). Cleared on
@@ -108,6 +119,10 @@ function emptyQuota() {
 }
 
 const DEFAULT_SCHEDULER = {
+  // Kept high on purpose. A cap of 3 was tried 2026-11-07 (to look like one person)
+  // and measured against the owner's real traffic first: peaks of 79 simultaneous
+  // requests from his many sessions, with only ~4 accounts usable that day, would
+  // have queued and failed. Spreading load is the router's job, not a hard cap's.
   safetyMaxActivePerAccount: 50,
   safetyMaxGlobalActive: 150,
   cooldownMs: 30_000,
@@ -175,7 +190,47 @@ const DEFAULT_SCHEDULER = {
   // accounts. So in-flight concurrency is the DOMINANT term, with a steep
   // per-account soft cap; burn-pace is only a soft de-preference (never a
   // bench); quota "use-it-or-lose-it" is intentionally a minor signal here.
-  concurrencyWeight: 2,            // multiplies in-flight load (activeWeight+reqWeight) — dominant
+  // Cache-affinity discount (owner 2026-11-08, see _cacheAffinity): score points
+  // a conversation's last-used healthy account sheds (every mode except sticky).
+  // On an undiscounted row one in-flight weight unit costs ~12 points past the
+  // per-account target (the bonus is rescaled per row so discounted rows match),
+  // and a Claude Code turn weighs 3-30 units: 400 ≈ 33 units of extra depth before
+  // the conversation moves. It scales up with conversation size (to 3x) but is then
+  // CAPPED at cacheAffinityMaxExtraDepth below (40 units ≈ 480 points), so the
+  // effective bonus is 400-480 whatever the size. 0 = pure per-request.
+  cacheAffinityBonus: 400,
+  // ANTI-DOGPILE CAP on what the hold may buy (owner hard rule 2026-11-08: many parallel
+  // sessions must SPREAD; a hold must never stack conversations on one account until it
+  // throttles). The size-scaled bonus above reaches 3x (1200 points ≈ 100 weight units ≈
+  // 11 big turns) for a 450KB+ conversation — measured: 11 bound 450KB conversations on
+  // one account, depth 110 (old code with the account in weekly reserve: 2, depth 30).
+  // This is the most EXTRA depth, in weight units past the account's concurrency target
+  // (perAccountConcurrencyTarget, or the tighter reserveConcurrencyTarget for reserve /
+  // unlocked-critical), that a hold can ever tolerate on ANY account: 40 ≈ 4 turns of a
+  // ~450KB conversation (weight ~10). Priced per row at that row's own unit cost, so a
+  // discounted GLM row gets the same DEPTH. Hard bound on a held account's in-flight depth
+  // = concTarget + this + one request's weight, whatever the body size or bonus. A reserve /
+  // unlocked-critical row's hold is scaled by reserveConcurrencyTarget/perAccountConcurrencyTarget.
+  cacheAffinityMaxExtraDepth: 40,
+  // HOLD-UNTIL-CANNOT-SERVE (owner 2026-11-08): a bound conversation leaves its last
+  // account only when that account truly cannot serve it. A re-store costs the same
+  // whether the conversation leaves at 85% or at the wall, so leaving early buys
+  // nothing and staying avoids it if the conversation ends / the window resets first.
+  // This is the 5-hour-window level at which the hold lets go (providers; Claude
+  // benches at switchThreshold anyway). Weekly reserve/soft tiers do NOT release.
+  cacheAffinityFiveHourWall: 0.97,
+  // RETURN HOME after a provider detour (owner 2026-11-09): when a conversation's turn
+  // went to GLM/Kimi and a later turn is routed back to Claude, it prefers the Claude
+  // account it used last — that account still holds its stored copy. Only while the copy
+  // is alive: Claude Code writes 1-hour copies (measured 2026-11-09: 272 of 272 cache
+  // writes `ephemeral_1h`; 55 of 64 detours came back within the hour, median 533 s).
+  cacheAffinityReturnWindowMs: 3_600_000,
+  // STICKY BUSY WAIT (owner 2026-11-15): how long, in total, a warm Claude conversation
+  // waits for its own cloud account to stop being busy before it moves (a move re-writes
+  // its whole prompt cache). Edited live from the TUI routing screen (`b`); env
+  // MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it when set. 0 = never wait.
+  stickyBusyBudgetMs: 60_000,
+  concurrencyWeight: 2,           // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
   paceCostWeight: 1.5,            // soft de-preference of accounts burning ahead of pace (was the ×6 term)
@@ -292,6 +347,16 @@ const DEFAULT_SCHEDULER = {
   providers: {},
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
+// Absolute weekly headroom TIE-BREAK for new placements (2026-11-15): at equal load a
+// fresh-weekly account beats a 60%-weekly one. ~0.75 points at 100% used vs ~70 per
+// in-flight unit, so it only ever decides near-ties; held conversations are unaffected
+// (their steering terms are zeroed).
+const ABS_UTIL_WEIGHT = 0.25;
+// Pinned-busy back-off bounds for a cloud row (markPinBusy).
+const PIN_BUSY_MIN_MS = 1000;
+const PIN_BUSY_MAX_MS = 5000;
+// Edge-pool client outcomes ring (noteClientOutcome).
+const CLIENT_OUTCOME_MAX_AGE_MS = 60 * 60 * 1000;
 // Consecutive failed recovery probes before we stop trusting the SHARED breaker and
 // fall back to per-account handling. Bounds any future "poisoned probe" from becoming
 // an indefinite fleet-wide outage (2026-07-25 incident).
@@ -328,9 +393,86 @@ const PERSISTED_QUOTA_FIELDS = [
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
-  'providerQuotaSource', 'lastProbeOkAt',
+  'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
 ];
 
+/** The sticky busy-wait budget actually in force, and where it comes from — ONE resolver
+ *  for the server (per request, live) and the TUI setting (review 2026-11-16, 5c: the
+ *  screen used to show the saved setting while an env override silently won). */
+export function resolveStickyBusyBudget(scheduler, env = process.env) {
+  const raw = env.MAXPOOL_STICKY_BUSY_BUDGET_MS;
+  if (raw != null && raw !== '' && Number.isFinite(Number(raw)) && Number(raw) >= 0) {
+    return { ms: Number(raw), fromEnv: true };
+  }
+  const v = Number(scheduler?.stickyBusyBudgetMs);
+  return { ms: Number.isFinite(v) && v >= 0 ? v : 60_000, fromEnv: false };
+}
+
+/** Figures only the EDGE pool (the one the client talks to) can know for a request it
+ *  forwarded to a cloud row — see _mirrorEfficiencyAcc. */
+const EDGE_EFFICIENCY_FIELDS = ['bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved', 'moved', 'newConversation'];
+
+const efficiencyWindowMs = (windowKey) => (windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000);
+
+function emptyEfficiency() {
+  return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0,
+    movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
+    newConversation: 0, bounced: 0, refused: 0, waited: 0, waitMs: 0, waitThenMoved: 0, e2e: [] };
+}
+/** Add one exported/summarized efficiency block into an accumulator (missing fields = 0). */
+function addEfficiency(acc, e) {
+  for (const k of ['served', 'in', 'out', 'cr', 'cc', 'moved', 'newConversation', 'bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved']) {
+    acc[k] += Number(e[k]) || 0;
+  }
+  for (const c of Object.keys(acc.movedByCause)) acc.movedByCause[c] += Number(e.movedByCause?.[c]) || 0;
+  // Latency samples exist for this pool's own rows only (percentiles do not add).
+  if (Array.isArray(e.e2e)) acc.e2e.push(...e.e2e);
+}
+const pct = (arr, p) => {
+  if (!arr.length) return null;
+  const s = [...arr].sort((x, y) => x - y);
+  return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+};
+/** Derived figures: hit = cr/(cr+cc+in) (GLM has no cc → r/(r+in)); missTokens = in+cc. */
+function finishEfficiency(acc, provider) {
+  const prompt = acc.cr + acc.cc + acc.in;
+  const { e2e, ...sums } = acc;
+  return {
+    ...sums,
+    provider,
+    hit: prompt > 0 ? acc.cr / prompt : null,
+    missTokens: acc.in + acc.cc,
+    promptTokens: prompt,
+    lowVolume: acc.served < 20 || prompt < 100_000,
+    e2eP50: pct(e2e, 0.5),
+    e2eP95: pct(e2e, 0.95),
+  };
+}
+
+/** Combine efficiency blocks (summaries or exports) into one, with derived figures —
+ *  `maxpool status` uses it to add linked pools' exported sums to the local ones. */
+export function combineEfficiency(blocks, provider) {
+  const acc = emptyEfficiency();
+  for (const b of blocks) if (b) addEfficiency(acc, b);
+  return finishEfficiency(acc, provider);
+}
+
+const CONVERSATION_AFFINITY_MAX = 5000;
+/** Bounded LRU insert: re-insert = most recent; the oldest key drops past the cap. */
+function lruSet(map, key, value) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > CONVERSATION_AFFINITY_MAX) map.delete(map.keys().next().value);
+}
+/** An Anthropic account with its own prompt cache (allow-list: a provider or legacy
+ *  pool row can forward to GLM, so "not a provider" is not proof of a Claude cache). */
+const isClaudeAccount = (a) => a?.type === 'oauth' || a?.type === 'apikey';
+const IDENTITY_WINDOW_MS = 15 * 60_000;
+const IDENTITY_MAX_SAMPLES = 4000;
+const IDENTITY_MIN_PER_SESSION = 8;
+const IDENTITY_MIN_SAMPLE = 60;
+const IDENTITY_DEGRADED_RATE = 0.9;
+const IDENTITY_RECOVER_RATE = 0.7;
 const PROVIDER_429_MIN_BENCH_SEC = 60;
 const PROVIDER_429_MAX_BENCH_SEC = 15 * 60;
 const PROVIDER_429_STREAK_FORGET_MS = 60 * 60 * 1000;
@@ -386,6 +528,35 @@ function parseResetHeader(value) {
  * also logs once so a hand-edited config doesn't silently fail open (a NaN cap makes
  * every `util >= cap` comparison false = uncapped, with no error anywhere).
  */
+const PLAN_CADENCE_MONTHS = { monthly: 1, quarterly: 3, annual: 12, annually: 12, yearly: 12 };
+
+/** Optional per-account plan config: { tier, cadence, priceUsd, billingMonths }.
+ *  Display-only (Capacity page Plan column + $/1M). Tolerant: anything malformed → null,
+ *  never a guessed value. billingMonths defaults from the cadence word. */
+export function sanitizePlan(plan) {
+  if (!plan || typeof plan !== 'object') return null;
+  const priceUsd = Number(plan.priceUsd);
+  const cadence = typeof plan.cadence === 'string' ? plan.cadence.toLowerCase() : null;
+  let billingMonths = Number(plan.billingMonths);
+  if (!(billingMonths > 0)) billingMonths = PLAN_CADENCE_MONTHS[cadence] || NaN;
+  const out = {
+    tier: typeof plan.tier === 'string' ? plan.tier.slice(0, 40) : null,
+    cadence,
+    priceUsd: priceUsd >= 0 && Number.isFinite(priceUsd) ? priceUsd : null,
+    billingMonths: billingMonths > 0 ? billingMonths : null,
+  };
+  return (out.tier || out.priceUsd != null) ? out : null;
+}
+
+/** Default plan of every Anthropic (OAuth) account when none is configured (owner 2026-11-06). */
+export const DEFAULT_CLAUDE_PLAN = { tier: 'Claude Max', cadence: 'monthly', priceUsd: 200, billingMonths: 1 };
+
+/** Monthly-normalized USD from a plan, or null when it cannot be derived. */
+export function planMonthlyUSD(plan) {
+  const p = sanitizePlan(plan);
+  return (p && p.priceUsd != null && p.billingMonths) ? p.priceUsd / p.billingMonths : null;
+}
+
 function _sanitizeCap(value, name, quiet = false) {
   if (value == null) return null;
   const n = Number(value);
@@ -450,6 +621,46 @@ function _windowElapsedRatio(resetAt, durationMs, now) {
   return Math.max(0, (durationMs - (resetAt - now)) / durationMs);
 }
 
+/** B1/B2 (2026-11-10): normalize a REMOTE status row's reset payload. One shared
+ *  shape for syncRemoteMirrors and the TUI benched-twin overlay. An older cloud
+ *  omits the new fields: a missing `eligible` reads `grants.length>0` (holdings
+ *  still display, never a silent 0 — the "cloud rows show no resets" bug);
+ *  missing new grant fields take the fail-closed default from A1; a missing
+ *  capLift means no lift (never recomputed from the mirror's listing copy). */
+export function normalizeRemoteResets(ra) {
+  if (!ra) return { resetCards: null, resetGrants: null, capLift: null };
+  const out = { resetCards: null, resetGrants: null, capLift: null };
+  if (ra.resetCards && typeof ra.resetCards === 'object') {
+    out.resetCards = {
+      fiveHour: Array.isArray(ra.resetCards.fiveHour) ? ra.resetCards.fiveHour : [],
+      weekly: Array.isArray(ra.resetCards.weekly) ? ra.resetCards.weekly : [],
+      checkedAt: ra.resetCards.checkedAt ?? null,
+      stale: Boolean(ra.resetCards.stale),
+      lastError: ra.resetCards.lastError ?? null,
+    };
+  }
+  if (ra.resetGrants && typeof ra.resetGrants === 'object') {
+    const grants = Array.isArray(ra.resetGrants.grants) ? ra.resetGrants.grants : [];
+    out.resetGrants = {
+      grants,
+      nextGrantId: ra.resetGrants.nextGrantId ?? null,
+      cooldownUntil: ra.resetGrants.cooldownUntil ?? null,
+      // Missing eligible (an older cloud export) → display iff grants exist.
+      eligible: ra.resetGrants.eligible !== undefined ? ra.resetGrants.eligible !== false : grants.length > 0,
+      checkedAt: ra.resetGrants.checkedAt ?? null,
+      stale: Boolean(ra.resetGrants.stale),
+      lastError: ra.resetGrants.lastError ?? null,
+    };
+  }
+  if (ra.capLift && typeof ra.capLift === 'object') {
+    // `ceiling` is the holder's computed lifted cap (null = full lift). A give-back
+    // lift MUST carry it — without it the mirror would read a full lift.
+    const ceiling = Number.isFinite(ra.capLift.ceiling) ? ra.capLift.ceiling : null;
+    out.capLift = { active: ra.capLift.active === true, since: ra.capLift.since ?? null, mode: ra.capLift.mode ?? null, ceiling };
+  }
+  return out;
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}, dependencies = {}) {
     this.scheduler = { ...DEFAULT_SCHEDULER, ...schedulerOptions };
@@ -490,6 +701,7 @@ export class AccountManager {
       type: acct.type,
       provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
+      organizationUuid: acct.organizationUuid || null,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
@@ -516,6 +728,7 @@ export class AccountManager {
       capRampStart: _sanitizeRampStart(acct.capRampStart, acct.name),
       model: acct.model || null,
       modelMap: acct.modelMap || null,
+      plan: sanitizePlan(acct.plan),
       stripBetaHeaders: Boolean(acct.stripBetaHeaders),
       runtime: Boolean(acct.runtime),
       enabled: acct.enabled !== false,
@@ -557,6 +770,25 @@ export class AccountManager {
     this.routingMode = 'automatic';
     this.preferredAccountName = null;
     this.sessionBindings = new Map();
+    // Cache affinity: conversation (terminal + prefix hash) → last account name.
+    // Bounded LRU — oldest conversations drop first; a dropped entry only means the
+    // next turn is balanced fresh.
+    this.conversationLastAccount = new Map();
+    // When that account last SERVED the conversation (first real upstream byte) —
+    // holdsWarmConversation reads it. Same LRU bound, in-memory like the map above.
+    this.conversationLastServedAt = new Map();
+    // Final client outcomes of POST /v1/messages at THIS (edge) pool, 1 h ring.
+    this.clientOutcomes = [];
+    // _homeKey (affinityKey, else sessionKey) → { name, at, detoured } of the last CLAUDE
+    // account only (a GLM/Kimi turn never overwrites the name; it sets `detoured`), so a
+    // conversation returning from a provider detour can go home.
+    this.conversationLastClaudeAccount = new Map();
+    // Conversation-identity HEALTH (owner 2026-11-08: "make sure this cannot degrade
+    // silently"). Twice in one day a Claude Code request-shape detail (a moving
+    // cache_control marker, then a per-request billing checksum) made every turn hash
+    // to a new conversation id — affinity went silently inert. Rolling sample of
+    // (terminal, conversation id) per request; see _noteIdentityHealth.
+    this.identityHealth = { samples: [], degraded: false, since: null, lastRate: null, lastN: 0 };
     this._peakCache = null;   // per-UTC-minute peak-window memo (see _peakStateFor)
     // CAPACITY LEDGER (2026-08-22): observed tokens per completed window cycle, so
     // "true capacity" is comparable across providers. Restored from state on boot.
@@ -801,6 +1033,15 @@ export class AccountManager {
     return weeklyPasses.some(options => this.accounts.some(account => {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
+      // A row that JUST refused busy (pinBusyUntil, clamped 1-5 s) is no route for a NEW
+      // placement — else the queue pacer re-tries an all-busy pool in a sub-second spin.
+      // Its holder may still use it, unless this request already gave up waiting on it
+      // (_busyExcluded). The DEPTH half of _pinBusyForNew (30 s-poll snapshot, one slot
+      // short of the limit) is deliberately NOT consulted here: the cloud still accepts
+      // at limit-1, so that row is a route — depth belongs to placement RANKING only
+      // (_selectNext's coolBest), matching what the acquire path would actually do.
+      if (this._recentlyRefusedBusy(account, now)
+        && (!this._holdsRequest(account, requestInfo) || requestInfo._busyExcluded?.has(account.name))) return false;
       return this._isAvailable(account, { ...options, model: requestInfo.model, now });
     }));
   }
@@ -826,7 +1067,11 @@ export class AccountManager {
     const prevCurrentName = requestInfo.sessionKey
       ? this._sessionBinding(requestInfo.sessionKey)?.currentName
       : null;
+    requestInfo.returnedHome = null;   // set by the selection loop when it sends the turn home
     const account = this.getActiveAccount(requestInfo, excludedIndexes);
+    // The D3 retry-same hint is good for exactly ONE acquire, honored or not — a stale
+    // hint would pull a later failover hop back onto the account it just left.
+    requestInfo.retrySameAccountName = null;
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
@@ -836,13 +1081,17 @@ export class AccountManager {
       // disagree with the peak tier that caused the move (defaults to real time).
       this._bindSession(requestInfo.sessionKey, account, requestInfo.model, requestInfo.now);
     }
+    this._noteIdentityHealth(requestInfo);
+    this._noteConversationAccount(requestInfo, account);
     account.inFlight++;
     account.activeWeight += weight;
     account.lastUsedAt = Date.now();
     this.notePoolSend(account);
     // Non-null only when this acquire moved the session off its prior account.
     const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
-    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName };
+    const returnedHome = requestInfo.returnedHome?.name === account.name;
+    const returnedHomeSwitched = returnedHome && requestInfo.returnedHome.switched === true;
+    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome, returnedHomeSwitched, requestInfo };
   }
 
   /** Fail-safe: snap a session's binding back to the pre-migration issuing account
@@ -953,12 +1202,35 @@ export class AccountManager {
     return out;
   }
 
+  /**
+   * outcome.neutral  — the attempt says nothing about the account (client cancel,
+   *                    request-shape refusal): no counters move at all.
+   * outcome.scope    — 'account' (default) | 'request'. A request-scoped failure is
+   *                    recorded (failedRequests, lastError) but never extends the
+   *                    consecutiveFailures streak, so it cannot trip the hold-release
+   *                    gate for the account's other conversations.
+   * outcome.linkFault — a LINK-transport fault (link_ttfb / link_idle /
+   *                    pool_link_unreachable): the Mac↔cloud link gave up, not the
+   *                    account (2026-11-12: cloud rows showed 10-26 "failed" while the
+   *                    cloud itself failed ≈6 of ~2,100). Records a link drop load
+   *                    event and returns — no failedRequests, no streak, no error text.
+   */
   releaseAccount(lease, outcome = {}) {
     if (!lease?.account) return;
     const account = lease.account;
 
+    const depthBefore = account.activeWeight;
     account.inFlight = Math.max(0, account.inFlight - 1);
     account.activeWeight = Math.max(0, account.activeWeight - lease.weight);
+
+    // Owner's throttling constraint: make any throttle on a return-home turn countable,
+    // and say whether the switch (vs the loop's own pick) put the turn on home.
+    if (lease.returnedHome && (outcome.status === 429 || (outcome.status === 503 && account.remote)) && outcome.error !== 'request_shape_refused') {
+      // A pool-wide throttle (markUpstreamThrottled) is not about home's depth — tag it so
+      // the post-release count can leave it out.
+      const scope = outcome.upstreamThrottled ? ' pool-wide' : '';
+      console.log(`[Maxpool] return-home lease throttled (${outcome.status} ${outcome.error || '-'}${scope}, ${lease.returnedHomeSwitched ? 'switched' : 'natural'}): ${account.name} depth=${depthBefore}`);
+    }
 
     if (lease.upstreamThrottleProbe) {
       if (outcome.success) {
@@ -970,6 +1242,21 @@ export class AccountManager {
 
     if (outcome.neutral) return;
 
+    // A link fault is not the account failing: tally it as a link drop (kept out of
+    // avgMs too — a 120s give-up is not the account's latency) and stop here, before
+    // every failure counter / error field.
+    if (outcome.linkFault) {
+      this._recordLoadEvent(account, lease, { success: false, linkFault: true });
+      return;
+    }
+
+    // A pinned refusal (busy / unavailable / throttled cloud row) never reached the
+    // client: one BOUNCED load event, no failure counters, no streak, no error text.
+    if (outcome.bounced) {
+      this._recordLoadEvent(account, lease, { ...outcome, success: false, bounced: true });
+      return;
+    }
+
     // A per-model weekly cap is NOT an account failure — the account is healthy for
     // every other model. Don't poison its failure counters / scoring penalty (mirror
     // the network-blip carve-out); the scoped bench is already set in markRateLimited.
@@ -978,6 +1265,10 @@ export class AccountManager {
     if (outcome.success) {
       account.completedRequests++;
       account.consecutiveFailures = 0;
+      // Review r2 A: any success ends a request-scoped fault run.
+      account.requestFaultStreak = 0;
+      account.requestFaultEscalated = false;
+      account.softCooldownUntil = null;
       account.providerRateLimitStreak = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
@@ -989,14 +1280,26 @@ export class AccountManager {
         account.lastError = null;
         account.lastErrorAt = null;
       }
-      this._recordLoadEvent(account, lease, { ...outcome, success: true });
+      // Backstop for callers that never saw a first byte (unit callers): a 2xx served
+      // the conversation. Idempotent — the first-byte note already ran on the real paths.
+      if (lease.requestInfo && !(outcome.status >= 300)) this.noteConversationServed(lease.requestInfo, account);
+      // Efficiency fields derived from the served request; a field the caller passed
+      // explicitly on the outcome wins.
+      const tel = this._servedTelemetry(lease.requestInfo, account);
+      for (const k of Object.keys(tel)) if (outcome[k] != null) tel[k] = outcome[k];
+      this._recordLoadEvent(account, lease, { ...outcome, ...tel, success: true });
       account.lastSuccessAt = Date.now();
       return;
     }
 
     if (outcome.error || outcome.status) {
       account.failedRequests++;
-      account.consecutiveFailures++;
+      // scope:'request' (cancel-adjacent / first-byte timeout / link blip): the fault
+      // belongs to THIS request, not the account. It must not bump the streak that
+      // the hold-release gate (_affinityRelease `failures-N`) reads — one such fault
+      // used to evict every conversation held on the account (4 in 1s, 2026-11-09
+      // 08:13Z). Account-level faults (429 / caps / auth) keep the default 'account'.
+      if (outcome.scope !== 'request') account.consecutiveFailures++;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
       this._recordLoadEvent(account, lease, outcome);
@@ -1013,9 +1316,149 @@ export class AccountManager {
       durationMs: Math.max(0, now - lease.startedAt),
       weight: Math.max(1, lease.weight || 1),
       success: Boolean(outcome.success),
+      linkFault: Boolean(outcome.linkFault),
       status: outcome.status || null,
+      // Efficiency telemetry (2026-11-15) — optional, read by _efficiencySummary only.
+      bounced: Boolean(outcome.bounced),
+      usage: outcome.usage || null,
+      moved: Boolean(outcome.moved),
+      newConversation: Boolean(outcome.newConversation),
+      moveCause: outcome.moveCause || null,
+      busyWaitMs: outcome.busyWaitMs || 0,
+      e2eFirstByteMs: Number.isFinite(outcome.e2eFirstByteMs) ? outcome.e2eFirstByteMs : null,
+      refusal: outcome.refusal || null,
+      // _efficiencyAcc skips these: a count_tokens call is not a conversation turn.
+      countTokens: Boolean(outcome.countTokens),
     });
     this._pruneLoadEvents(account, now);
+  }
+
+  /** Efficiency fields of a SERVED event, read off the request that was served. */
+  _servedTelemetry(ri, account) {
+    if (!ri) return {};
+    // A PINNED request was routed by the linked (edge) pool: the edge books its move,
+    // cause, wait and client-felt latency on its own mirror row. Booking them here too
+    // would double-count the move (as 'balance' — this pool never knew the cause) and
+    // add a latency sample that starts AFTER the edge's wait. Served + tokens stay here.
+    const pinned = ri.pinAccount != null;
+    const moved = !pinned && Boolean(ri._servedMoved) && ri._notedServed === account.name;
+    return {
+      countTokens: Boolean(ri.isCountTokens),
+      usage: ri.isCountTokens ? null : {
+        in: ri._capacityInput || 0, out: ri._capacityOutput || 0,
+        cr: ri._capacityCacheRead || 0, cc: ri._capacityCacheCreation || 0,
+      },
+      moved,
+      moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
+      newConversation: !pinned && Boolean(ri._newConversation) && ri._notedServed === account.name,
+
+      busyWaitMs: ri._busyWaitMs || 0,
+      e2eFirstByteMs: !pinned && ri._servedAt && ri.startedAt ? Math.max(0, ri._servedAt - ri.startedAt) : null,
+    };
+  }
+
+  /** Cache / move / bounce figures for one account over a window (getStatus + TUI only —
+   *  never on the scoring path). Additive sums plus derived hit share. */
+  _efficiencySummary(account, windowMs, now = Date.now()) {
+    return finishEfficiency(this._efficiencyAcc(account, windowMs, now), isClaudeAccount(account) ? 'claude' : 'glm');
+  }
+
+  _efficiencyAcc(account, windowMs, now = Date.now()) {
+    this._pruneLoadEvents(account, now);
+    const since = now - windowMs;
+    const out = emptyEfficiency();
+    for (const e of account.loadEvents || []) {
+      if (e.at < since || e.countTokens) continue;
+      if (e.bounced) {
+        out.bounced++;
+        if (e.refusal && e.refusal !== 'busy') out.refused++;
+        continue;
+      }
+      if (!e.success) continue;
+      out.served++;
+      if (e.usage) { out.in += e.usage.in; out.out += e.usage.out; out.cr += e.usage.cr; out.cc += e.usage.cc; }
+      if (e.moved) {
+        out.moved++;
+        const c = Object.hasOwn(out.movedByCause, e.moveCause) ? e.moveCause : 'other';
+        out.movedByCause[c]++;
+        if (e.busyWaitMs > 0) out.waitThenMoved++;
+      }
+      if (e.newConversation) out.newConversation++;
+      if (e.busyWaitMs > 0) { out.waited++; out.waitMs += e.busyWaitMs; }
+      if (e.e2eFirstByteMs != null) out.e2e.push(e.e2eFirstByteMs);
+    }
+    return out;
+  }
+
+  /** One cloud MIRROR row's figures, each field taken from the only pool that can know it
+   *  (review 2026-11-16, cluster 1):
+   *  - served / tokens / cache hit: the SERVING pool's export (it saw every client of that
+   *    account, teammates included);
+   *  - bounced / refused / waited / waitMs / waitThenMoved / moved / movedByCause /
+   *    newConversation, and first-byte latency: THIS pool's own events on the row. The
+   *    cloud books a pin refusal before any lease, never sees the edge's wait or its move
+   *    cause, and starts its clock after the edge's wait — and it no longer counts pinned
+   *    requests as its own moves (_servedTelemetry), so nothing here is counted twice.
+   *  An older cloud with no export: this pool's own events alone (it counts nothing). */
+  _mirrorEfficiencyAcc(account, windowKey, windowMs, now = Date.now()) {
+    const edge = this._efficiencyAcc(account, windowMs, now);
+    const exp = account._remoteLoad?.[windowKey]?.efficiency;
+    if (!exp) return edge;
+    const acc = emptyEfficiency();
+    for (const k of ['served', 'in', 'out', 'cr', 'cc']) acc[k] = Number(exp[k]) || 0;
+    for (const k of EDGE_EFFICIENCY_FIELDS) acc[k] = (Number(exp[k]) || 0) + edge[k];
+    for (const c of Object.keys(acc.movedByCause)) {
+      acc.movedByCause[c] = (Number(exp.movedByCause?.[c]) || 0) + edge.movedByCause[c];
+    }
+    acc.e2e = edge.e2e;
+    return acc;
+  }
+
+  /** The per-row summary the TUI and `maxpool status` show: a mirror row merges the
+   *  serving pool's export with this pool's edge-only fields; a local row is its own. */
+  rowEfficiencySummary(account, windowKey = 'last15m', now = Date.now()) {
+    const windowMs = efficiencyWindowMs(windowKey);
+    const acc = account.remote ? this._mirrorEfficiencyAcc(account, windowKey, windowMs, now) : this._efficiencyAcc(account, windowMs, now);
+    return finishEfficiency(acc, isClaudeAccount(account) ? 'claude' : 'glm');
+  }
+
+  /** Overall efficiency, per provider, for the TUI / `maxpool status`: this pool's own
+   *  rows plus each cloud mirror row (_mirrorEfficiencyAcc: cache/served from the cloud's
+   *  export, bounces/waits/moves/latency from this pool's own events — each counted once).
+   *  First-byte percentiles cover this pool's CLIENTS, mirror-served turns included, so
+   *  an edge busy wait shows up in p95. */
+  efficiencyOverall(windowKey = 'last15m', now = Date.now(), { mirrors = true } = {}) {
+    const windowMs = efficiencyWindowMs(windowKey);
+    const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
+    for (const a of this.accounts) {
+      if (a.enabled === false || (a.remote && !mirrors)) continue;
+      const tag = isClaudeAccount(a) ? 'claude' : 'glm';
+      const e = a.remote ? this._mirrorEfficiencyAcc(a, windowKey, windowMs, now) : this._efficiencyAcc(a, windowMs, now);
+      addEfficiency(by[tag], e);
+    }
+    const e2e = [...by.claude.e2e, ...by.glm.e2e];
+    return { claude: finishEfficiency(by.claude, 'claude'), glm: finishEfficiency(by.glm, 'glm'),
+      e2eP50: pct(e2e, 0.5), e2eP95: pct(e2e, 0.95) };
+  }
+
+  /** Final client outcome of one request at THIS pool. Edge-only: a request pinned to
+   *  us by a linked pool is that pool's client, never ours (its refusals would read as
+   *  our client errors). POST /v1/messages only, count_tokens skipped. */
+  noteClientOutcome(requestInfo, status, now = Date.now()) {
+    if (!requestInfo || requestInfo.pinAccount != null || requestInfo.isCountTokens) return;
+    // The client cancelled (Esc / Ctrl-C) — no error was served to anyone.
+    if (requestInfo._clientCancelled) return;
+    if (requestInfo.method !== 'POST' || !/^\/v1\/messages(\?|$)/.test(requestInfo.path || '')) return;
+    this.clientOutcomes.push({ at: now, status: Number(status) || 0 });
+    const cutoff = now - CLIENT_OUTCOME_MAX_AGE_MS;
+    while (this.clientOutcomes.length && this.clientOutcomes[0].at < cutoff) this.clientOutcomes.shift();
+  }
+
+  clientOutcomeSummary(windowMs = 15 * 60_000, now = Date.now()) {
+    const ev = this.clientOutcomes.filter(e => e.at >= now - windowMs);
+    const poolErrors = ev.filter(e => e.status >= 500 || e.status === 429).length;
+    const requestErrors = ev.filter(e => e.status >= 400 && e.status < 500 && e.status !== 429).length;
+    return { total: ev.length, poolErrors, requestErrors };
   }
 
   _pruneLoadEvents(account, now = Date.now()) {
@@ -1029,16 +1472,28 @@ export class AccountManager {
   _loadSummary(account, windowMs, now = Date.now()) {
     this._pruneLoadEvents(account, now);
     const since = now - windowMs;
-    const events = (account.loadEvents || []).filter(e => e.at >= since);
+    const all = (account.loadEvents || []).filter(e => e.at >= since);
+    // A BOUNCE (pinned refusal, 2026-11-15) never served anything: out of every
+    // denominator — requests, weight (spread share), avgMs — and out of `failed`.
+    const bounced = all.filter(e => e.bounced).length;
+    const events = all.filter(e => !e.bounced);
     const requests = events.length;
-    const failed = events.filter(e => !e.success).length;
+    // "failed" is what the operator reads as the ACCOUNT misbehaving; a link fault is
+    // the pool's own tunnel to the team pool and gets its own field (2026-11-12).
+    const failed = events.filter(e => !e.success && !e.linkFault).length;
+    const linkFailed = events.filter(e => !e.success && e.linkFault).length;
+    // avgMs excludes link faults (N1, pre-mortem r2): a 120s give-up on the link is not
+    // this account's response time.
+    const timed = events.filter(e => !e.linkFault);
     const weight = events.reduce((sum, e) => sum + (e.weight || 1), 0);
-    const durationMs = events.reduce((sum, e) => sum + (e.durationMs || 0), 0);
+    const durationMs = timed.reduce((sum, e) => sum + (e.durationMs || 0), 0);
     return {
       requests,
       failed,
+      linkFailed,
+      bounced,
       weight,
-      avgMs: requests ? Math.round(durationMs / requests) : null,
+      avgMs: timed.length ? Math.round(durationMs / timed.length) : null,
     };
   }
 
@@ -1061,6 +1516,21 @@ export class AccountManager {
     // `maxed` tag, so "maxed" renders iff the model is actually benched.
     const exhausted = e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
     return exhausted ? { resetAt: e.resetAt || null, family: fam } : null;
+  }
+
+  /** Review r2 A: inside a request-scoped soft cooldown (new placements only). */
+  _softCooling(account, now = Date.now()) {
+    return Boolean(account.softCooldownUntil && now < account.softCooldownUntil);
+  }
+
+  /** Does `account` already hold this request's conversation (so a soft cooldown must
+   *  not move it)? The one-shot retry-same hint, or the last account for the affinity
+   *  key (which falls back to the sessionKey, so a sticky binding is covered). A
+   *  return-home target needs no clause: homeCand is captured before the skip. */
+  _holdsRequest(account, requestInfo = {}) {
+    if (requestInfo.retrySameAccountName === account.name) return true;
+    const key = this._affinityKey(requestInfo);
+    return Boolean(key && this.conversationLastAccount.get(key) === account.name);
   }
 
   _isAvailable(account, options = {}) {
@@ -1636,6 +2106,19 @@ export class AccountManager {
   _effectiveCap(account, window = 'wk', now = Date.now()) {
     const floor = account?.capUtilization;
     if (floor == null) return null;                       // uncapped — unchanged
+    // C3 CAP LIFT (D2, owner 2026-11-10): while an account holds a usable
+    // full-refill reset (a `clears:['seven_day',...]` grant or a usable z.ai
+    // weekly card), its cap does not apply — it runs to its weekly limit, the
+    // pool spends the reset there, and the cap applies again after. Suspends the
+    // cap on BOTH windows (the session bench reads the cap too) and the provider
+    // max(ses,wk) cap (a GLM capped below 0.90 never reaches the z.ai wall).
+    // Give-back-only grants (gives_back_weekly, no seven_day) lift to a measured
+    // ceiling, not the full wall — see _capLiftCeiling.
+    if (this.capLiftActive(account, now)) {
+      const ceil = this._capLiftCeiling(account, window, now);
+      if (ceil != null) return ceil;
+      return null;                                        // full lift for this window
+    }
     if (account.capMode !== 'dynamic') return floor;      // fixed — byte-for-byte as before
     const ceiling = account.capCeiling ?? this.switchThreshold;
     if (floor >= ceiling) return floor;                   // never pull a high floor DOWN
@@ -1645,6 +2128,178 @@ export class AccountManager {
     const rampStart = account.capRampStart ?? this.scheduler.capRampStart;
     const ramp = rampStart >= 1 ? 0 : clamp01((elapsed - rampStart) / (1 - rampStart));
     return floor + (ceiling - floor) * ramp;
+  }
+
+  // ── C3: cap lift (D2) ─────────────────────────────────────────────────────
+  // capLift is computed ONLY by the holder pool (pre-mortem #13): mirrors honour
+  // the exported value and never recompute it from their copy of the listing.
+  // State per account: account.capLift = { active, since, graceUntil, reason,
+  // ceilingOverride? } — evaluated live by capLiftActive() from the CURRENT
+  // listing, so a grant missing from a fresh listing ends the lift at once.
+
+  /** D4 (finding 3): the free weekly refill of the limit the lift lets the account
+   *  burn is < 24h away — the lift would spend a scarce reset for a few hours of
+   *  capacity the free refill brings anyway. Held unless the lifting reset itself
+   *  dies inside the same 24h (its value is lost either way). Unknown refill = no hold. */
+  _liftRefillHeld(account, sourceEndsAt, now = Date.now()) {
+    const q = account.quota || {};
+    const refillAt = account.type === 'provider' ? q.providerWkReset : q.unified7dReset;
+    if (refillAt == null || refillAt - now >= POLICY.dyingWindowMs) return false;
+    const sourceDying = sourceEndsAt != null && sourceEndsAt - now < POLICY.dyingWindowMs;
+    return !sourceDying;
+  }
+
+  /** C3: a listing failure holds an active lift LIFT_GRACE_MS from the FIRST failure
+   *  of the streak — measured from the last good read, a failure late in the 5-min
+   *  cycle left ~3 min of hold (live 2026-11-11). A good listing rewrites capLift,
+   *  which ends the streak. */
+  _holdLiftThroughFailure(account, now = Date.now()) {
+    const st = account.capLift;
+    if (!st?.active || st.failingSince != null) return;
+    st.failingSince = now;
+    st.graceUntil = Math.max(st.graceUntil ?? 0, now + LIFT_GRACE_MS);
+  }
+
+  /** A FULL lift (a held reset that refills the whole week) makes the weekly window
+   *  not scarce: the pool picks the cheapest account, so pricing a lifted 0.97 on
+   *  its weekly usage made it worst-of-pool and starved it (reports, live
+   *  2026-11-12). Weekly pace/utilization/pressure ignore it; the 5h window and the
+   *  load terms still apply. A give-back lift refills only what the model used, so
+   *  it keeps weekly pricing. */
+  _weeklyRefilledByLift(account, now = Date.now()) {
+    return this.capLiftActive(account, now) && account.capLift?.mode !== 'giveback';
+  }
+
+  /** True while the account's usage cap is suspended by a held full-refill reset. */
+  capLiftActive(account, now = Date.now()) {
+    if (!account || account.enabled === false) return false;
+    if (account.remote) {
+      // Mirror: honour the holder pool's export only (never recompute).
+      return account.capLift?.active === true;
+    }
+    const st = account.capLift;
+    if (!st?.active) return false;
+    // DEAD/OUT conditions end the lift regardless of grace.
+    if (account.poolBenchedBy || account.refreshDead || account.subscriptionGone) {
+      this.endCapLift(account.index, 'account dead/benched', now);
+      return false;
+    }
+    // GRACE: listing failures hold the lift for LIFT_GRACE_MS, then end it.
+    if (now > (st.graceUntil ?? 0)) {
+      this.endCapLift(account.index, 'grace expired', now);
+      return false;
+    }
+    // The free refill moved inside 24h while lifted: the cap returns now.
+    if (this._liftRefillHeld(account, st.sourceEndsAt ?? null, now)) {
+      this.endCapLift(account.index, 'free refill <24h away', now);
+      return false;
+    }
+    return true;
+  }
+
+  /** The lifted ceiling for a window, or null for "no cap at all".
+   *  A give-back grant with a measured drop lifts only to cap + drop (per window,
+   *  the weekly is where the give-back lands); a full seven_day grant lifts fully.
+   *  A MIRROR reads the holder's exported ceiling (it carries no giveBack); a
+   *  give-back lift whose ceiling is unknown fails CLOSED to the cap itself. */
+  _capLiftCeiling(account, _window, _now) {
+    const st = account.capLift;
+    if (!st) return null;
+    if (st.mode !== 'giveback') return null;   // full lift
+    // Uncapped: the line it would otherwise stop at is the last-resort tier.
+    const cap = account.capUtilization != null ? Number(account.capUtilization) || 0
+      : this.scheduler.weeklyCriticalThreshold;
+    if (account.remote) return Number.isFinite(st.ceiling) ? st.ceiling : cap;
+    const drop = Number(account.giveBack?.drop);
+    return Number.isFinite(drop) && drop > 0 ? Math.min(1, cap + drop) : cap;
+  }
+
+  /** Re-evaluate the lift from the CURRENT listing (holder pool only). Called by
+   *  applyResetGrants / applyResetCards after every successful listing, and by
+   *  endCapLift on terminal events. Idempotent; logs each change once. */
+  refreshCapLift(accountIndex, now = Date.now(), reason = 'listing refreshed') {
+    const account = this.accounts[accountIndex];
+    if (!account || account.remote) return;
+    const was = Boolean(account.capLift?.active);
+
+    // START conditions (all must hold).
+    let active = false;
+    let mode = null;
+    let sources = [];      // the resets that carry the lift (their expiry decides the refill hold)
+    // Capped OR uncapped (owner 2026-11-11): an uncapped account above 0.95 weekly
+    // tiers last-resort and never reaches the 0.99 claim point, so its full reset
+    // sat unspent while GLM took the load. The lift applies to every holder.
+    if (account.enabled !== false && !account.poolBenchedBy && !account.refreshDead && !account.subscriptionGone) {
+      const rg = account.resetGrants;
+      const cards = account.resetCards;
+      const listingOk = rg && rg.stale !== true && rg.eligible !== false
+        && rg.checkedAt != null && (now - rg.checkedAt) <= LISTING_FRESH_MS
+        // No cooldown, no claim backoff for the grant that would lift (C3).
+        && !(rg.cooldownUntil != null && rg.cooldownUntil > now);
+      if (listingOk) {
+        const inBackoff = g => {
+          const until = this._claimRetryUntil?.get(`${account.name}:${g.id}`);
+          return until != null && until > now;
+        };
+        const fresh = (rg.grants || []).filter(g =>
+          g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason
+          && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0 && !inBackoff(g));
+        // appliesTo is the ONE scope answer: full = clears seven_day; give-back =
+        // gives_back_weekly on a grant that does NOT clear seven_day.
+        const fullGrants = fresh.filter(g => Array.isArray(g.clears) && g.clears.includes('seven_day'));
+        const givebackGrants = fresh.filter(g => g.givesBackWeekly === true
+          && !(Array.isArray(g.clears) && g.clears.includes('seven_day')));
+        if (fullGrants.length) { active = true; mode = 'full'; sources = fullGrants.map(g => g.endsAt); }
+        else if (givebackGrants.length) {
+          // Give-back lifts ONLY once a measured claim recorded the drop (pre-mortem #7:
+          // a give-back grant returns what the MODEL used, not the whole weekly).
+          const drop = Number(account.giveBack?.drop);
+          if (Number.isFinite(drop) && drop > 0) { active = true; mode = 'giveback'; sources = givebackGrants.map(g => g.endsAt); }
+        }
+      }
+      // z.ai weekly card: a full refill by the same rule (pre-mortem #9: a GLM
+      // capped below 0.90 never reaches the z.ai wall otherwise).
+      if (!active && account.type === 'provider' && account.provider === 'zai' && cards && cards.stale !== true
+        && cards.checkedAt != null && (now - cards.checkedAt) <= LISTING_FRESH_MS) {
+        const hasWeeklyLimit = account.quota?.providerWk != null || account.quota?.providerWkReset != null;
+        const liveWeekly = (cards.weekly || []).filter(c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now));
+        if (hasWeeklyLimit && liveWeekly.length) { active = true; mode = 'full'; sources = liveWeekly.map(c => c.expiresAt); }
+      }
+    }
+    // The soonest-expiring source is the one a claim would spend first.
+    const known = sources.filter(t => t != null);
+    const sourceEndsAt = known.length ? Math.min(...known) : null;
+    // D4 (finding 3): never start or keep the lift inside 24h of the free refill.
+    let endWhy = 'grant missing from fresh listing';
+    if (active && this._liftRefillHeld(account, sourceEndsAt, now)) { active = false; endWhy = 'free refill <24h away'; }
+
+    if (active) {
+      const prev = account.capLift;
+      account.capLift = {
+        active: true,
+        since: prev?.active ? prev.since : now,
+        graceUntil: now + LIFT_GRACE_MS,
+        mode: mode || 'full',
+        sourceEndsAt,
+        reason,
+      };
+      if (!was) this._logCapLift(account, 'cap lifted', reason);
+    } else if (was) {
+      this.endCapLift(accountIndex, endWhy, now);
+    }
+  }
+
+  /** Force-end the lift (claim success/failure, grant gone, resetsLeft 0, cooldown). */
+  endCapLift(accountIndex, why = 'lift ended', now = Date.now()) {
+    const account = this.accounts[accountIndex];
+    if (!account?.capLift?.active) return;
+    account.capLift = { ...account.capLift, active: false, endedAt: now };
+    this._logCapLift(account, 'cap restored', why);
+  }
+
+  _logCapLift(account, verb, why) {
+    console.log(`[reset-grant] ${account.name}: ${verb} (${why})`);
+    appendEventLog(`[reset-grant] ${account.name}: ${verb} (${why})`);
   }
 
   /**
@@ -2198,9 +2853,9 @@ export class AccountManager {
       }
     }
     // Session binding only applies in 'sticky' mode. Every other mode scores each
-    // request independently — the whole point of 'balance' is that 20 sessions that
-    // happened to start on the same account do NOT keep hammering it while others
-    // idle. Warmup-pull still works under the non-sticky modes because it keys on
+    // request — so 20 sessions that started on one account do NOT keep hammering it
+    // while others idle — but with a bounded cache-affinity discount for the
+    // conversation's last account (_cacheAffinity, owner 2026-11-08). Warmup-pull still works under the non-sticky modes because it keys on
     // `_isWarming`, not on a binding.
     const isStickyMode = this.scheduler.routingMode === 'sticky';
     const bound = isStickyMode
@@ -2243,10 +2898,13 @@ export class AccountManager {
     ];
 
     const bestUnlockMap = new Map();
+    const home = this._returnHome(requestInfo, now);
     for (const weeklyOptions of weeklyPasses) {
       best = null;
       bestScore = Infinity;
       bestPriority = Infinity;
+      let homeCand = null;   // the home account as a candidate THIS pass, scored as holder
+      let coolBest = null;   // best soft-cooled account (review r2 A): used only if nothing else fits
 
       for (let i = 0; i < this.accounts.length; i++) {
         const idx = (this.nextIndex + i) % this.accounts.length;
@@ -2262,12 +2920,67 @@ export class AccountManager {
 
         const priority = this._effectivePriority(account, requestInfo, now);
         const score = this._scoreAccount(account, requestInfo, scoringCtx, critUnlock);
+        if (home && account.name === home.name) {
+          homeCand = { account, priority, critUnlock,
+            score: this._scoreAccount(account, requestInfo, scoringCtx, critUnlock, home.name) };
+        }
+        // REQUEST-SCOPED SOFT COOLDOWN (review r2 A): after a request-scoped first-byte
+        // timeout the account is deprioritised for NEW placements only — a cold pick
+        // takes it last. A conversation it HOLDS (_holdsRequest) is not touched:
+        // evicting those is exactly what a request-scoped fault must never do.
+        if ((this._softCooling(account, now) || this._pinBusyForNew(account, now)) && !this._holdsRequest(account, requestInfo)) {
+          if (!coolBest || priority < coolBest.priority || (priority === coolBest.priority && score < coolBest.score)) {
+            coolBest = { account, priority, score, critUnlock };
+          }
+          continue;
+        }
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
           bestScore = score;
           best = account;
           if (critUnlock) bestUnlockMap.set(account.name, critUnlock); else bestUnlockMap.delete(account.name);
         }
+      }
+
+      // Deprioritised, never benched: with no other candidate, the soft-cooled one serves.
+      if (!best && coolBest) {
+        best = coolBest.account;
+        bestPriority = coolBest.priority;
+        bestScore = coolBest.score;
+        if (coolBest.critUnlock) bestUnlockMap.set(best.name, coolBest.critUnlock); else bestUnlockMap.delete(best.name);
+      }
+
+      // RETURN HOME: only once this pass already picked a Claude account — a provider
+      // pick is never touched, so this never pulls a conversation off GLM sooner. Home
+      // wins when it is a candidate here, in the same priority tier, and its score AS
+      // HOLDER (release gates, zeroed steering, anti-dogpile cap) beats the pick.
+      let homeNote = null;
+      let homeSwitched = false;
+      const pickedBeforeHome = best;
+      if (best && home && isClaudeAccount(best)) {
+        if (best.name === home.name) {
+          homeNote = `home=${home.name}:returned`;
+        } else if (home.stale) {
+          homeNote = `home=${home.name}:skipped(stale-${Math.round(home.ageMs / 60_000)}m)`;
+        } else if (homeCand && homeCand.priority <= bestPriority && homeCand.score < bestScore) {
+          // `<=`, not `===`: a soft-cooled HOME is skipped from the best-pick above but
+          // still recorded in homeCand — home at equal-or-better priority wins even then
+          // (review r3 R3-5: soft-cooldown must never override return-home).
+          best = homeCand.account;
+          homeSwitched = true;
+          if (homeCand.critUnlock) bestUnlockMap.set(best.name, homeCand.critUnlock); else bestUnlockMap.delete(best.name);
+          homeNote = `home=${home.name}:returned`;
+        } else if (homeCand && this._softCooling(homeCand.account, now)) {
+          // R3-5: a soft-cooled home that did NOT win as holder: name the soft cooldown
+          // (it kept home out of the best-pick) instead of an `outscored:` line computed
+          // as if home had competed there.
+          homeNote = `home=${home.name}:skipped(soft-cooled;${homeCand.priority > bestPriority ? 'priority-tier' : `holder-score ${homeCand.score.toFixed(1)}>=pick ${bestScore.toFixed(1)}`})`;
+        } else {
+          let why = 'unknown';
+          try { why = this._moveReason(home.name, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(best.name) || null, now, true); } catch (e) { why = `error:${e.message}`; }
+          homeNote = `home=${home.name}:skipped(${why})`;
+        }
+        if (best.name === home.name) requestInfo.returnedHome = { name: home.name, switched: homeSwitched };
       }
 
       if (best) {
@@ -2292,6 +3005,17 @@ export class AccountManager {
         best.probing = best.quota.unified7dReset == null;
         if (switched) {
           console.log(`[alPool] Switched to account "${best.name}"`);
+        }
+        // Evidence for the next cache measurement: one line each time a KNOWN
+        // conversation leaves its last account (bounded by moves, not by requests).
+        const ckey = this._affinityKey(requestInfo);
+        const lastName = ckey ? this.conversationLastAccount.get(ckey) : null;
+        if (lastName && lastName !== best.name) {
+          // why= explains why the conversation LEFT its last account — measured against
+          // the loop's own pick, before any return-home switch.
+          let why = 'unknown';
+          try { why = this._moveReason(lastName, pickedBeforeHome, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(pickedBeforeHome.name) || null, now); } catch (e) { why = `error:${e.message}`; }
+          console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B) why=${why}${homeNote ? ` ${homeNote}` : ''}`);
         }
         return best;
       }
@@ -2476,23 +3200,103 @@ export class AccountManager {
     return profiles.includes(profile);
   }
 
+  /** The in-flight depth at which a PINNED request is refused busy (the cloud's only
+   *  hard per-account cap for pinned traffic). One helper for the gate and the export. */
+  _pinBusyLimit(_account) {
+    return 2 * this.scheduler.perAccountConcurrencyTarget;
+  }
+
+  /** A cloud row NEW placements should skip right now: it just refused busy
+   *  (pinBusyUntil), or its last known depth is one short of the cloud's pin limit.
+   *  Placement-scoped only — never in _isAvailable, so a holder still reaches it. */
+  _pinBusyForNew(a, now = Date.now()) {
+    if (this._recentlyRefusedBusy(a, now)) return true;
+    const depth = this._remoteDepthEstimate(a, now);
+    return Boolean(a.remote && Number.isFinite(a._remotePinLimit) && depth != null
+      && depth >= a._remotePinLimit - 1);
+  }
+
+  /** A cloud row's in-flight depth NOW, as best this pool can tell (review 2026-11-16,
+   *  2c). The poll snapshot (every ~30 s) counted our own leases at poll time; swap those
+   *  for our current leases. A refusal's depth header is fresher but describes one
+   *  instant, so it counts only within the busy window it came with (pinBusyUntil). */
+  _remoteDepthEstimate(a, now = Date.now()) {
+    if (Number.isFinite(a._refusalDepth) && a._refusalDepthUntil > now) return a._refusalDepth;
+    if (!Number.isFinite(a._remoteInflightCount)) return null;
+    return Math.max(0, a._remoteInflightCount - (a._remoteOwnAtSync || 0)) + (a.inFlight || 0);
+  }
+
+  /** Only the TIME-CAPPED half of the busy signal: the row refused busy within its
+   *  1-5 s pinBusyUntil window. Route-existence checks use this alone; the depth
+   *  snapshot (30 s poll) ranks placement but never denies a route. */
+  _recentlyRefusedBusy(a, now = Date.now()) {
+    return Boolean(a.pinBusyUntil && now < a.pinBusyUntil);
+  }
+
+  /** A busy refusal on this row: repel new placements for `ms` (clamped 1-5 s). A
+   *  success does NOT clear it — the refusal said the row is at its pin limit. */
+  markPinBusy(index, ms) {
+    const a = this.accounts[index];
+    if (!a) return;
+    const d = Math.min(PIN_BUSY_MAX_MS, Math.max(PIN_BUSY_MIN_MS, Number(ms) || PIN_BUSY_MIN_MS));
+    a.pinBusyUntil = Math.max(a.pinBusyUntil || 0, Date.now() + d);
+  }
+
+  /** A throttled linked pool (its ANTHROPIC egress is held): cool every Claude-egress
+   *  mirror row of that link at once, so the request moves off the link in ONE hop.
+   *  Provider (GLM/Kimi) mirrors are NEVER cooled by a Claude throttle — the cloud
+   *  only refuses 'throttled' for account.type !== 'provider' (see _matchesRequest),
+   *  so those rows can still serve, and cooling them would black out GLM/'all'
+   *  routing for up to 30 s. */
+  markLinkMirrorsCooldown(fromAccount, ms) {
+    const linkName = fromAccount?.remote?.linkName;
+    if (!linkName) return [];
+    const until = Date.now() + Math.max(0, Number(ms) || 0);
+    const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName && a.type !== 'provider');
+    for (const a of cooled) a.cooldownUntil = Math.max(a.cooldownUntil || 0, until);
+    return cooled;
+  }
+
+  /** Fresher depth for a cloud row from a refusal's x-maxpool-pin-* headers. */
+  noteRemoteDepth(name, inflight, limit) {
+    const a = this.accounts.find(x => x.remote && x.name === name);
+    if (!a) return;
+    // Held only for the busy window it came with — never overwrites the poll snapshot,
+    // so a refusal can't keep the row repelled until the next poll.
+    if (Number.isFinite(inflight)) {
+      a._refusalDepth = inflight;
+      a._refusalDepthUntil = Date.now() + PIN_BUSY_MAX_MS;
+    }
+    if (Number.isFinite(limit)) a._remotePinLimit ??= limit;
+  }
+
   _matchesRequest(account, profile, requestInfo = {}) {
     if (this.admissionPaused) return false;
     // A pinned request (from a linked pool) may ONLY run on the named account, and
     // never on a mirror row (no chained forwarding between pools).
     if (requestInfo.pinAccount != null) {
       if (account.remote || account.name !== requestInfo.pinAccount) return false;
-      // P1: the pin bypasses this pool's balancer, so keep its anti-dogpile floor
-      // here — refuse past 2x the soft per-account target; the caller fails over.
-      if ((account.inFlight || 0) >= 2 * this.scheduler.perAccountConcurrencyTarget) {
-        requestInfo.pinRefusedBusy = true;
-        return false;
-      }
       // P3: a pinned request isn't competing in this pool's queue — it skips the
       // queue-fairness gate (that alone 503'd every pinned Claude request). The
       // upstream throttle STAYS: it describes this pool's real egress to Anthropic.
       if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
-      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
+      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) {
+        requestInfo.pinRefusal = 'throttled';
+        return false;
+      }
+      // P1: the pin bypasses this pool's balancer, so keep its anti-dogpile floor
+      // here — refuse past 2x the soft per-account target; the caller fails over.
+      // 'busy' tells the edge "servable once a slot frees — wait for it", so it is said
+      // ONLY for an account that is otherwise available (review 2026-11-16, 2d). An
+      // unavailable one (rate-limited, cooling, exhausted) matches here and is rejected
+      // by the selection loop's _isAvailable, so the refusal reads 'unavailable' and the
+      // edge moves at once instead of waiting out its budget on it.
+      if ((account.inFlight || 0) >= this._pinBusyLimit(account)
+        && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+        requestInfo.pinRefusedBusy = true;
+        requestInfo.pinRefusal = 'busy';
+        return false;
+      }
       return true;
     }
     // Duplicate guard: a local account whose identity also lives in a team pool
@@ -2974,6 +3778,132 @@ export class AccountManager {
    *   - ramp:        ease a just-recovered account back in instead of slamming it
    *   - failures:    direct per-account backoff after errors
    */
+  /** R7 (owner, 2026-11-13 — task-2026-11-13-maxpool-hold-resets-when-pool-has-room):
+   *  how many OTHER accounts in THIS pool have room to absorb the load while the
+   *  GENERAL weekly wall claim waits for the account's free weekly refill (< 24h
+   *  out). General only (red-team r3): model walls are never held, so there is no
+   *  per-model count. The number
+   *  feeds decideClaudeWithReason's hold gate (opts.peersWithRoom), so it must be
+   *  computed LIVE from current account state — the hold re-evaluates every sweep.
+   *  Conservative per peer: only a probe-FRESH (≤ CLAIM_FRESH_MS) reading counts,
+   *  every disqualifier means "cannot confirm room" (claim, never hold on a guess):
+   *   - serves the SAME traffic (red-team r3 #4, r4 #5): counted PER routing profile
+   *     self serves, by the router's own _matchesProfile, and the THINNEST profile
+   *     decides — every kind of traffic the walled account carries needs its own
+   *     roomy peers (a peer serving only 'all' takes none of its 'claude' requests).
+   *     A self that serves no profile has no confirmed room (0).
+   *   - routable NOW: enabled, not throttled/error/exhausted, not pool-benched
+   *     (a benched local copy is counted through its cloud mirror, never twice),
+   *     not auth/subscription-dead. A cloud MIRROR row counts like a local one,
+   *     judged on the cloud's exported state; its freshness is the cloud's own
+   *     quota.lastProbeOkAt (an older cloud that sends none = unknown = not counted).
+   *   - weekly util (unified7d) leaves ≥ POLICY.holdPeerWeeklyRoom to the peer's
+   *     weekly ceiling — its effective usage cap, else 1.0 (uncapped: below the 0.65
+   *     `soft` tier the router already spreads load at). Red-team #4: room is
+   *     measured to the CAP, so a 0.70 cap at 0.64 is not room.
+   *   - 5h util (unified5h) leaves ≥ POLICY.holdPeerSessionRoom to the peer's
+   *     session bench (_sessionBenchThreshold: its 5h cap, else the 0.90 switch
+   *     threshold) — a session-benched account absorbs nothing.
+   *   - a DIFFERENT identity (accountUuid/credential fingerprint) — not this same
+   *     account under a second name; peers sharing one capacity group (two local
+   *     names, or a mirror and its org-less twin, for one subscription) count ONCE
+   *     (red-team #6).
+   *   - every ACTIVE model bucket the peer reports also has ≥ holdPeerWeeklyRoom
+   *     left (red-team #1) — the walled account serves no model at all, so a peer
+   *     whose Fable is exhausted/full (or 429-marked, or unreadable) would leave
+   *     Fable with no route for up to a day. An inactive bucket binds nothing (the
+   *     router's _scopedExhausted rule).
+   *   - a RESOLVABLE identity (red-team r2 #4): a peer whose capacityIdentity is
+   *     null is unknown capacity and is not counted; one equal to self's is self
+   *     (or self under a second name). Self itself is excluded by the same check —
+   *     its identity is either null or its own.
+   *  Returns a plain integer (the minimum over self's profiles); the POLICY decides
+   *  sufficiency (holdMinPeers × holders). */
+  countPeersWithRoom(self, now = Date.now()) {
+    // Peers are deduped by capacity GROUP, not identity string: an org-less twin
+    // of the same subscription (uuid:U vs uuid:U:org) groups with self and must
+    // never count as a second roomy member of the pool.
+    const selfGroup = new Set(this.capacityGroupOf(self));
+    const selfProfiles = self?.profiles || ['claude', 'all'];
+    const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
+    const roomy = [];
+    for (const p of this.accounts) {
+      const id = this.capacityIdentity(p);
+      if (id == null || selfGroup.has(p)) continue;
+      if (p.type !== 'oauth' || p.enabled === false) continue;
+      // A benched local copy is skipped; its identity is counted through the cloud
+      // MIRROR of the same account (one peer per capacity group, below).
+      if (p.poolBenchedBy) continue;
+      if (p.refreshDead || p.subscriptionGone) continue;
+      if (p.status === 'throttled' || p.status === 'error' || p.status === 'exhausted') continue;
+      if (p.cooldownUntil && p.cooldownUntil > now) continue;
+      // A cloud MIRROR carries the cloud's own exported state (status, refreshDead,
+      // quota incl. the cloud's lastProbeOkAt, cap, cap-lift) — judged below by the
+      // same gates as a local row. Its cooldown is the cloud's, copied separately.
+      if (p.remote && p.remoteCooldownUntil && p.remoteCooldownUntil > now) continue;
+      const q = p.quota || {};
+      // Probe-fresh only: a peer whose reading predates this sweep's decision is
+      // unknown capacity, and unknown capacity must not hold a claim.
+      const fresh = q.lastProbeOkAt != null && now - q.lastProbeOkAt <= CLAIM_FRESH_MS;
+      if (!fresh) continue;
+      const wkCeiling = this._effectiveCap(p, 'wk', now) ?? 1;
+      if (!roomLeft(q.unified7d, wkCeiling, POLICY.holdPeerWeeklyRoom)) continue;
+      if (!roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
+      const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
+      if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
+      // One peer per capacity GROUP (lowest member index as its key): an org-less twin
+      // of the same login, or a mirror + a second mirror of it, is one subscription.
+      roomy.push({ p, key: Math.min(...this.capacityGroupOf(p).map(x => x.index)) });
+    }
+    if (!selfProfiles.length) return 0;
+    return Math.min(...selfProfiles.map(pr =>
+      new Set(roomy.filter(({ p }) => this._matchesProfile(p, pr)).map(({ key }) => key)).size));
+  }
+
+  // ── R7 hold register (red-team r2 #1/#2) ──────────────────────────────────
+  // account._wallHold = { at, refillAt } is stamped whenever either claim path HOLDS the
+  // GENERAL weekly wall (the only wall R7 holds — red-team r3). It is live only
+  // while the hold still describes reality — see isHoldingWall — so a general
+  // claim, the refill or leaving the wall retires it without any clearing code.
+
+  /** Record that `account`'s general weekly wall claim was held, and WHICH refill
+   *  it waits for (red-team r4 #4). */
+  noteWallHold(account, now = Date.now()) {
+    if (account) account._wallHold = { at: now, refillAt: account.quota?.unified7dReset ?? null };
+  }
+
+  /** Is `account` holding its general weekly wall RIGHT NOW? A stamped hold that no
+   *  claim CLEARING the general weekly has superseded (lastFullGeneralClaimAt before
+   *  the stamp — a Fable claim refills nothing the hold waits on, red-team r3 #3; a
+   *  give-back claim retires it only through the live reading below, r5 #1), on an
+   *  enabled, live (r5 #2), locally-owned account still at the wall with its refill
+   *  still ahead — and that refill is still the one it waited for (a later window is
+   *  a new wall, not this hold; holdRefillSlackMs absorbs the two sources' reading
+   *  precision). */
+  isHoldingWall(account, now = Date.now()) {
+    const h = account?._wallHold;
+    if (!h || account.enabled === false || account.poolBenchedBy) return false;
+    if (account.refreshDead || account.subscriptionGone) return false;   // a dead account serves nothing to hold for
+    if (account.lastFullGeneralClaimAt != null && account.lastFullGeneralClaimAt >= h.at) return false;
+    const q = account.quota || {};
+    if (!(q.unified7dReset <= h.refillAt + POLICY.holdRefillSlackMs)) return false;
+    return Number.isFinite(q.unified7d) && q.unified7d >= CLAUDE_WALL_WEEKLY && q.unified7dReset > now;
+  }
+
+  /** The walls a hold must budget for: every OTHER account holding now, plus
+   *  `self` (the wall being decided). Feeds wallClaimHeld's holdersInPool. */
+  countHoldingWalls(self, now = Date.now()) {
+    // Cloud mirrors are peers in countPeersWithRoom, so the cloud's OWN holds draw on the
+    // same spare capacity and count as holders here (review 2026-11-16, cluster 6) —
+    // else two pools each budget the same roomy cloud accounts. A mirror of self's own
+    // capacity group is self, never a second holder. An older cloud exports no
+    // wallHolding, so it adds none (the previous behaviour).
+    const selfGroup = new Set(this.capacityGroupOf(self).map(x => x.index));
+    const remoteHolders = this.accounts.filter(a => a !== self && a.remote && a.enabled !== false
+      && a._remoteWallHolding === true && !selfGroup.has(a.index)).length;
+    return 1 + this.accounts.filter(a => a !== self && this.isHoldingWall(a, now)).length + remoteHolders;
+  }
+
   /**
    * Does this account hold a banked reset that can actually lift its BINDING limit?
    * Claude grants: usable, not paused, unexpired. z.ai cards: unexpired five-hour cards
@@ -2983,10 +3913,18 @@ export class AccountManager {
    */
   _holdsUsableReset(account, now = Date.now()) {
     if (!account || account.enabled === false) return false;
+    if (account.refreshDead || account.subscriptionGone) return false;   // C4: a dead account can never spend
+    // A spent/unknown listing holds nothing (C4: only a reset C1/C3 could spend).
     const grants = account.resetGrants?.grants || [];
-    if (grants.some(g => g && g.usableNow !== false && !g.paused && (g.endsAt == null || g.endsAt > now))) return true;
+    const listingFresh = account.resetGrants && account.resetGrants.stale !== true;
+    // appliesTo is the ONE scope answer (C4): only a grant that can refill a WEEKLY
+    // limit counts — session-only and unmapped-scope grants are never claimed, so
+    // they earn no routing discount.
+    if (grants.some(g => g && g.usableNow !== false && !g.paused && !g.blocking && !g.unavailableReason
+      && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0
+      && appliesTo(g).some(s => s !== 'session'))) return listingFresh;
     const cards = account.resetCards;
-    if (!cards) return false;
+    if (!cards || cards.stale === true) return false;
     const live = c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now);
     if ((cards.fiveHour || []).some(live)) return true;
     const hasWeeklyLimit = account.quota?.providerWk != null || account.quota?.providerWkReset != null;
@@ -2996,11 +3934,17 @@ export class AccountManager {
   _resetMultiplier(account, now = Date.now()) {
     const d = Number(this.scheduler.resetBoostDiscount) || 0;
     if (d <= 0) return 1;
+    // C3/C4 (pre-mortem #10): NO discount while the cap lift is active — a lifted
+    // reset-holder must attract ORDINARY share, not be preferred from 10% upward
+    // (which would pile traffic onto ~10 accounts and 429 them).
+    if (this.capLiftActive(account, now)) return 1;
     return this._holdsUsableReset(account, now) ? 1 - Math.min(d, 0.9) : 1;
   }
 
-  _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
+  _scoreTerms(account, requestInfo = {}, ctx = null, criticalUnlock = null, holderName = undefined) {
     const now = ctx?.now ?? Date.now();
+    // CACHE AFFINITY — see _cacheAffinity.
+    const affinity = this._cacheAffinity(account, requestInfo, criticalUnlock, holderName);
     const reqWeight = Math.max(1, requestInfo.weight || 1);
     // POOL LINK scores as the cloud's WORST-case load (owner 2026-10-29: "the team
     // pool will respect the accounts within it... included in the balancing act").
@@ -3009,7 +3953,10 @@ export class AccountManager {
     // A cloud mirror's depth includes OTHER teammates' live load on that same cloud
     // account (mirrored from the link poll), so every routing term below — the
     // unchanged balancing logic — sees it as busy as it really is.
-    const inflight = account.activeWeight + reqWeight + (account._remoteOtherLoad || 0);
+    // Other teammates' load in WEIGHT units (the cloud's activeWeight minus ours, 2026-11-15);
+    // an older cloud that omits activeWeight falls back to its in-flight count.
+    const remoteLoadW = Number.isFinite(account._remoteOtherWeight) ? account._remoteOtherWeight : (account._remoteOtherLoad || 0);
+    const inflight = account.activeWeight + reqWeight + remoteLoadW;
     const refillMult = this._fastRefillMultiplier(account);
 
     // DOMINANT term: in-flight concurrency. Short-term throttling is driven by
@@ -3072,7 +4019,13 @@ export class AccountManager {
     // benching, but wrong for load balancing: an account at 80% should be clearly less
     // attractive than one at 10% even if both are "on pace". Measured 2026-08-10: cc at
     // 80% scored 52.30 vs glm at 10% at 52.15 — a 0.15 gap drowned by round-robin.
-    const utilizationCost = this._rawUtilization(account) * this.scheduler.utilizationWeight * refillMult * resetMult;
+    // + the absolute weekly headroom tie-break (ABS_UTIL_WEIGHT), behind the same
+    // weekly-aware flag so the 5h-only mode stays byte-identical.
+    // A FULL lift refilled the week: like every other weekly term, the tie-break must
+    // not price it on its pre-refill usage (else a lifted 0.97 is worst-of-pool again).
+    const absUsed = this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)
+      ? this._absWeeklyUsed(account) : 0;
+    const utilizationCost = (this._rawUtilization(account) + ABS_UTIL_WEIGHT * absUsed) * this.scheduler.utilizationWeight * refillMult * resetMult;
 
     // Per-model weekly de-preference: an account whose scoped weekly for THIS
     // request's model (e.g. Fable) is high-but-not-exhausted is a poor pick for
@@ -3086,7 +4039,8 @@ export class AccountManager {
 
     const fleetRecentWeight = ctx?.fleetRecentWeight ?? 0;
     const recentWeight = this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
-    const share = fleetRecentWeight > 0 ? recentWeight / fleetRecentWeight : 0;
+    // Clamped: a provider is outside the denominator, so its raw share can exceed 1.
+    const share = fleetRecentWeight > 0 ? Math.min(1, recentWeight / fleetRecentWeight) : 0;
     // SPREAD also carries the fast-refill discount (2026-08-29, owner option 1). The
     // spread term is the equaliser that pulls every account back to fleet parity — at
     // converged equal share it is ~10x larger than the utilization+pace gap the
@@ -3104,15 +4058,288 @@ export class AccountManager {
     const reserveCost = this._reserveCost(account, now, weeklyState);
     const criticalCost = this._criticalCost(account, now, criticalUnlock, weeklyState);
     const failurePenalty = account.consecutiveFailures * 5;
-    // NO unknown-quota bonus. An account whose quota we cannot see must never be
-    // MORE attractive than a known-healthy one — the old -0.5 nudge (safe only
-    // while the prober quickly resolved "unknown") turned into a relentless pull
-    // toward blind accounts once probing was off, driving an out-of-band-burned
-    // account to exhaustion. Unknown now scores neutral; the prober (on by
-    // default) learns the real number within a cycle. `probing`/requalify still
-    // flags a never-seen account for learning — that path is unchanged.
+    // HELD conversation: the quota/steering terms (pace, utilization, scoped pace,
+    // spread, recovery ramp, reserve/critical overflow cost) exist to steer NEW work
+    // away from tight accounts. They must not, by themselves, pull an already-bound
+    // conversation off an account that can still serve it — a re-store costs more
+    // than any of them. Zeroed for the bound account only while the hold is live; the
+    // LOAD terms (concurrency, capPenalty) stay, so the load-gap escape is untouched.
+    // Structural, not a bonus-size accident: holds at any cacheAffinityBonus > the load gap.
+    const held = affinity > 0;
+    const steer = held ? { paceCost: 0, utilizationCost: 0, scopedPace: 0, spread: 0, ramp: 0, reserveCost: 0, criticalCost: 0 }
+      : { paceCost, utilizationCost, scopedPace, spread, ramp, reserveCost, criticalCost };
+    const terms = { concurrency, capPenalty, ...steer, failurePenalty, affinity };
+    return terms;
+  }
 
-    return concurrency + capPenalty + paceCost + utilizationCost + scopedPace + spread + ramp + reserveCost + criticalCost + failurePenalty;
+  /** Routing cost — lower is preferred. Sum of the named terms minus the affinity bonus. */
+  _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null, holderName = undefined) {
+    const t = this._scoreTerms(account, requestInfo, ctx, criticalUnlock, holderName);
+    return Math.max(0, t.concurrency + t.capPenalty + t.paceCost + t.utilizationCost + t.scopedPace + t.spread + t.ramp + t.reserveCost + t.criticalCost + t.failurePenalty - t.affinity);
+  }
+
+  /**
+   * CACHE AFFINITY (owner 2026-11-08): Anthropic's prompt cache is PER ACCOUNT, so
+   * a conversation that hops accounts re-writes its whole prefix — 72% of all
+   * Anthropic cache writes over 24h were such re-writes (measured 2026-11-08). In
+   * balance mode the account this session used LAST sheds `cacheAffinityBonus`
+   * score points, so the conversation stays put unless there is a MAJOR reason to
+   * move ("stay unless a major preference or truly no other account" — owner):
+   *   - availability gates reject it (limit, exclusion, auth) → never rescued here;
+   *   - it is no longer healthy: weekly at/over the reserve tier, the 5h window at
+   *     or over the same mark, or a failure streak → affinity off, plain balancing;
+   *   - it carries roughly two more large requests than the best sibling (one
+   *     weight unit in flight costs ~12 points past the per-account target).
+   * Every account type (owner 2026-11-08: treat GLM the same). Measured the same
+   * day: GLM conversations hopped accounts on 39% of turns yet z.ai still reported
+   * 98.6% cache reads, so z.ai's cache is not per-key — affinity buys GLM nothing
+   * there but costs nothing either, and one rule is simpler to reason about.
+   * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
+   */
+  _noteConversationAccount(requestInfo, account) {
+    // conversationLastAccount is written at the first real upstream byte
+    // (noteConversationServed), never here: a refused/failed hop must not re-point the
+    // conversation (2026-11-15).
+    // Home memory: ONE key per conversation, independent of identity health, so the
+    // degraded <-> ok flip of _affinityKey can neither hide a home nor lend it to the
+    // sibling conversations that share the terminal key. The entry carries its own
+    // detour state: a Claude turn clears it, a provider turn sets it (same name and
+    // `at`, only the LRU position moves so other traffic cannot evict a long detour).
+    const homeKey = this._homeKey(requestInfo);
+    if (!homeKey) return;
+    if (isClaudeAccount(account)) {
+      lruSet(this.conversationLastClaudeAccount, homeKey,
+        { name: account.name, at: requestInfo.now ?? Date.now(), detoured: false });
+    } else {
+      const home = this.conversationLastClaudeAccount.get(homeKey);
+      if (home) lruSet(this.conversationLastClaudeAccount, homeKey, { ...home, detoured: true });
+    }
+  }
+
+  /** The conversation was SERVED by `account` (first real upstream byte). Idempotent
+   *  per request. Records whether this turn moved the conversation (for telemetry). */
+  noteConversationServed(requestInfo, account) {
+    if (!requestInfo || !account || requestInfo._notedServed === account.name) return;
+    // count_tokens carries no prompt cache: it must not re-point the conversation's
+    // account memory (holdsWarmConversation / move telemetry read it).
+    if (requestInfo.isCountTokens) return;
+    requestInfo._notedServed = account.name;
+    requestInfo._servedAt = Date.now();
+    const key = this._affinityKey(requestInfo);
+    if (!key) return;
+    const prev = this.conversationLastAccount.get(key);
+    requestInfo._newConversation = prev == null;
+    requestInfo._servedMoved = prev != null && prev !== account.name;
+    lruSet(this.conversationLastAccount, key, account.name);
+    lruSet(this.conversationLastServedAt, key, Date.now());
+  }
+
+  /** Does `account` hold this conversation's WARM Claude cache — it served the last
+   *  turn, within the cache window? (The sticky busy wait is only worth it then.) */
+  holdsWarmConversation(account, requestInfo = {}) {
+    if (!isClaudeAccount(account)) return false;
+    const key = this._affinityKey(requestInfo);
+    if (!key || this.conversationLastAccount.get(key) !== account.name) return false;
+    return Date.now() - (this.conversationLastServedAt.get(key) || 0) <= this._cacheAffinityWindowMs();
+  }
+
+  /** cacheAffinityReturnWindowMs, falling back to the default when unset/invalid. */
+  _cacheAffinityWindowMs() {
+    const w = Number(this.scheduler.cacheAffinityReturnWindowMs);
+    return Number.isFinite(w) && w >= 0 ? w : DEFAULT_SCHEDULER.cacheAffinityReturnWindowMs;
+  }
+
+  /** Key of the conversation's home entry: the conversation itself, never the shared
+   *  terminal key when a conversation id exists. When identity is genuinely broken
+   *  (a fresh hash every request) the home is simply never found, so the normal pick
+   *  stands — never a forced or wrong return. */
+  _homeKey(requestInfo = {}) {
+    return requestInfo.affinityKey || requestInfo.sessionKey || null;
+  }
+
+  /**
+   * RETURN HOME (owner 2026-11-09): the Claude account a conversation should go back to
+   * after a provider detour, or null. A detour = a provider turn was served after the
+   * last Claude turn (the entry's own `detoured` flag), so a conversation that never
+   * left Claude has no home to return to. `stale` when the stored copy has outlived
+   * cacheAffinityReturnWindowMs — going home then buys nothing.
+   */
+  _returnHome(requestInfo, now = Date.now()) {
+    const homeKey = this._homeKey(requestInfo);
+    if (!homeKey) return null;
+    const home = this.conversationLastClaudeAccount.get(homeKey);
+    if (!home || !home.detoured) return null;
+    const ageMs = now - home.at;
+    return { name: home.name, stale: ageMs > this._cacheAffinityWindowMs(), ageMs };
+  }
+
+  /** Conversation identity: terminal + prefix hash when the server computed one;
+   *  falls back to the terminal session key (callers that never set the hash,
+   *  e.g. tests and pre-hash call sites). */
+  _affinityKey(requestInfo = {}) {
+    // SELF-HEAL: while conversation identity looks broken, fall back to the
+    // per-terminal key — cruder (subagents share it) but immune to request-shape
+    // drift, so stickiness degrades instead of switching off.
+    if (this.identityHealth.degraded) return requestInfo.sessionKey || requestInfo.affinityKey || null;
+    return requestInfo.affinityKey || requestInfo.sessionKey || null;
+  }
+
+  /** Track how often each terminal's requests START a new conversation id. Healthy
+   *  traffic reuses ids (measured 2026-11-08 on 1.24.77: 68 turns → 19 conversations;
+   *  a busy terminal 32 requests → 6 ids). A broken identity gives ~every request a
+   *  fresh id. Window: last IDENTITY_WINDOW_MS; judged only over terminals with at
+   *  least IDENTITY_MIN_PER_SESSION requests in it (a terminal sending 2 requests
+   *  proves nothing) and IDENTITY_MIN_SAMPLE requests in total. Flip to degraded at
+   *  ≥ IDENTITY_DEGRADED_RATE new-id share; recover below IDENTITY_RECOVER_RATE
+   *  (hysteresis — no flapping). One log line per transition; status shows the state. */
+  _noteIdentityHealth(requestInfo, now = Date.now()) {
+    if (!requestInfo.sessionKey || !requestInfo.conversationHash) return;
+    const h = this.identityHealth;
+    h.samples.push({ t: now, s: requestInfo.sessionKey, c: requestInfo.conversationHash });
+    const cutoff = now - IDENTITY_WINDOW_MS;
+    while (h.samples.length && h.samples[0].t < cutoff) h.samples.shift();
+    if (h.samples.length > IDENTITY_MAX_SAMPLES) h.samples.splice(0, h.samples.length - IDENTITY_MAX_SAMPLES);
+    const perSession = new Map();
+    for (const x of h.samples) {
+      if (!perSession.has(x.s)) perSession.set(x.s, []);
+      perSession.get(x.s).push(x.c);
+    }
+    let reqs = 0; let fresh = 0;
+    for (const ids of perSession.values()) {
+      if (ids.length < IDENTITY_MIN_PER_SESSION) continue;
+      reqs += ids.length; fresh += new Set(ids).size;
+    }
+    if (reqs < IDENTITY_MIN_SAMPLE) return;
+    const rate = fresh / reqs;
+    h.lastRate = rate; h.lastN = reqs;
+    if (!h.degraded && rate >= IDENTITY_DEGRADED_RATE) {
+      h.degraded = true; h.since = now;
+      console.log(`[Maxpool] cache affinity: conversation identity looks BROKEN (${Math.round(rate * 100)}% of ${reqs} requests started a new conversation) — Claude Code's request shape probably changed. Falling back to per-terminal stickiness until it recovers; the hash in describeRequest needs updating.`);
+    } else if (h.degraded && rate < IDENTITY_RECOVER_RATE) {
+      h.degraded = false; h.since = now;
+      console.log(`[Maxpool] cache affinity: conversation identity healthy again (${Math.round(rate * 100)}% new over ${reqs} requests) — per-conversation stickiness restored.`);
+    }
+  }
+
+  /**
+   * HOLD-UNTIL-CANNOT-SERVE (owner 2026-11-08). Returns null while the hold is live,
+   * or the NAME of the gate that lets the conversation go. The hold survives the
+   * weekly reserve (85%) and soft tiers and a high-but-not-walled 5-hour window: a
+   * move costs one full re-store whenever it happens, so leaving early only spends
+   * the re-store sooner. It releases only when the account truly cannot serve:
+   *   critical-no-unlock / exhausted / capped weekly, the 5h window at/over
+   *   cacheAffinityFiveHourWall, a failure streak, or Kimi's unreadable console-only
+   *   quota (nothing would ever release the hold before a 429). Availability gates
+   *   (cooldown, 429 bench, exclusion, in-flight cap) never reach here — the account
+   *   is not a candidate at all — so a throttled account releases on the very next request.
+   */
+  _affinityRelease(account, criticalUnlock = null) {
+    if (account.type === 'provider' && account.quota?.providerQuotaSource === 'console-only') return 'console-only';
+    const weeklyState = this._weeklyRawState(account);
+    if (weeklyState === 'critical') {
+      if (!criticalUnlock) return 'critical-no-unlock';
+    } else if (weeklyState === 'exhausted' || weeklyState === 'capped') {
+      return `weekly-${weeklyState}`;
+    }
+    // 5-hour window: Anthropic reports unified5h; GLM/Kimi report providerSes.
+    const five = account.type === 'provider' ? account.quota?.providerSes : account.quota?.unified5h;
+    if (five != null && five >= this.scheduler.cacheAffinityFiveHourWall) return `5h-${five.toFixed(2)}`;
+    const failures = account.consecutiveFailures || 0;
+    if (failures > 0) return `failures-${failures}`;
+    return null;
+  }
+
+  /** `holderName` scores `account` as if it held the conversation (return-home after a
+   *  provider detour); omitted = the conversation's real last account. */
+  _cacheAffinity(account, requestInfo = {}, criticalUnlock = null, holderName = undefined) {
+    const base = Number(this.scheduler.cacheAffinityBonus) || 0;
+    // Sticky mode has its own binding; its score loop runs only once the session has
+    // decided to LEAVE a hot account — a discount there would pull it straight back.
+    // D3 retry-same (one acquire, set by server.js after a first-byte timeout on a big
+    // prompt): the account that just timed out holds this prompt's warm copy, so it is
+    // scored AS THE HOLDER — the same bonus, release gates, priority tiers, weekly
+    // passes, fairness and anti-dogpile cap as any held conversation (red-team r1: no
+    // bypass). Only the cooldown is skipped, upstream (server.js never cools it). It
+    // applies in sticky mode too: pulling the turn back to that account IS the intent,
+    // for exactly one acquire.
+    const retrySame = requestInfo.retrySameAccountName != null && requestInfo.retrySameAccountName === account.name;
+    if (base <= 0 || (this.scheduler.routingMode === 'sticky' && !retrySame)) return 0;
+    if (!retrySame) {
+      const key = this._affinityKey(requestInfo);
+      if (!key || (holderName ?? this.conversationLastAccount.get(key)) !== account.name) return 0;
+    }
+    // Scale with the CONVERSATION'S SIZE too: losing the cache costs the prefix a
+    // hop re-writes, and requestInfo.bodyBytes ≈ prefix + this turn. Checkpoint
+    // 2026-11-08 11:07Z: a flat 400 cut full re-writes only 18.9%→14.8% of turns —
+    // the rest were 100K-500K-token conversations whose single in-flight turn
+    // already outweighed it. 1x below 150KB, rising to 3x at 450KB+.
+    const sizeMult = Math.min(3, Math.max(1, (requestInfo.bodyBytes || 0) / 150_000));
+    if (this._affinityRelease(account, criticalUnlock)) return 0;
+    // Scale to THIS row's price of one in-flight unit, so every account tolerates the
+    // same extra DEPTH (~33 units) — a fast-refill/soak-discounted GLM row prices a
+    // unit at ~0.4x, and an unscaled bonus let it run ~2.5x deeper (red-team r1).
+    const refillMult = this._fastRefillMultiplier(account);
+    const safetyMult = this.scheduler.soakDiscount < 1
+      ? this._fastRefillMultiplier(account, { capFloor: true }) : refillMult;
+    const unit = this.scheduler.concurrencyWeight * refillMult + this.scheduler.capPenaltyWeight * safetyMult;
+    const fullUnit = this.scheduler.concurrencyWeight + this.scheduler.capPenaltyWeight;
+    const bonus = base * sizeMult * Math.min(1, unit / fullUnit);
+    // Anti-dogpile cap: never tolerate more than cacheAffinityMaxExtraDepth units of
+    // extra depth at THIS row's unit price, however large the conversation or bonus.
+    let maxExtra = Number(this.scheduler.cacheAffinityMaxExtraDepth);
+    if (!Number.isFinite(maxExtra) || maxExtra < 0) return bonus;
+    // A reserve (or unlocked-critical) account has the TIGHTER concurrency target; its
+    // hold gets the same tightening so the hold never stretches the lowest-headroom tier
+    // as far as a healthy one (reserveConcurrencyTarget / perAccountConcurrencyTarget).
+    const wk = this._weeklyRawState(account);
+    if (wk === 'reserve' || (wk === 'critical' && criticalUnlock)) {
+      maxExtra *= Math.min(1, this.scheduler.reserveConcurrencyTarget / Math.max(1, this.scheduler.perAccountConcurrencyTarget));
+    }
+    return Math.min(bonus, maxExtra * unit);
+  }
+
+  /**
+   * WHY a known conversation left its last account — one short string for the
+   * `conversation moved:` log line. `released:<gate>` = the hold let go (the gate
+   * names the reason, incl. availability causes); `outscored:` = the hold was live and
+   * the sibling still won, with the dominant score terms that beat the bonus.
+   */
+  _moveReason(lastName, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlock, now, asHolder = false) {
+    // asHolder: explain why `lastName` lost while scored AS the holder (return-home).
+    const holder = asHolder ? lastName : undefined;
+    const last = this.accounts.find(a => a.name === lastName);
+    if (!last) return 'released:account-gone';
+    if (excludedIndexes.has(last.index)) return 'released:excluded';
+    if (!this._matchesRequest(last, requestInfo.profile || 'claude', requestInfo)) return 'released:not-eligible';
+    const unlock = weeklyOptions.allowWeeklyCritical ? null : this._criticalUnlock(last, requestInfo, excludedIndexes, null, now);
+    const avail = { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!unlock, model: requestInfo.model, now };
+    if (!this._isAvailable(last, avail)) return `released:unavailable(${this._unavailableCause(last, now)})`;
+    const gate = this._affinityRelease(last, unlock);
+    if (gate) return `released:${gate}`;
+    if (this._effectivePriority(last, requestInfo, now) > this._effectivePriority(best, requestInfo, now)) return 'released:priority-tier';
+    if (this._cacheAffinity(last, requestInfo, unlock, holder) <= 0) return 'released:no-hold';
+    const lt = this._scoreTerms(last, requestInfo, scoringCtx, unlock, holder);
+    const bt = this._scoreTerms(best, requestInfo, scoringCtx, bestUnlock);
+    const sum = t => t.concurrency + t.capPenalty + t.paceCost + t.utilizationCost + t.scopedPace + t.spread + t.ramp + t.reserveCost + t.criticalCost + t.failurePenalty - t.affinity;
+    const delta = sum(lt) - sum(bt);
+    const diffs = ['concurrency', 'capPenalty', 'paceCost', 'utilizationCost', 'scopedPace', 'spread', 'ramp', 'reserveCost', 'criticalCost', 'failurePenalty', 'affinity']
+      .map(k => [k, (k === 'affinity' ? -(lt[k] - bt[k]) : lt[k] - bt[k])])
+      .filter(([, d]) => d > 0.05).sort((x, y) => y[1] - x[1]).slice(0, 2)
+      .map(([k, d]) => `${k}+${d.toFixed(1)}`);
+    return `outscored:${delta.toFixed(1)}(${diffs.join(',') || 'rank'};bonus=${lt.affinity.toFixed(0)};depth=${last.activeWeight}/${best.activeWeight})`;
+  }
+
+  /** Short human cause for a not-available account (log text only). */
+  _unavailableCause(account, now) {
+    if (!account.enabled) return 'disabled';
+    if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) return 'rate-limited';
+    if (account.cooldownUntil && now < account.cooldownUntil) return 'cooldown';
+    if (account.provisionalUpstreamUntil && now < account.provisionalUpstreamUntil) return 'upstream-failure';
+    if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount) return 'in-flight-cap';
+    if (this._isSessionQuotaUnavailable(account, now)) return '5h-wall';
+    const w = this._weeklyRawState(account, now);
+    if (w !== 'normal' && w !== 'soft' && w !== 'unknown') return `weekly-${w}`;
+    return account.status || 'other';
   }
 
   /**
@@ -3145,7 +4372,8 @@ export class AccountManager {
     if (q.unified5h != null) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.unified5h, q.unified5hReset, FIVE_HOUR_MS, now));
     }
-    if (q.unified7d != null) {
+    const weeklyFree = this._weeklyRefilledByLift(account, now);
+    if (q.unified7d != null && !weeklyFree) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
     }
     if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
@@ -3160,7 +4388,7 @@ export class AccountManager {
     if (q.providerSes != null) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.providerSes, q.providerSesReset, FIVE_HOUR_MS, now));
     }
-    if (q.providerWk != null) {
+    if (q.providerWk != null && !weeklyFree) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.providerWk, q.providerWkReset, WEEK_MS, now));
     }
     return scarcity;
@@ -3196,7 +4424,7 @@ export class AccountManager {
     // signal (the actual fix) while capacity dying at reset stays free (the
     // invariant the older tests pin). Unknown/absent reset → face value, same as
     // _accountScarcity. Turn the flag off to restore session-only exactly.
-    if (this.scheduler.weeklyAwareScoring !== false) {
+    if (this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)) {
       if (q.unified7d != null) {
         util = Math.max(util, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
       }
@@ -3205,6 +4433,13 @@ export class AccountManager {
       }
     }
     return util;
+  }
+
+  /** Absolute weekly used fraction (0..1), not pace-adjusted — the tie-break input. */
+  _absWeeklyUsed(account) {
+    const q = account?.quota;
+    if (!q) return 0;
+    return Math.max(q.unified7d != null ? clamp01(q.unified7d) : 0, q.providerWk != null ? clamp01(q.providerWk) : 0);
   }
 
   _windowScarcity(util, resetMs, windowLen, now = Date.now()) {
@@ -3401,6 +4636,7 @@ export class AccountManager {
   _weeklyState(account) {
     const rawState = this._weeklyRawState(account);
     if (rawState === 'unknown' || rawState === 'exhausted' || rawState === 'capped') return rawState;
+    if (this._weeklyRefilledByLift(account)) return rawState;
 
     const pressure = Math.max(clamp01(account.quota.unified7d ?? 0), this._effectiveWeeklyUsage(account));
     if (pressure >= this.scheduler.weeklyCriticalThreshold) return 'critical';
@@ -3447,6 +4683,13 @@ export class AccountManager {
       // session window is its ONLY quota signal. Session availability otherwise
       // belongs to _isSessionQuotaUnavailable + PROVIDER_SES_WALL.
       const used = wkUsed != null ? wkUsed : (sesUsed ?? 0);
+      // C3 CAP LIFT (provider twin): a lifted z.ai account tiers `normal` below
+      // the wall so it can climb to the 0.90 card wall instead of being stranded
+      // in reserve/critical by its own cap.
+      if (this.capLiftActive(account, now)) {
+        const ceil = this._capLiftCeiling(account, 'wk', now);
+        if ((ceil == null && used < this.scheduler.weeklyExhaustedThreshold) || (ceil != null && used < ceil)) return 'normal';
+      }
       // USAGE CAP — checked FIRST, before every tier: a reservation is owner intent
       // and outranks both the tier ladder and the upstream verdict. There is no
       // upstreamAllows carve-out for providers anyway, but the ordering documents
@@ -3465,6 +4708,16 @@ export class AccountManager {
     if (q.unified7d == null) return 'unknown';
 
     const used = clamp01(q.unified7d);
+    // C3 CAP LIFT (pre-mortem #10): while a general reset can be spent, the
+    // soft/reserve/critical tiers would strand it — above 0.95 an account is
+    // last-resort-only, so it never reaches the 0.99 claim point. Below the wall
+    // (0.999, or the give-back ceiling cap+drop) a lifted account tiers as
+    // `normal`, at ordinary share; above the ceiling the ordinary logic applies.
+    if (this.capLiftActive(account, now)) {
+      const ceil = this._capLiftCeiling(account, 'wk', now);
+      if (ceil == null && used < this.scheduler.weeklyExhaustedThreshold) return 'normal';
+      if (ceil != null && used < ceil) return 'normal';
+    }
     // NEVER bench on utilization alone while the upstream explicitly says the account is
     // ALLOWED. Anthropic reports both a percentage and a verdict; the verdict is the
     // authority, and it keeps saying "allowed"/"allowed_warning" at 100% used. This mirrors
@@ -3493,6 +4746,7 @@ export class AccountManager {
     // Provider quota lives in separate fields — see _weeklyRawState.
     if (account.type === 'provider') return this._weeklyRawState(account, now);
     if (account.quota.unified7d == null) return 'unknown';
+    if (this._weeklyRefilledByLift(account, now)) return this._weeklyRawState(account, now);
     const effective = this._effectiveWeeklyUsage(account);
     if (effective >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
     if (effective >= this.scheduler.weeklyCriticalThreshold) return 'critical';
@@ -3516,7 +4770,7 @@ export class AccountManager {
    * Update an account's quota from a background usage probe (fetchUsage result).
    * Same effect as learning quota from a live response, but for idle accounts.
    */
-  applyUsageData(accountIndex, usage) {
+  applyUsageData(accountIndex, usage, { sentAt = null } = {}) {
     // A successful probe ends any escalation streak.
     if (this.accounts[accountIndex]?.quota) this.accounts[accountIndex].quota.consecutiveProbeFailures = 0;
     const account = this.accounts[accountIndex];
@@ -3593,6 +4847,18 @@ export class AccountManager {
     }
 
     q.lastProbeOkAt = Date.now();
+    // C1 (finding 1): the SEND time orders this reading against a claim — a probe
+    // sent before a claim and applied after it carries the pre-claim reading.
+    q.lastProbeOkSentAt = Number.isFinite(sentAt) ? sentAt : q.lastProbeOkAt;
+    // C3 give-back measurement: the FIRST successful probe after a give-back claim
+    // records how far unified7d DROPPED — the value a give-back grant actually
+    // returns (it only returns what the model used, never the whole weekly;
+    // pre-mortem #7). Later lifts for this account use cap + drop as the ceiling.
+    if (account.giveBack?.pendingAt != null && q.lastProbeOkSentAt > account.giveBack.pendingAt
+      && usage.sevenDay?.utilization != null) {
+      const utilBefore = account.giveBack.utilBefore;
+      account.giveBack = { drop: Math.max(0, utilBefore - clamp01(usage.sevenDay.utilization)), at: Date.now() };
+    }
     // A successful probe clears any recorded failure — freshness confirmed — including
     // the org-403 streak (a healthy probe proves the org still accepts OAuth).
     q.consecutiveOrgGone = 0;
@@ -3692,17 +4958,30 @@ export class AccountManager {
    * the OAuth quota gates.
    */
   /** Store the latest Claude reset-grant listing (prober piggyback). */
-  applyResetGrants(accountIndex, listing) {
+  applyResetGrants(accountIndex, listing, now = Date.now()) {
     const account = this.accounts[accountIndex];
     if (!account || !listing) return;
-    if (listing.error) { account.resetGrants = null; return; }
+    if (listing.error) {
+      // A failed check must not erase the last good count (2026-11-10: "2~119d" went
+      // blank after one transient non-2xx, with no reset claimed). Keep the previous
+      // listing, mark it stale, and keep checkedAt = the last GOOD read. Never good
+      // before → stay null (nothing to show).
+      if (account.resetGrants) {
+        account.resetGrants = { ...account.resetGrants, stale: true, lastError: String(listing.error), lastErrorAt: now };
+      }
+      this._holdLiftThroughFailure(account, now);
+      return;
+    }
     account.resetGrants = {
       grants: listing.grants || [],
       nextGrantId: listing.nextGrantId ?? null,
       cooldownUntil: listing.cooldownUntil ?? null,
       eligible: listing.eligible !== false,
-      checkedAt: Date.now(),
+      checkedAt: now,
+      stale: false,
     };
+    // C3: re-evaluate the cap lift from the fresh listing.
+    this.refreshCapLift(accountIndex, now, 'listing refreshed');
   }
 
   /** Store the latest reset-card listing for an account (prober piggyback).
@@ -3718,29 +4997,75 @@ export class AccountManager {
 
   monthlyPriceFor(account) {
     // A cloud mirror carries no credential, so this pool cannot read its subscription;
-    // the cloud pool reads it and exports it per row (remoteMonthlyPriceUSD).
-    if (account?.remote && account.remoteMonthlyPriceUSD != null) return account.remoteMonthlyPriceUSD;
-    if (account?.type === 'provider') return account.monthlyPriceUSD ?? null;
+    // the cloud pool reads it and exports it per row (remotePlan / remoteMonthlyPriceUSD).
+    if (account?.remote) {
+      const rp = planMonthlyUSD(account.remotePlan);
+      if (rp != null) return rp;
+      if (account.remoteMonthlyPriceUSD != null) return account.remoteMonthlyPriceUSD;
+    }
+    // GLM: the live z.ai subscription value (renewPrice ÷ cycle months, from the prober)
+    // is authoritative; a configured `plan` (receipts) is only the fallback.
+    if (account?.type === 'provider') return account.monthlyPriceUSD ?? planMonthlyUSD(account?.plan);
+    const pm = planMonthlyUSD(account?.plan);
+    if (pm != null) return pm;
     const tbl = this.scheduler?.monthlyPriceUSD;
     if (tbl && typeof tbl === 'object') {
       const hit = tbl[account?.name] ?? tbl['*'];
       if (Number.isFinite(hit)) return hit;
     }
-    // Owner 2026-10-31: "Claude monthly price is fixed, it's 200 dollars per month."
-    // Anthropic has no per-account price API, so this is the default for every Claude
-    // login; scheduler.monthlyPriceUSD (name or '*') overrides it.
-    if (account?.type === 'oauth') return 200;
-    return null;
+    // Owner 2026-11-06: every Anthropic account is monthly $200 — the default plan below.
+    return account?.type === 'oauth' ? DEFAULT_CLAUDE_PLAN.priceUsd / DEFAULT_CLAUDE_PLAN.billingMonths : null;
   }
 
   applyResetCards(accountIndex, cards) {
     const account = this.accounts[accountIndex];
     if (!account || !cards) return;
-    if (cards.error) { account.resetCards = null; return; }   // never half-write
+    if (cards.error) {
+      // A4 (2026-11-10): keep-last-good, same as Claude grants. The old
+      // `resetCards = null` blanked the count on any transient error (the z.ai
+      // twin of the "2 → gone → back" flicker) and handed a wrong 0 to routing.
+      // Never good before → stay null.
+      if (account.resetCards) {
+        account.resetCards = { ...account.resetCards, stale: true, lastError: String(cards.error), lastErrorAt: Date.now() };
+      }
+      this._holdLiftThroughFailure(account);
+      return;
+    }
+    // DRIFT = a 200 the parser can't have meant (pre-mortem #17): expected arrays
+    // missing, or raw entries present but none kept — treated EXACTLY like an
+    // error: keep the last good cards (marked stale) and leave the cap lift on
+    // its grace window (finding 11: re-evaluating the lift on a drifted listing
+    // ended it at once instead of after the grace).
+    const drift = !Array.isArray(cards.fiveHour) || !Array.isArray(cards.weekly);
+    if (drift) {
+      if (account.resetCards) {
+        account.resetCards = { ...account.resetCards, stale: true, lastError: 'listing drift (unexpected payload shape)', lastErrorAt: Date.now() };
+      }
+      this._holdLiftThroughFailure(account);
+      return;
+    }
     account.resetCards = {
-      fiveHour: cards.fiveHour || [],
-      weekly: cards.weekly || [],
+      fiveHour: cards.fiveHour,
+      weekly: cards.weekly,
       checkedAt: Date.now(),
+      stale: false,
+      lastError: null,
+    };
+    // C3: a z.ai weekly card can start the lift too.
+    this.refreshCapLift(accountIndex, Date.now(), 'cards refreshed');
+  }
+
+  /** Remove one card recordId from the stored list after a SUCCESSFUL redeem
+   *  (A4): the follow-up read can fail, and a redeemed card that lingers keeps
+   *  feeding _holdsUsableReset a discount for capacity that no longer exists. */
+  removeResetCard(accountIndex, recordId) {
+    const account = this.accounts[accountIndex];
+    if (!account?.resetCards || recordId == null) return;
+    const rm = c => c.recordId !== recordId;
+    account.resetCards = {
+      ...account.resetCards,
+      fiveHour: (account.resetCards.fiveHour || []).filter(rm),
+      weekly: (account.resetCards.weekly || []).filter(rm),
     };
   }
 
@@ -3763,7 +5088,20 @@ export class AccountManager {
       if (usage.source === 'console-only') q.providerQuotaSource = 'console-only';
       return;
     }
+    if (usage.noPlan) {
+      // The key authenticates but the account HAS no plan (z.ai code 500 "no coding
+      // plan", e.g. cancelled/expired — measured 2026-11-08). That is a stable
+      // terminal state for the quota probe: show it in the row instead of "probing"
+      // forever, and stop treating the row as a quota unknown.
+      q.providerQuotaSource = 'zai';
+      q.noPlan = true;
+      q.providerSes = null; q.providerSesReset = null;
+      q.providerWk = null; q.providerWkReset = null;
+      q.lastProbeOkAt = Date.now();
+      return;
+    }
     q.providerQuotaSource = usage.source || 'zai';
+    q.noPlan = false; // a real reading means the plan exists (renewed / re-bought)
     if (usage.ses) {
       if (usage.ses.utilization != null) q.providerSes = clamp01(usage.ses.utilization);
       if (usage.ses.resetAt != null) {
@@ -3995,18 +5333,17 @@ export class AccountManager {
   capacityTank(accountIndex, window) {
     const a = this.accounts[accountIndex];
     if (!a) return null;
-    // A cloud mirror's history lives in TWO ledgers: this pool's, under the account's
-    // pre-migration name (months of cycles measured locally before it moved), and the
-    // cloud pool's own, exported per row as remoteTank. Mirror rows are named
-    // "<name> ☁", which matched neither — so every cloud row read "--" (2026-10-31).
-    if (a.remote) {
-      // Prefer whichever ledger holds MORE cycles: the cloud pool only started
-      // measuring at migration (2026-10-29), so for weeks its 0-2 cycles would
-      // otherwise override months of history measured here.
-      const cloud = a.remoteTank?.[window] || null;
-      const local = this.capacity.tankStats(a.remote.remoteName || a.name, window);
-      const best = (cloud && local) ? ((cloud.n || 0) >= (local.n || 0) ? cloud : local) : (cloud || local);
-      return best ? { ...best, source: 'cycles' } : null;
+    // One account = one history, wherever it ran. A mirror/benched pair (same identity)
+    // is the SAME account seen from two pools: union this pool's ledger cycles with the
+    // cycles every linked pool exported — never "the ledger with more cycles wins".
+    if (a.remote || a.poolBenchedBy) {
+      const merged = this.capacityHistory(a, window);
+      const t = tankStatsFromCycles(merged, window, {
+        readFloor: this.capacity._readFloorOverride, ignoreCeiling: this.capacity._readFloorOverride != null });
+      if (t) return { ...t, source: 'cycles' };
+      // An older cloud's exported aggregate (remoteTank) is on the legacy input+output
+      // axis: never shown, never blended.
+      return null;
     }
     const measured = this.capacity.tankStats(a.name, window);
     if (measured) return { ...measured, source: 'cycles' };
@@ -4021,6 +5358,106 @@ export class AccountManager {
       bounded: est.lowerBound ? 1 : 0, lowerBound: Boolean(est.lowerBound),
       source: 'live', utilization: est.utilization, method: est.method, fresh: est.fresh,
     };
+  }
+
+  /** Identity of a row: local → accountIdentity; mirror → the remote's uuid / key
+   *  fingerprint (same key shape). null = unresolvable (never merged by name). */
+  capacityIdentity(a) {
+    if (!a) return null;
+    if (a.remote) return remoteAccountIdentity({ type: a.type, provider: a.provider, accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid, keyFingerprint: a.remoteKeyFp });
+    return accountIdentity(a);
+  }
+
+  /** Every row of one identity (local rows + mirrors). An unresolvable row is alone. */
+  capacityGroupOf(a) {
+    const id = this.capacityIdentity(a);
+    if (!id) return [a];
+    const same = this.accounts.filter(x => this.capacityIdentity(x) === id);
+    // `uuid:<user>[:<org>]`: a row whose organization is unknown (saved before orgs
+    // were recorded, or mirrored from an older pool) is still the same login as the
+    // user's org-bearing row while that user has ONE known organization here. Two
+    // known organizations are two subscriptions: then only exact ids group.
+    if (!id.startsWith('uuid:')) return same;
+    const user = id.split(':')[1];
+    const rows = this.accounts.filter(x => {
+      const xid = this.capacityIdentity(x);
+      return xid && xid.startsWith('uuid:') && xid.split(':')[1] === user;
+    });
+    const orgs = new Set(rows.map(x => this.capacityIdentity(x).split(':')[2]).filter(Boolean));
+    return orgs.size > 1 ? same : rows;
+  }
+
+  /** Merged closed-cycle history of an account's whole identity: this pool's ledger
+   *  (under the local name, and under a mirror's pre-migration remote name) plus every
+   *  linked pool's exported cycles. */
+  capacityHistory(a, window) {
+    const group = this.capacityGroupOf(a);
+    const names = new Set();
+    for (const x of group) names.add(x.remote ? (x.remote.remoteName || x.name) : x.name);
+    let local = [];
+    for (const n of names) local = mergeCycles(local, this.capacity.closedCycles(n, window));
+    let remote = [];
+    for (const x of group) {
+      if (x.remote && Array.isArray(x.remoteCycles?.[window])) remote = mergeCycles(remote, x.remoteCycles[window]);
+    }
+    return mergeCycles(local, remote);
+  }
+
+  /** Where an account's measurements live: 'cloud' | 'laptop' | 'both' (ledgers with
+   *  activity in the last 14 days, else where the live row routes). */
+  capacityWhere(a, now = Date.now()) {
+    const group = this.capacityGroupOf(a);
+    const cutoff = now - 14 * 86400_000;
+    let laptop = false, cloud = false;
+    const hasMirror = group.some(x => x.remote && x.enabled !== false);
+    for (const x of group) {
+      if (x.remote) {
+        const rc = x.remoteCycles || {};
+        if ([...(rc.ses || []), ...(rc.wk || [])].some(c => c.endedAt >= cutoff)) cloud = true;
+        const n = x.remote.remoteName || x.name;
+        if (this._ledgerActiveSince(n, cutoff)) laptop = true;
+      } else if (this._ledgerActiveSince(x.name, cutoff)) laptop = true;
+    }
+    if (hasMirror) cloud = true;           // the live row routes through the cloud
+    if (!laptop && !cloud) return group.some(x => !x.remote) ? 'laptop' : 'cloud';
+    return laptop && cloud ? 'both' : (cloud ? 'cloud' : 'laptop');
+  }
+
+  _ledgerActiveSince(name, cutoff) {
+    for (const w of ['ses', 'wk']) {
+      if (this.capacity.closedCycles(name, w).some(c => c.endedAt >= cutoff)) return true;
+      if ((this.capacity.openCycle(name, w)?.lastAccrualAt || 0) >= cutoff) return true;
+    }
+    return false;
+  }
+
+  /** Capacity-page rows: ONE per identity. Primary = the live authority (mirror when
+   *  present, else the local row). Rows with no resolvable identity stay separate and
+   *  are marked `unresolved` (never merged by name alone). */
+  capacityRows(order, { hideDisabled = false } = {}) {
+    const rows = [];
+    const seen = new Set();
+    for (const i of order) {
+      const a = this.accounts[i];
+      if (!a || seen.has(a.index)) continue;
+      const id = this.capacityIdentity(a);
+      const group = id ? this.capacityGroupOf(a) : [a];
+      for (const x of group) seen.add(x.index);
+      const visible = group.filter(x => !(hideDisabled && x.enabled === false));
+      if (!visible.length) continue;
+      const primary = visible.find(x => x.remote && x.enabled !== false) || visible.find(x => !x.remote) || visible[0];
+      const localRow = group.find(x => !x.remote);
+      const withPrice = [primary, ...group].find(x => x && this.monthlyPriceFor(x) != null) || primary;
+      const withPlan = [primary, ...group].find(x => x && (x.plan || x.remotePlan)) || null;
+      rows.push({
+        index: primary.index, group: group.map(x => x.index), unresolved: !id,
+        displayName: (localRow || primary).name.replace(/ ☁$/, ''),
+        where: this.capacityWhere(primary),
+        priceAccount: withPrice,
+        plan: withPlan ? sanitizePlan(withPlan.plan || withPlan.remotePlan) : (primary.type === 'oauth' ? DEFAULT_CLAUDE_PLAN : null),
+      });
+    }
+    return rows;
   }
 
   /** Safe, presentation-ready capacity summary for status/control clients. Capacity
@@ -4060,7 +5497,7 @@ export class AccountManager {
     };
   }
 
-  accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
+  accrueCapacity(accountIndex, { input = 0, output = 0, cacheRead = 0, cacheCreation = 0, model = null } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     // A no-weekly plan (z.ai legacy TOKENS_LIMIT, weeklyAbsent) has no weekly window to
@@ -4069,7 +5506,7 @@ export class AccountManager {
     // window + day buckets (the 7d volume) are the real signals for such accounts.
     const windows = account.type === 'provider' && account.quota?.weeklyAbsent
       ? ['ses'] : ['ses', 'wk'];
-    this.capacity.accrue(account.name, { input, output }, undefined, windows);
+    this.capacity.accrue(account.name, { input, output, cacheRead, cacheCreation, model }, undefined, windows);
   }
 
   /** The vendor's CURRENT fullness reading for a window — the tank numerator's
@@ -4266,9 +5703,34 @@ export class AccountManager {
     console.log(`[alPool] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
   }
 
-  markTransientFailure(accountIndex, reason = 'transient_error', { network = false } = {}) {
+  markTransientFailure(accountIndex, reason = 'transient_error', { network = false, scope = 'account' } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // REQUEST-SCOPED (review r2 A): a first-byte/idle timeout on ONE request says nothing
+    // about the account's other conversations. Deprioritise it for new placements only
+    // (softCooldownUntil — held conversations keep it), and count consecutive request-
+    // scoped faults. REQUEST_FAULT_ESCALATE in a row (no success between) is no longer
+    // "one slow request": escalate to the account-scoped shape below (real cooldown +
+    // failure streak → held conversations released), logged once per run.
+    if (network && scope === 'request') {
+      account.failedRequests++;
+      account.lastError = reason;
+      account.lastErrorAt = Date.now();
+      account.requestFaultStreak = (account.requestFaultStreak || 0) + 1;
+      if (account.requestFaultStreak < REQUEST_FAULT_ESCALATE) {
+        account.softCooldownUntil = Date.now() + this.scheduler.networkCooldownMs;
+        console.log(`[Maxpool] Account "${account.name}" deprioritised for new placements for ${Math.ceil(this.scheduler.networkCooldownMs / 1000)}s after ${reason} (request-scoped ${account.requestFaultStreak}/${REQUEST_FAULT_ESCALATE}; held conversations stay)`);
+        return;
+      }
+      account.consecutiveFailures++;
+      account.cooldownUntil = Date.now() + this.scheduler.networkCooldownMs;
+      if (!account.requestFaultEscalated) {
+        account.requestFaultEscalated = true;
+        console.log(`[Maxpool] Account "${account.name}": ${account.requestFaultStreak} request-scoped faults in a row (${reason}) — treating as an ACCOUNT fault: cooling down ${Math.ceil(this.scheduler.networkCooldownMs / 1000)}s, held conversations released`);
+      }
+      return;
+    }
 
     if (network) {
       // A network-class failure (lost connectivity / token-refresh `fetch failed`)
@@ -4497,6 +5959,9 @@ export class AccountManager {
     account.refreshDead = false;  // fresh tokens from re-auth revive a dead-refresh account
     account.subscriptionGone = false;  // a working re-auth means the org accepts OAuth again
     if (account.status === 'error') account.status = 'active';
+    // A re-login may be a DIFFERENT org under the same name: forget the cached
+    // claim org and the claim backoff (finding 10).
+    this._forgetClaimState(account.name);
     console.log(`[alPool] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
@@ -4516,6 +5981,7 @@ export class AccountManager {
       type: acctData.type,
       provider: acctData.provider || (acctData.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acctData.accountUuid || null,
+      organizationUuid: acctData.organizationUuid || null,
       credential: acctData.accessToken || acctData.authToken || acctData.apiKey,
       upstream: acctData.upstream || null,
       authHeader: acctData.authHeader || null,
@@ -4523,6 +5989,7 @@ export class AccountManager {
       priority: Number.isFinite(acctData.priority) ? acctData.priority : 0,
       model: acctData.model || null,
       modelMap: acctData.modelMap || null,
+      plan: sanitizePlan(acctData.plan),
       stripBetaHeaders: Boolean(acctData.stripBetaHeaders),
       runtime: Boolean(acctData.runtime),
       configSourced: Boolean(acctData.configSourced),
@@ -4760,6 +6227,9 @@ export class AccountManager {
     const removed = this.accounts[index];
     if (removed.inFlight > 0) return false;
     const removedName = removed.name;
+    // A later account under the same name must start clean (finding 10). Mirrors
+    // never claimed, so only local rows carry claim state.
+    if (!removed.remote) this._forgetClaimState(removedName);
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -4773,11 +6243,17 @@ export class AccountManager {
     return true;
   }
 
-  // Match a saved state entry to a live account by stable identity: prefer the
-  // account UUID when both have one, otherwise fall back to the name.
+  /**
+   * Match a saved state entry to a live account by stable identity: the account
+   * UUID + organization UUID when both have a UUID, otherwise the name. A saved
+   * entry without an organization (written before organizations were recorded)
+   * also matches the same user under the same name, so quota survives the first
+   * restart after an account learns its organization.
+   */
   _sameIdentity(saved, account) {
-    if (saved.accountUuid && account.accountUuid) return saved.accountUuid === account.accountUuid;
-    return saved.name === account.name;
+    if (!saved.accountUuid || !account.accountUuid) return saved.name === account.name;
+    return sameAccountIdentity(saved, account)
+      || (!saved.organizationUuid && sameUser(saved, account) && saved.name === account.name);
   }
 
   /**
@@ -4788,11 +6264,26 @@ export class AccountManager {
     return this.accounts.filter(a => !a.remote).map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      const out = { accountUuid: a.accountUuid, name: a.name, quota };
+      const out = { accountUuid: a.accountUuid, organizationUuid: a.organizationUuid, name: a.name, quota };
       // OUTSIDE-USAGE flag survives restart (red-team R1.2): a restart is exactly
       // when a leak's cards are most at risk — remediation rotates keys and
       // restarts the pool, and the in-memory flag would vanish mid-remediation.
       if (a.outsideUsage?.outside) out.outsideUsage = { ...a.outsideUsage };
+      // RESETS survive restart (2026-11-10, live during the 1.24.84 rollout:
+      // every local row blanked ~5-10 min after each seamless reload because the
+      // serialized grants sweep takes minutes to re-list all accounts). Persist a
+      // grants/cards SNAPSHOT so the post-reload screen shows the last known
+      // count instead of nothing; restoreQuotaState marks it stale.
+      if (a.resetGrants) out.resetGrants = { ...a.resetGrants, grants: (a.resetGrants.grants || []).map(g => ({ ...g })) };
+      if (a.resetCards) out.resetCards = { ...a.resetCards, fiveHour: (a.resetCards.fiveHour || []).map(c => ({ ...c })), weekly: (a.resetCards.weekly || []).map(c => ({ ...c })) };
+      // R7 HOLD REGISTER survives restart (red-team r5 #3): the hold and the claim
+      // stamps that retire it / guard one claim per wall. isHoldingWall re-checks the
+      // restored hold against the live wall and refill, so a stale one self-retires.
+      // Unset fields are undefined and drop out of the JSON state file; a hold is
+      // only ever replaced whole (noteWallHold), so sharing the reference is safe.
+      out.wallHold = a._wallHold;
+      out.lastGeneralClaimAt = a.lastGeneralClaimAt;
+      out.lastFullGeneralClaimAt = a.lastFullGeneralClaimAt;
       return out;
     });
   }
@@ -4827,6 +6318,23 @@ export class AccountManager {
       }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
+      // RESTORED RESETS (2026-11-10): a pre-reload snapshot is a proof, not a
+      // live listing — restore it marked STALE so the screen shows the count
+      // with the not-fresh marker (never blank) and the first live listing
+      // (≤ GRANTS_EVERY_MS) overwrites it. Never claim off a restored listing:
+      // usability is re-derived by the next live check (C5 gates on usableNow
+      // from the LIVE response; a restored entry may be hours old).
+      if (match.resetGrants && !account.resetGrants) {
+        account.resetGrants = { ...match.resetGrants, stale: true };
+      }
+      if (match.resetCards && !account.resetCards) {
+        account.resetCards = { ...match.resetCards, stale: true };
+      }
+      // R7 hold register (r5 #3). Boot-time only (index.js), so nothing live is
+      // overwritten; an absent field restores as undefined, i.e. never stamped.
+      account._wallHold = match.wallHold;
+      account.lastGeneralClaimAt = match.lastGeneralClaimAt;
+      account.lastFullGeneralClaimAt = match.lastFullGeneralClaimAt;
       // OUTSIDE-USAGE restored: keep holding R7 and force the next sweep to
       // re-verify immediately (fresh poolHourly can only re-prove the leak).
       if (match.outsideUsage?.outside) {
@@ -4966,10 +6474,14 @@ export class AccountManager {
       // persistence, re-auth, disk sync) can never resolve to a mirror row.
       a.accountUuid = null;
       a.remoteUuid = ra.accountUuid || null;
+      a.remoteOrganizationUuid = ra.organizationUuid || null;
       a.provider = ra.provider || a.provider;
       a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
       a.status = ra.status || 'active';
       a.refreshDead = Boolean(ra.refreshDead);
+      // The CLOUD's cooldown (additive export; an older cloud omits it = none). Kept off
+      // `cooldownUntil`, which is this process's own routing gate for the mirror row.
+      { const cd = ra.cooldownUntil ? Date.parse(ra.cooldownUntil) : NaN; a.remoteCooldownUntil = Number.isFinite(cd) ? cd : null; }
       a.lastError = ra.lastError || null;
       a.rateLimitedUntil = ra.rateLimitedUntil ? Date.parse(ra.rateLimitedUntil) : null;
       a.capUtilization = ra.capUtilization ?? null;
@@ -4977,14 +6489,33 @@ export class AccountManager {
       a.capCeiling = ra.capCeiling ?? a.capCeiling;
       a.capRampStart = ra.capRampStart ?? a.capRampStart;
       a.addedAt = null;                        // H3: mirrors never count as "warming"
-      a.resetCards = ra.resetCards || null;
-      a.resetGrants = ra.resetGrants || null;
+      // B1/B2 (2026-11-10): one shared normalizeRemoteResets for the mirror row AND
+      // the benched-twin overlay — an OLDER cloud omits `eligible`/new fields; a
+      // missing `eligible` reads grants.length>0 so its holdings still display.
+      // The lift is NEVER recomputed here (C3/pre-mortem #13): the exported
+      // capLift flag is honoured as-is, missing = no lift.
+      const rr = normalizeRemoteResets(ra);
+      a.resetCards = rr.resetCards;
+      a.resetGrants = rr.resetGrants;
+      a.capLift = rr.capLift;
       a.remoteMonthlyPriceUSD = Number.isFinite(ra.monthlyPriceUSD) ? ra.monthlyPriceUSD : null;
       a.remoteTank = ra.tank || null;
+      a.remoteKeyFp = ra.keyFingerprint || null;
+      a.remoteCycles = ra.cycles || null;
+      a.remotePlan = sanitizePlan(ra.plan);
       // Other teammates' live load on this cloud account (remote inFlight minus our
       // own leases) — so the balancer sees the account as busy as it really is.
       a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
+      // The same in WEIGHT units (NaN → fallback when an older cloud omits activeWeight).
+      a._remoteOtherWeight = Number.isFinite(ra.activeWeight) ? Math.max(0, ra.activeWeight - (a.activeWeight || 0)) : NaN;
+      a._remoteInflightCount = Number.isFinite(ra.inFlight) ? ra.inFlight : null;
+      // Our own leases on this row at poll time (already inside ra.inFlight): the depth
+      // estimate swaps them for our CURRENT leases, so our finished requests stop
+      // counting against the row until the next poll (review 2026-11-16, 2c).
+      a._remoteOwnAtSync = a.inFlight || 0;
+      a._remotePinLimit = Number.isFinite(ra.pinBusyAt) ? ra.pinBusyAt : null;
       a._remoteLoad = ra.load || null;
+      a._remoteWallHolding = ra.wallHolding === true;
       a.probing = false;
       a.enabled = true;
     }
@@ -5004,6 +6535,198 @@ export class AccountManager {
     return Boolean(account && account.poolBenchedBy);
   }
 
+  // ── C2: the reactive claim (a 429 on the serving lease claims AT ONCE) ──────
+  // Runs only on the serving lease's LOCAL account holding the credential — never
+  // a mirror row (its 429 is the CLOUD's; the cloud claims on its own side) and
+  // never a relayed 429 (pre-mortem #21: the wrong pool would double-spend).
+  // The grant comes from the STORED listing: stale is allowed up to 6h with
+  // endsAt>now (a fresh listing is exactly what's missing at the wall — the usage
+  // endpoint 429s). The claim uses the CURRENT access token; a 401 defers to the
+  // sweep (no refresh on this path).
+
+  /** Pick the grant for a reactive claim. weekly=true → a general grant; a family
+   *  name → that model's grant, only if the probe MEASURED the bucket at the wall
+   *  (a reactive 429's own 1.0 mark is not measurement). Returns the grant or null. */
+  _reactiveClaimGrant(account, kind, now = Date.now()) {
+    if (!account?.resetGrants || account.resetGrants.eligible === false) return null;
+    const checkedAt = account.resetGrants.checkedAt;
+    if (checkedAt == null || now - checkedAt > CLAIM_STALE_LISTING_MAX_MS) return null;   // stored listing ≤ 6h
+    const grants = (account.resetGrants.grants || [])
+      .filter(g => g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason
+        && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0)
+      .sort((a, b) => (a.endsAt ?? Infinity) - (b.endsAt ?? Infinity));
+    if (!grants.length) return null;
+    if (kind === 'weekly') return grants.find(g => appliesTo(g).includes('general')) || null;
+    // Model-scoped: the probe must have MEASURED that family's bucket at the wall.
+    const e = account.quota?.scopedWeekly?.[kind];
+    const measured = e && e.reactive !== true && e.utilization != null && e.utilization >= CLAUDE_WALL_WEEKLY;
+    if (!measured) return null;
+    // NARROWEST FIRST (2026-11-11, owner report): a grant that directly CLEARS the
+    // general weekly (full-reset shape: clears includes 'seven_day') is the
+    // account's most powerful card — never spend it at a model-only wall while a
+    // model-only grant remains. gives_back_weekly does NOT make a grant broad
+    // (the give-back is a side effect of the model reset, not a weekly refill —
+    // the client's own rule treats it as an OR). Within one breadth, the
+    // soonest-expiry sort above still wins so nothing rots.
+    const clearsWeekly = g => (Array.isArray(g.clears) ? g.clears : []).includes('seven_day');
+    const narrow = grants.find(g => !clearsWeekly(g) && appliesTo(g).includes(kind));
+    return narrow || grants.find(g => appliesTo(g).includes(kind)) || null;
+  }
+
+  /** A claim SUCCEEDED: spend it in the stored listing at once (finding 1). Until
+   *  the next listing (≤ 5 min, or hours when the endpoint 429s) the stored copy
+   *  otherwise still offers the spent reset to the reactive path, the lift and
+   *  the routing discount. resetsLeft drops by one; at 0 the grant leaves. */
+  noteGrantClaimed(account, grantId) {
+    const rg = account?.resetGrants;
+    if (!rg || !Array.isArray(rg.grants)) return;
+    const grants = [];
+    for (const g of rg.grants) {
+      if (g?.id !== grantId) { grants.push(g); continue; }
+      const left = Math.floor(g.resetsLeft ?? 1) - 1;
+      if (left >= 1) grants.push({ ...g, resetsLeft: left });
+    }
+    account.resetGrants = { ...rg, grants };
+  }
+
+  /** Forget everything claim-related keyed by this account name: the cached org
+   *  and the per-grant backoff (finding 10 — a same-name re-login to another org
+   *  must not POST to the old org or inherit its backoff). */
+  _forgetClaimState(accountName) {
+    forgetClaimOrg(accountName);
+    const prefix = `${accountName}:`;
+    for (const m of [this._claimTries, this._claimRetryUntil]) {
+      if (!m) continue;
+      for (const k of [...m.keys()]) if (k.startsWith(prefix)) m.delete(k);
+    }
+  }
+
+  /** C6: the ONE claim lock per account, shared by the prober and the reactive
+   *  path. Returns true when the lock was ACQUIRED (caller must release). */
+  acquireClaimLock(accountName) {
+    if (!this._claimLocks) this._claimLocks = new Set();
+    if (this._claimLocks.has(accountName)) return false;
+    this._claimLocks.add(accountName);
+    return true;
+  }
+
+  releaseClaimLock(accountName) {
+    this._claimLocks?.delete(accountName);
+  }
+
+  /** C6: record a claim FAILURE — backoff per (account, grantId) 15m/30m/1h, cap 6h.
+   *  Shared state with the prober path (same maps). Returns the wait ms. */
+  noteClaimFailure(accountName, grantId, now = Date.now()) {
+    const key = `${accountName}:${grantId}`;
+    if (!this._claimTries) this._claimTries = new Map();
+    if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
+    const tries = (this._claimTries.get(key) || 0) + 1;
+    this._claimTries.set(key, tries);
+    const steps = CLAIM_BACKOFF_STEPS_MS;
+    const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, steps[Math.min(tries - 1, steps.length - 1)]);
+    this._claimRetryUntil.set(key, now + waitMs);
+    return { tries, waitMs };
+  }
+
+  /** C6: a SUCCESSFUL claim clears the backoff for that grant. */
+  noteClaimSuccess(accountName, grantId) {
+    this._claimRetryUntil?.set(`${accountName}:${grantId}`, 0);
+    this._claimTries?.set(`${accountName}:${grantId}`, 0);
+  }
+
+  /** Try the reactive claim for a weekly-class 429 (7d header ≥ 0.999) or a scoped
+   *  429 (model family). Returns true when a claim was attempted. NEVER called for
+   *  a mirror row or a benched/disabled account. Shares the C6 lock and backoff
+   *  state with the prober path. The server calls it fire-and-forget; the claim
+   *  itself gives up after REACTIVE_CLAIM_TIMEOUT_MS so the lock is never held for
+   *  minutes. A 401 (token rejected) defers to the next sweep — it refreshes the
+   *  token first — and is NOT counted as a failed claim (no backoff). */
+  async tryReactiveClaim(account, { kind, weeklyUtil: _weeklyUtil = null }, now = Date.now()) {
+    if (!account) return false;
+    if (account.remote || account.poolBenchedBy || account.enabled === false) return false;
+    if (!account.credential || account.type !== 'oauth') return false;
+    // C6 (finding 1): ONE claim per wall — after a claim, only a probe SENT after
+    // it may show the wall again. Repeated 429s on the same wall never re-claim.
+    // The general wall counts only claims that cleared it (red-team r4 #2): after a
+    // Fable claim under the hold, a dark probe can't move past the account-wide
+    // stamp, and the rescue / weekly 429 must still reach the general reset.
+    const lastClaimAt = (kind === 'weekly' ? account.lastGeneralClaimAt : account.lastClaimAt) ?? null;
+    if (lastClaimAt != null && !((probeSentAt(account.quota) ?? -Infinity) > lastClaimAt)) return false;
+    // No grant (or a scoped 429 without a probe-measured bucket) → the next sweep
+    // decides on its own fresh reading.
+    const grant = this._reactiveClaimGrant(account, kind, now);
+    if (!grant) return false;
+    // R7 (owner, 2026-11-13): a wall 429 claims a held reset only when the free
+    // refill of the limit it clears ISN'T imminent-with-pool-room — the same
+    // wallClaimHeld rule the sweep uses, so the fast path cannot spend a reset the
+    // sweep deliberately holds. Evaluated DIRECTLY here, not via the sweep's full
+    // decision (red-team #3): at the wall the account's own usage probe and listing
+    // are routinely stale (the usage endpoint 429s), and the sweep's freshness skips
+    // would read as "not held" and fall through to a claim. The hold needs no fresh
+    // reading of THIS account: the refill stamp is kept current by every response's
+    // rate-limit headers (updateQuota), the grant end comes from the stored listing,
+    // and capacity comes from the PEERS' own fresh probes (countPeersWithRoom). A
+    // grant dying before (or within 24h after) the refill never waits. The budget
+    // counts every wall held in this pool right now (r2 #2) and the hold is
+    // registered (r2 #1) so the sweep's rescue can find it again.
+    // GENERAL ONLY (red-team r3): a model (Fable) 429 claims exactly as before R7.
+    if (kind === 'weekly' && wallClaimHeld(account.quota?.unified7dReset, grant, now,
+      { peersWithRoom: () => this.countPeersWithRoom(account, now),
+        holdersInPool: () => this.countHoldingWalls(account, now),
+        listingCheckedAt: account.resetGrants?.checkedAt })) {
+      // Log once per hold EPISODE: the sweep's rescue re-evaluates a held wall every
+      // failed tick, and a line per tick would bury the console.
+      const already = this.isHoldingWall(account, now);
+      this.noteWallHold(account, now);
+      if (!already) console.log(`[reset-grant] ${account.name}: at wall, claim held (${HOLD_POOL_HAS_ROOM})`);
+      return false;
+    }
+    // C6: shared backoff per (account, grantId).
+    const key = `${account.name}:${grant.id}`;
+    const until = this._claimRetryUntil?.get(key);
+    if (until && until > now) return false;
+    if (!this.acquireClaimLock(account.name)) return false;
+    try {
+      const { claimResetGrant } = await import('./claude-reset-grants.js');
+      const r = await claimResetGrant(account.credential, grant.id, {
+        accountKey: account.name, signal: AbortSignal.timeout(REACTIVE_CLAIM_TIMEOUT_MS),
+      });
+      if (!r?.ok && r?.status === 401) {
+        console.log(`[reset-grant] ${account.name}: reactive claim deferred to the next sweep (token rejected)`);
+        return true;   // attempted; no backoff, no lift change
+      }
+      if (r?.ok) {
+        this.noteClaimSuccess(account.name, grant.id);
+        account.lastClaimAt = Date.now();
+        // A spent grant that applies to the general weekly — whatever the 429 kind —
+        // counts as the general wall's claim (r3 #3, r4 #3: one claim per wall). Only
+        // one that CLEARS it retires the hold (r5 #1): a give-back returns just what
+        // the model used, and the live reading retires the hold once a probe sees it.
+        if (appliesTo(grant).includes('general')) account.lastGeneralClaimAt = account.lastClaimAt;
+        if (clearsGeneralWeekly(grant)) account.lastFullGeneralClaimAt = account.lastClaimAt;
+        this.noteGrantClaimed(account, grant.id);
+        // Clear the wall this claim refills.
+        if (kind !== 'weekly' && account.quota?.scopedWeekly?.[kind]) delete account.quota.scopedWeekly[kind];
+        if (account.status === 'throttled') {
+          account.status = 'active'; account.rateLimitedUntil = null;
+          if (account.lastError === 'rate_limited') { account.lastError = null; account.lastErrorAt = null; }
+        }
+        this.endCapLift(account.index, 'reactive claim succeeded');
+        console.log(`[reset-grant] ${account.name}: grant ${grant.id} claimed reactively (${kind === 'weekly' ? 'weekly 429 at the wall' : `${kind} scoped 429`})`);
+        return true;
+      }
+      const { tries, waitMs } = this.noteClaimFailure(account.name, grant.id, now);
+      console.log(`[reset-grant] ${account.name}: reactive claim FAILED ${grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
+      this.endCapLift(account.index, 'reactive claim failed');
+      return true;   // attempted
+    } catch (e) {
+      console.log(`[reset-grant] ${account.name}: reactive claim error ${e.message}`);
+      return true;
+    } finally {
+      this.releaseClaimLock(account.name);
+    }
+  }
+
   getStatus() {
     const now = Date.now();
     return {
@@ -5016,7 +6739,20 @@ export class AccountManager {
       // verifies the wrong thing (measured 2026-08-23: reported 1.8.7 while executing
       // 1.8.6). This field is the one to assert on.
       runningVersion: this.runningVersion || null,
+      // Cache-affinity identity health — 'ok' | 'degraded' (+ the measured new-id
+      // share). A post-release check asserts 'ok' on live traffic.
+      affinityIdentity: {
+        state: this.identityHealth.degraded ? 'degraded' : 'ok',
+        newConversationShare: this.identityHealth.lastRate,
+        sampledRequests: this.identityHealth.lastN,
+        since: this.identityHealth.since,
+      },
       currentAccount: this.accounts[this.currentIndex]?.name,
+      // Overall cache / move / bounce / wait figures — the SAME merge the TUI Cache line
+      // uses (mirror rows: cache + served from the serving pool's export, edge-only
+      // fields from this pool's own events), plus edge client outcomes.
+      efficiency: { last15m: this.efficiencyOverall('last15m', now), last1h: this.efficiencyOverall('last1h', now) },
+      clientOutcomes: { last15m: this.clientOutcomeSummary(15 * 60_000, now), last1h: this.clientOutcomeSummary(60 * 60_000, now) },
       switchThreshold: this.switchThreshold,
       routing: {
         mode: this.routingMode,
@@ -5033,8 +6769,30 @@ export class AccountManager {
         remote: Boolean(a.remote),
         // Reset cards / grants (display + cross-pool routing preference). Card ids,
         // counts and expiry only — no credentials; the redeem stays with the holder.
-        resetCards: a.resetCards ? { fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly, checkedAt: a.resetCards.checkedAt } : null,
-        resetGrants: a.resetGrants ? { grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil, checkedAt: a.resetGrants.checkedAt } : null,
+        // B1 (2026-11-10): carries eligible/stale/lastError/checkedAt/capLift/giveBack
+        // so a linked pool (and its TUI) can display and honour them; a DISABLED
+        // account exports null resets (pre-mortem #20: the API must not report
+        // resets for accounts the pool can't use).
+        resetCards: a.enabled === false || !a.resetCards ? null : {
+          fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly,
+          checkedAt: a.resetCards.checkedAt, stale: Boolean(a.resetCards.stale), lastError: a.resetCards.lastError ?? null,
+        },
+        resetGrants: a.enabled === false || !a.resetGrants ? null : {
+          grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil,
+          checkedAt: a.resetGrants.checkedAt, stale: Boolean(a.resetGrants.stale), lastError: a.resetGrants.lastError ?? null,
+          eligible: a.resetGrants.eligible !== false,
+        },
+        // C3: the holder pool's cap-lift verdict. Mirrors honour this as-is;
+        // missing = no lift. Never recomputed on the mirror side.
+        // `ceiling` = the holder's lifted cap (null = full lift): a give-back lift
+        // exported without it read as a FULL lift on every mirror (finding 2).
+        // The EVALUATED verdict (grace, refill proximity, dead/benched), never the
+        // raw stored flag — a lift that capLiftActive would end must not reach mirrors.
+        capLift: (a.remote ? a.capLift?.active === true : this.capLiftActive(a, now))
+          ? { active: true, since: a.capLift.since ?? null, mode: a.capLift.mode ?? null,
+              ceiling: a.remote ? (a.capLift.ceiling ?? null) : this._capLiftCeiling(a, 'wk', now) }
+          : { active: false },
+        giveBack: a.giveBack ?? null,
         // Capacity-page inputs for linked pools (a mirror has no credential and no
         // local cycles): this pool's plan price and measured tanks, per window.
         monthlyPriceUSD: a.remote ? null : this.monthlyPriceFor(a),
@@ -5049,7 +6807,16 @@ export class AccountManager {
         // fingerprint. Without these a linked pool can't see a duplicate Claude login
         // (live-rehearsal 2026-10-29: status omitted accountUuid → no bench).
         accountUuid: a.type === 'oauth' ? (a.accountUuid || null) : null,
+        organizationUuid: a.type === 'oauth' ? (a.organizationUuid || null) : null,
         keyFingerprint: (a.type === 'provider' && a.credential) ? credentialFp(a.credential) : null,
+        // Plan config (display-only) + this pool's closed cycles per window so a linked
+        // pool can UNION history instead of picking one ledger (bounded: 12 weekly /
+        // 60 session). 
+        plan: a.remote ? null : (a.plan || null),
+        cycles: a.remote ? null : {
+          wk: this.capacity?.exportCycles(a.name, 'wk', 12) || [],
+          ses: this.capacity?.exportCycles(a.name, 'ses', 60) || [],
+        },
         upstream: a.upstream,
         profiles: a.profiles,
         priority: a.priority,
@@ -5074,15 +6841,29 @@ export class AccountManager {
             inFlight: a.inFlight,
             activeWeight: a.activeWeight,
           },
-          last15m: this._loadSummary(a, 15 * 60 * 1000, now),
-          last1h: this._loadSummary(a, 60 * 60 * 1000, now),
+          last15m: { ...this._loadSummary(a, 15 * 60 * 1000, now), efficiency: this.rowEfficiencySummary(a, 'last15m', now) },
+          last1h: { ...this._loadSummary(a, 60 * 60 * 1000, now), efficiency: this.rowEfficiencySummary(a, 'last1h', now) },
         },
+        // The cloud's pin limit for this row (linked pools skip it one short of this).
+        pinBusyAt: a.remote ? null : this._pinBusyLimit(a),
+        // A cloud row's cache figures as the SERVING pool exported them (team-wide on
+        // that account); null on an older cloud or a local row.
+        teamEfficiency: a.remote ? {
+          last15m: a._remoteLoad?.last15m?.efficiency ?? null,
+          last1h: a._remoteLoad?.last1h?.efficiency ?? null,
+        } : null,
         lastError: a.lastError,
         lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
         cooldownUntil: Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)
           ? new Date(Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)).toISOString()
           : null,
-        quota: { ...a.quota },
+        // A BENCHED duplicate is never probed or refreshed locally, so its own quota is
+        // stale by design — don't export it as current. The cloud pool owns the live
+        // numbers (the TUI overlays them via remoteRowFor); consumers read this marker.
+        quota: a.poolBenchedBy ? null : { ...a.quota },
+        quotaSource: a.poolBenchedBy ? 'cloud-mirror' : 'local',
+        // A linked pool counts this row's hold against the spare capacity it shares.
+        wallHolding: a.remote ? false : this.isHoldingWall(a, now),
         outsideUsage: a.outsideUsage ? { ...a.outsideUsage } : null,
         weekly: {
           state: this._weeklyState(a),

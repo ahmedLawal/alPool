@@ -31,16 +31,39 @@ export function credentialFp(credential) {
 }
 
 /** Stable identity of an account for duplicate matching. Claude OAuth →
- *  accountUuid; provider key → provider + key fingerprint. null = no identity
- *  (an unnamed apikey account can't be matched — it never benches anything). */
+ *  accountUuid (+ organizationUuid when known); provider key → provider + key
+ *  fingerprint. null = no identity (an unnamed apikey account can't be matched —
+ *  it never benches anything). */
 export function accountIdentity(account) {
   if (!account) return null;
   if (account.type === 'oauth') {
-    return account.accountUuid ? `uuid:${account.accountUuid}` : null;
+    if (!account.accountUuid) return null;
+    return account.organizationUuid ? `uuid:${account.accountUuid}:${account.organizationUuid}` : `uuid:${account.accountUuid}`;
   }
   if (account.type === 'provider' && account.provider && account.credential) {
     return `key:${account.provider}:${credentialFp(account.credential)}`;
   }
+  return null;
+}
+
+// Keys a LOCAL row looks up in a remote identity map. A row whose organization is
+// known also accepts the remote's org-less wildcard `uuid:<uuid>:*` (the remote
+// saved the login before organizations were recorded, or runs an older version);
+// an org-less row looks up the bare `uuid:<uuid>`, which an org-bearing remote row
+// also registers while that user has a single organization there. Two KNOWN and
+// different organizations never match.
+export function identitiesOf(account) {
+  const id = accountIdentity(account);
+  if (!id) return [];
+  if (account.type === 'oauth' && account.organizationUuid) return [id, `uuid:${account.accountUuid}:*`];
+  return [id];
+}
+
+/** Identity of a REMOTE status row (same key shape as accountIdentity). */
+export function remoteAccountIdentity(a) {
+  if (!a) return null;
+  if (a.type === 'oauth') return accountIdentity(a);
+  if (a.type === 'provider' && a.provider && a.keyFingerprint) return `key:${a.provider}:${a.keyFingerprint}`;
   return null;
 }
 
@@ -51,12 +74,33 @@ export function accountIdentity(account) {
 export function remoteIdentities(status) {
   const out = new Map();
   if (!status || !Array.isArray(status.accounts)) return out;
+  const orgsByUser = new Map();   // uuid -> Set of known organizations
+  const exactBare = new Set();    // bare keys owned by an org-less remote row
   for (const a of status.accounts) {
     if (a.enabled === false) continue; // a benched remote row doesn't bench the local copy
-    let id = null;
-    if (a.type === 'oauth' && a.accountUuid) id = `uuid:${a.accountUuid}`;
-    else if (a.type === 'provider' && a.keyFingerprint) id = `key:${a.provider}:${a.keyFingerprint}`;
-    if (id) out.set(id, { name: a.name, provider: a.provider, type: a.type });
+    const row = { name: a.name, provider: a.provider, type: a.type };
+    if (a.type === 'oauth') {
+      if (!a.accountUuid) continue;
+      const bare = `uuid:${a.accountUuid}`;
+      if (a.organizationUuid) {
+        out.set(`${bare}:${a.organizationUuid}`, row);
+        if (!out.has(bare)) out.set(bare, row);       // for an org-less local copy
+        const set = orgsByUser.get(a.accountUuid) || new Set();
+        set.add(a.organizationUuid); orgsByUser.set(a.accountUuid, set);
+      } else {
+        out.set(bare, row); exactBare.add(bare);
+        out.set(`${bare}:*`, row);                     // for an org-bearing local copy
+      }
+    } else if (a.type === 'provider' && a.keyFingerprint) {
+      out.set(`key:${a.provider}:${a.keyFingerprint}`, row);
+    }
+  }
+  // Two known organizations of one user make an org-less local copy ambiguous:
+  // drop the bare key rather than bench on a guess (unless an org-less remote row
+  // owns it exactly).
+  for (const [uuid, orgs] of orgsByUser) {
+    const bare = `uuid:${uuid}`;
+    if (orgs.size > 1 && !exactBare.has(bare)) out.delete(bare);
   }
   return out;
 }
@@ -66,10 +110,23 @@ export function remoteIdentities(status) {
 export function computeDuplicates(accounts, remoteIdentitiesMap) {
   const out = [];
   if (!remoteIdentitiesMap || remoteIdentitiesMap.size === 0) return out;
+  // The org-less wildcard `uuid:<user>:*` is resolved only while the user has at
+  // most ONE known organization locally. Two local orgs against one org-less
+  // remote row is ambiguous (the remote holds at most one of the two
+  // subscriptions), so then only an exact identity match benches — mirroring the
+  // remote-side ambiguity rule below.
+  const orgCount = new Map();
   for (const a of accounts) {
-    const id = accountIdentity(a);
-    const hit = id ? remoteIdentitiesMap.get(id) : null;
-    if (hit) out.push({ index: a.index, identity: id, remoteName: hit.name, provider: hit.provider });
+    if (a?.type === 'oauth' && a.accountUuid && a.organizationUuid) {
+      orgCount.set(a.accountUuid, (orgCount.get(a.accountUuid) || 0) + 1);
+    }
+  }
+  for (const a of accounts) {
+    const ids = identitiesOf(a);
+    const wildcard = ids[1];
+    const usable = orgCount.get(a.accountUuid) > 1 && wildcard ? ids.slice(0, 1) : ids;
+    const hit = usable.map(id => remoteIdentitiesMap.get(id)).find(Boolean);
+    if (hit) out.push({ index: a.index, identity: ids[0], remoteName: hit.name, provider: hit.provider });
   }
   return out;
 }
@@ -170,6 +227,17 @@ function sanitizeRemoteStatus(json) {
  * so a link that hasn't polled yet still benches what it benched last run.
  */
 const BOOT_IDS_TTL_MS = 14 * 24 * 3600 * 1000;  // stale beyond this → trust a fresh boot instead
+export const FAILS_BEFORE_DOWN = 2;
+
+/** Plain-English cause of a link failure, for the one-line cloud banner. */
+export function describeLinkError(err) {
+  const e = String(err || '');
+  if (e === 'key rejected') return "the cloud pool rejected this laptop's key";
+  if (/^HTTP 5\d\d$/.test(e)) return `the cloud pool answered with an error (${e})`;
+  if (/^HTTP /.test(e)) return `the cloud pool answered ${e}`;
+  // timeout, ECONNREFUSED/RESET, "fetch failed", DNS… — from here they look alike.
+  return `no connection — check your internet or the tunnel (${e || 'network error'})`;
+}
 
 export class PoolLink {
   constructor(def, deps = {}) {
@@ -186,6 +254,8 @@ export class PoolLink {
     this.status = null;        // raw remote status JSON when ok
     this.lastError = null;
     this.lastOkAt = null;
+    this.failStreak = 0;       // consecutive failed checks
+    this.downSince = null;     // when lastError was first set (the outage start)
     this.identities = new Map();
     this.summary = null;
   }
@@ -218,13 +288,23 @@ export class PoolLink {
         this.status = sanitizeRemoteStatus(r.json);
         this.lastOkAt = r.at;
         this.lastError = null;
+        this.failStreak = 0;
+        this.downSince = null;
         this.identities = remoteIdentities(r.json);
         this.summary = summarizeRemote(r.json);
       } else {
-        // Keep the LAST good status for display, but mark the link degraded so
-        // routing benches it and the UI names the error.
-        this.lastError = r.error;
-        this.summary = null;
+        // One missed check on a flaky network is not an outage: a single timeout
+        // used to flip every cloud row to ✕ while requests were still getting
+        // through. Mark the link down only after FAILS_BEFORE_DOWN checks in a row
+        // (a rejected key is never transient — down at once). Keep the LAST good
+        // status for display; down → routing benches it and the UI names the cause.
+        this.failStreak = (this.failStreak || 0) + 1;
+        this.lastPollError = r.error;
+        if (this.failStreak >= FAILS_BEFORE_DOWN || r.error === 'key rejected' || this.lastOkAt == null) {
+          if (!this.lastError) this.downSince = r.at;
+          this.lastError = r.error;
+          this.summary = null;
+        }
       }
       return r;
     } finally {

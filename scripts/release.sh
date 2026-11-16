@@ -43,8 +43,16 @@ run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — prints output, fa
   fi
 }
 BUMP="${1:-patch}"
-REMOTE="${RELEASE_REMOTE:-private}"
+# Clones name the GitHub remote differently ('private' on some, 'origin' on others):
+# prefer 'private' when it exists, else 'origin'. Checked BEFORE the test stage so a
+# missing remote fails in seconds, not after the suite and a local version bump.
+if git remote get-url private >/dev/null 2>&1; then DEFAULT_REMOTE=private; else DEFAULT_REMOTE=origin; fi
+REMOTE="${RELEASE_REMOTE:-$DEFAULT_REMOTE}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
+  echo "✗ Git remote '$REMOTE' does not exist in this clone (remotes: $(git remote | tr '\n' ' ')). Set RELEASE_REMOTE." >&2
+  exit 1
+fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "✗ Working tree is dirty. Commit your changes first, then release." >&2
@@ -52,7 +60,10 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-run_stage "Running tests" 900 bash scripts/run-tests.sh
+# Ceiling raised 2026-11-06: the suite outgrew 900s (1462 tests, ~20-25 min on this
+# Mac) and the v1.24.68 release aborted at rc=124 with 770 green, 0 failed. Override
+# with RELEASE_TEST_CEILING.
+run_stage "Running tests" "${RELEASE_TEST_CEILING:-2400}" bash scripts/run-tests.sh
 
 run_stage "Linting" 120 npx eslint src/ || true   # warnings do not block a release
 

@@ -58,7 +58,10 @@ test('pool link: identities + duplicate benching (uuid + provider key)', async (
     const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${port}`, key: 'mp-max' }, {
       fetchRemoteStatus: (url, key) => fetchRemoteStatus(url, key, { timeoutMs: 2000 }),
     });
-    await link.poll();
+    // Retry the first poll: under full-suite load a 2s HTTP timeout to the local
+    // stub can expire once (release run 2026-11-06: failed only under load, green in
+    // isolation). The assertion's subject is identity/benching, not poll timing.
+    for (let i = 0; i < 3 && !link.lastOkAt; i++) await link.poll();
     assert.ok(link.lastOkAt, 'link poll ok');
     assert.equal(link.summary.usable, 2);
 
@@ -231,8 +234,8 @@ test('duplicate guard end-to-end: the REMOTE status (real getStatus shape) carri
 
 
 test('terminal People line: merges local + cloud callers, hides legacy key, empty when nobody named', async () => {
-  const { TUI } = await import('../src/tui.js');
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const { TUI } = await import('../src/tui.js');
   const am = new AccountManager([], 0.9);
   am.callerCounts.set('max', 12);
   am.callerCounts.set('legacy-key', 3);
@@ -319,6 +322,67 @@ test('per-account cloud rows: every remote account mirrored individually, no cre
   assert.equal(am.accounts.filter(a => a.remote).length, 2);
   assert.equal(am.accounts.filter(a => a.remote && a.enabled).length, 0, 'all out of routing');
   am.setPoolLinks([]);
+});
+
+test('request-shape refusal from the linked pool passes through: 429 + marker, mirror row NOT cooled', async () => {
+  // Chain: local proxy -> linked remote proxy -> Anthropic stub that refuses a
+  // non-Claude-Code Opus request (the 2026-11-08 shape refusal). The local side must
+  // hand the client the remote's answer and leave the mirror row available — cooling
+  // it would bench a healthy cloud account for real sessions.
+  const bare = JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Error' } });
+  let remoteHits = 0;
+  let enableLocalOnRefusal = null;
+  const upstream = http.createServer((req, res) => { let b=''; req.on('data', c=>b+=c); req.on('end', () => {
+    remoteHits++;
+    const body = JSON.parse(b);
+    const cc = Array.isArray(body.system) && body.system.some(x => String(x?.text||'').startsWith('You are Claude Code'));
+    if (!/haiku/.test(body.model) && !cc) { enableLocalOnRefusal?.(); res.writeHead(429, { 'content-type': 'application/json' }); res.end(bare); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  }); });
+  const upPort = await listen(upstream);
+  // A CLAUDE-type remote row so the remote's own shape check runs (provider rows skip it).
+  const remoteAm = new AccountManager([{ name: 'reports', type: 'oauth', accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600_000, accountUuid: 'R', upstream: `http://127.0.0.1:${upPort}` }], 0.9, { routingMode: 'balance' });
+  const remote = createProxyServer(remoteAm, { proxy: { clients: [{ name: 'max', key: 'mp-max' }] }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const rPort = await listen(remote);
+
+  // A local apikey route that CAN serve any shape (its own upstream) — after the mirror
+  // refuses the shape, the request must fail over HERE (red-team r2), not pass through.
+  const keyUp = http.createServer((req, res) => { req.resume(); req.on('end', () => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  }); });
+  const keyPort = await listen(keyUp);
+  const localAm = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${keyPort}` }], 0.9, { routingMode: 'balance' });
+  localAm.accounts[0].enabled = false; // phase 1: no local route → the refusal passes through
+  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${rPort}`, key: 'mp-max' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [{ name: 'reports', type: 'oauth', accountUuid: 'R', enabled: true, status: 'active', inFlight: 0, quota: { unified7d: 0.1 } }] };
+  link.identities = remoteIdentities(link.status);
+  localAm.setPoolLinks([link]);
+  const local = createProxyServer(localAm, { proxy: { apiKey: 't' }, queue: { enabled: false } });
+  const lPort = await listen(local);
+  try {
+    const nonCC = JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 8, system: [{ type: 'text', text: 'You are a precise assistant.' }], messages: [{ role: 'user', content: 'hi' }] });
+    const res = await fetch(`http://127.0.0.1:${lPort}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't', 'x-maxpool-profile': 'claude', 'x-maxpool-pin-account': 'reports' }, body: nonCC });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('x-maxpool-request-shape-refused'), '1', 'the marker survived the link hop');
+    const mirror = localAm.accounts.find(a => a.remote && a.remote.remoteName === 'reports');
+    assert.ok(mirror, 'mirror row exists');
+    assert.ok(!mirror.cooldownUntil, 'mirror row was NOT cooled by the shape refusal');
+    assert.notEqual(mirror.status, 'throttled');
+    // Phase 2: a local apikey route exists → the same request is SERVED there. Load
+    // the local row so balancing picks the MIRROR first; the refusal must then fail
+    // over locally (the path under test), not reach the local row by first choice.
+    // Deterministic order: the local row stays OFF while routing picks the mirror and
+    // is switched ON by the cloud's upstream just before it answers with the refusal.
+    enableLocalOnRefusal = () => { localAm.accounts[0].enabled = true; };
+    const remoteHitsBefore = remoteHits;
+    const res2 = await fetch(`http://127.0.0.1:${lPort}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't', 'x-maxpool-profile': 'claude', 'x-maxpool-pin-account': 'reports' }, body: nonCC });
+    assert.equal(res2.status, 200, 'failed over to the local apikey route');
+    assert.ok(remoteHits > remoteHitsBefore, 'the mirror was tried first (the path under test ran)');
+    assert.ok(!mirror.cooldownUntil, 'mirror still not cooled');
+  } finally { await close(local); await close(remote); await close(upstream); await close(keyUp); }
 });
 
 test('pin: remote serves a pinned request ONLY on the named account; pinned-unavailable is a fast 503 the caller fails over on', async () => {
@@ -458,6 +522,7 @@ test('SC22 People screen: columns align by visible width, merges cloud windows, 
 
 test('SC19 sort + hide: Where groups first (local before cloud), h also hides guarded locals', async () => {
   const { TUI } = await import('../src/tui.js');
+  const _strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
   const am = new AccountManager([
     { name: 'kira', type: 'oauth', accountUuid: 'K', accessToken: 'x', refreshToken: 'r' },
   ], 0.9, { routingMode: 'balance' });
@@ -483,7 +548,7 @@ test('SC19 sort + hide: Where groups first (local before cloud), h also hides gu
   am.setPoolLinks([]);
 });
 
-test('link down: cloud mirror rows read "cloud ✕", never "disabled"', async () => {
+test('link down: cloud mirror rows read "offline", never "disabled"', async () => {
   const am = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1' }], 0.9, { routingMode: 'balance' });
   const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
   link.lastOkAt = 1; link.lastError = null;
@@ -498,7 +563,7 @@ test('link down: cloud mirror rows read "cloud ✕", never "disabled"', async ()
   const { TUI } = await import('../src/tui.js');
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
   const line = strip(new TUI({ accountManager: am })._renderAcct(m.index, 11, true));
-  assert.match(line, /cloud ✕/, 'reads as cloud unreachable');
+  assert.match(line, /⟐ offline/, 'reads as cloud unreachable');
   assert.doesNotMatch(line, /disabled/, 'never "disabled"');
   am.setPoolLinks([]);
 });
@@ -679,9 +744,13 @@ test('capacity page on the REAL two-pool shape: cloud rows get their price and t
   const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
   link.lastOkAt = 1; link.lastError = null; link.identities = new Map();
   link.status = { accounts: [
-    { name: 'personal', type: 'oauth', accountUuid: 'P1', enabled: true, status: 'active', inFlight: 0, quota: {} },
+    { name: 'personal', type: 'oauth', accountUuid: 'P1', enabled: true, status: 'active', inFlight: 0, quota: {},
+      plan: { tier: 'Max 20x', cadence: 'monthly', priceUsd: 200, billingMonths: 1 } },
     { name: 'glm q', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0, quota: {},
-      monthlyPriceUSD: 134.4, tank: { wk: { avg: 8_000_000, n: 7, prev: null, last: 8_000_000, lowerBound: false } } },
+      monthlyPriceUSD: 134.4,
+      // v5: only all-token CYCLES are capacity; a bare aggregate `tank` (legacy axis) is ignored.
+      cycles: { ses: [], wk: [{ startedAt: Date.now() - 8 * 86400e3, endedAt: Date.now() - 86400e3, resetAt: Date.now() - 86400e3,
+        tokens: 8_000_000, finalUtilization: 1.0, complete: true, axis: 'all' }] } },
   ] };
   am.setPoolLinks([link]); am.syncRemoteMirrors(link);
   const t = new TUI({ accountManager: am, config: {} });
@@ -711,4 +780,14 @@ test('cloud row tank: months of local history beat a 1-cycle cloud reading', asy
   assert.equal(t.n, 3, 'the 3-cycle local history wins');
   assert.equal(t.avg, 10_000_000);
   am.setPoolLinks([]);
+});
+
+test('two organizations of one Claude user are not duplicates of each other; the same organization is', async () => {
+  const { computeDuplicates } = await import('../src/pool-link.js');
+  const remote = remoteIdentities({ accounts: [{ name: 'team', type: 'oauth', accountUuid: 'U1', organizationUuid: 'O-team', enabled: true }] });
+  const local = [
+    { index: 0, type: 'oauth', accountUuid: 'U1', organizationUuid: 'O-personal' },
+    { index: 1, type: 'oauth', accountUuid: 'U1', organizationUuid: 'O-team' },
+  ];
+  assert.deepEqual(computeDuplicates(local, remote).map(d => d.index), [1]);
 });

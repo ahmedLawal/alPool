@@ -5,6 +5,387 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.97] - 2026-11-16
+
+### Fixed
+
+- Self-update runs npm from the home directory, not the inherited cwd
+
+## [1.24.96] - 2026-11-16
+
+### Added
+
+- Two reset columns (MRst model / ARst account); Fable tag matches the bar
+- A warm conversation waits for its busy cloud account instead of moving
+- Cache efficiency line, per-account cache share and busy-wait setting
+- Q closes the view when Maxpool runs as a background service
+- Background service keeps the pool running when Terminal closes
+
+### Changed
+
+- RED — prober sweeps benched duplicates with dead tokens
+- Pin that a benched row takes no pacing slot (kills sweep-filter mutant)
+- RED — countPeersWithRoom ignores every cloud mirror row
+- Comment wording
+- Fix/skip-benched-probes into the 1.24.96 release
+- RED — warm conversation's busy refusal moves instead of waiting
+- One rule for served-event telemetry (explicit outcome fields win)
+- Pin the busy-exclusion and hard-pin rules in balance mode
+- Shared helpers for the cache-affinity window and efficiency window mapping
+- Feat/sticky-busy-and-efficiency into the 1.24.96 release
+- Skip the launchd/tmux/plutil harness on non-macOS runners
+- Feat/pool-launchd-service into the 1.24.96 release
+
+### Fixed
+
+- Fbl bar draws a real reading even when Anthropic reports is_active=false
+- Prober skips benched duplicates; status marks their quota as cloud-mirror
+- Reset-hold counts fresh cloud mirror rows as peers with room
+- Maxpool status no longer crashes on a benched duplicate's null quota
+- The Mac counts the cloud's own wall holds against shared spare capacity
+- The busy wait now reaches the whole budget (60s by default)
+- Throttle cooldown spares GLM mirrors; stale depth no longer denies a route
+- Count_tokens calls are not turns — not counted served, never re-point a conversation
+- The dashboard sees cloud traffic — bounces, waits, move causes, latency
+- The cloud says 'busy' only for an account that can serve once a slot frees
+- Client cancels aren't pool errors; forced moves keep their cause; the wait setting can't lie; cloud depth is live
+- Two regressions the full suite caught (pre-existing on the branch)
+- Background service starts the pool without waiting for a viewer
+
+## [1.24.95] - 2026-11-15
+
+### Changed
+
+- Contributor guide + lean, gated CI
+
+### Fixed
+
+- End client stream when the upstream leg dies after the status was sent
+- Capacity history spans an org-less row; injected rows get one unique name; regression tests
+- Round-2 from adversarial verification — symmetric healing, local-side wildcard ambiguity, group-deduped peers
+
+## [1.24.94] - 2026-11-14
+
+### Added
+
+- Show a Fable weekly bar between the session and week bars
+- Keep two organizations of one Claude login as separate accounts
+- Leave out the session bar when no account reports a session window
+- Put the Fable weekly bar first, before the session and week bars
+- Hold a wall claim for the imminent free refill while the pool has room
+
+### Changed
+
+- RED — hold the wall claim when the free refill is <24h away and the pool has room
+- Mutation round — pin fractional peer count, roomy/identity-less self, scoped prober wiring; drop dead null check
+- RED — red-team round 1 findings 1-4, 6 (+ scoped reactive insurance); single-now boundary tests (#5)
+- Pin the model-loop hold fall-through with a second (injected) model family
+- RED — red-team round 2 (#1 stranded hold, #2 pool-wide budget, #4 identity-less peer); #3 driven in server order
+- Round-2 mutation pins; held line logs once per hold episode
+- RED — red-team round 3: the hold is for the general weekly wall only
+- RED — red-team round 4 (7 findings)
+- RED — red-team round 5 (3 findings)
+- Simplify pass — reattach _holdsUsableReset JSDoc displaced by the R7 block
+- Isolated reload files get the same one-retry policy as the fast tests
+
+### Fixed
+
+- Fbl staleness marker + stable Ses column
+- Org-less rows heal instead of duplicating; two orgs never share tokens by name
+- Red-team round 1 — model-aware room, fall-through hold, direct reactive gate, cap-measured room, distinct identities
+- Red-team round 2 — held-wall rescue, pool-wide hold budget, identity-less peers skipped
+- Red-team round 3 — hold only the general weekly wall
+- Red-team round 4 — seven findings
+- Red-team round 5 — give-back keeps the hold, dead holders don't count, hold survives restart
+
+## [1.24.93] - 2026-11-14
+
+### Changed
+
+- RED — seamless reload stalls when the terminal is not reading (supervisor + reload worker block on tty writes)
+- Pin the terminal-not-reading fix elements the pty test cannot see
+- Red-team round 2 — id-less notices settle but never cold-restart; helper process; quit/respawn never wait on the terminal
+- Round-2 greens hardened; dead reload worker never touches the live dashboard
+- Gate the pending-raw-switch pty tests on a measured kernel capability
+
+### Fixed
+
+- Seamless reload no longer stalls when the terminal is not reading
+- Cold start keeps synchronous raw mode; deferred reclaim fires on progress
+- Red-team round 1 — rollback notices name their reload, terminal mode switches never stall a serving worker
+- Hand the terminal over before closing the listener; old-supervisor compat test; rollback clock
+- A supervised cold restart hands the terminal to its successor; one update-flag reset
+- Crash-class exit-75s hand the terminal off when supervised
+
+## [1.24.92] - 2026-11-13
+
+### Added
+
+- Client-patience deadline for non-streaming + scrubbed-stream keepalive + client-gone guards
+
+### Fixed
+
+- Red-team round 1 — cloud 120s timer vs pool deadline (F3), mixed-version 504 gate (F1), chokepoint coverage (F5), test hardening (F2/F7/F8)
+- Red-team round 2 — deadline-aware backstop reaper (R2-1), 504 for direct long-patience clients at the hop cap (R2-2)
+
+## [1.24.91] - 2026-11-12
+
+### Changed
+
+- Pin reclaimRawMode by behaviour (toggle + no tcsetattr while the terminal is behind)
+
+### Fixed
+
+- The pool never blocks on its own terminal; link faults count as link drops, not failures
+- Crash paths keep output non-blocking; bounded, overlap hand-off; keys detached during it
+
+## [1.24.90] - 2026-11-12
+
+### Fixed
+
+- A fully-lifted account is not priced on its weekly window
+
+## [1.24.89] - 2026-11-11
+
+### Fixed
+
+- The 10-min lift hold through listing failures starts at the FIRST failure
+
+## [1.24.88] - 2026-11-11
+
+### Fixed
+
+- D2 reaches uncapped accounts; Rst column shows count AND expiry
+
+## [1.24.87] - 2026-11-11
+
+### Changed
+
+- Drop three unused test variables (CI lint red since the resets work)
+
+### Fixed
+
+- A not-yet-rechecked mixed cell keeps 1+2Fable instead of flipping to 3?
+
+## [1.24.86] - 2026-11-11
+
+### Fixed
+
+- Show the weekly half of a full reset (1+2Fable) and spend narrow grants first
+
+## [1.24.85] - 2026-11-10
+
+### Fixed
+
+- Spell the model name (2Fable) and survive self-updates
+
+## [1.24.84] - 2026-11-10
+
+### Fixed
+
+- Rst column — model-scoped grants display under their model tag even when they also give back to the weekly
+
+## [1.24.83] - 2026-11-10
+
+### Fixed
+
+- Accept the live claim success shape {result:'reset',reset:true}
+
+## [1.24.82] - 2026-11-10
+
+### Changed
+
+- One shared appliesTo() across display, routing, claim and lift
+- Pin the sibling-pull regression against a terminal-keyed home; fix home-map field comment
+- Return-home routing fix (repro/home-note-missing) into reset-machinery release
+- Prefix intentionally-unused params (window, now, weeklyUtil) per no-unused-vars
+
+### Documentation
+
+- CONTEXT entry for the 2026-11-10 reset-machinery decisions
+- Record the reset-machinery judge-round decisions
+
+### Fixed
+
+- Fall back to the 'origin' remote when 'private' is absent; fail before the test stage on a missing remote
+- Keep last good reset count (mark stale) on failed grant check; log ttfb
+- Per-grant scope from Anthropic's own clears field; fail-closed normalizer
+- Cap lift while a full-refill reset is held; z.ai cards keep last good; claim pacing + backoff
+- Every row shows its resets with scope; mirrors display and honour the holder's verdict
+- Reactive claim on the serving lease's 429; ttfb anchors the real upstream byte
+- One shared claim lock + backoff for prober and reactive paths; lift start-gates read cooldown and backoff
+- Request path — reactive claim off the request, ttfb per serving attempt, one timing module
+- Judge round 1 — one claim per wall, refill-aware lift, exported ceiling, exact skip reasons
+- Keep return-home memory across identity-key flips and LRU eviction
+- Key the return-home memory by conversation with its own detour flag
+
+## [1.24.81] - 2026-11-10
+
+### Added
+
+- Return a conversation to its last Claude account after a GLM/Kimi detour
+
+### Changed
+
+- Pin GLM-pick guard, pre-return why=, unlock bookkeeping on return-home
+- Delete dead accountLevel branch in the link catch — remote 429/503 never reach it (equivalent mutant M49)
+
+### Fixed
+
+- Return-home review round 1 — attributable throttle line, reset/refusal/503 pins, dead stores, degraded-identity test, window guard
+- Return-home review round 2 — spread test counts switched turns only; pool-wide throttles tagged on the throttle line
+- Client cancel is neutral, request-level faults stop evicting held conversations, every failed attempt logged
+- Size-scaled first-byte wait, retry-same for big prompts, remaining attempt-log sites
+- Red-team r1 — outcome-decided attempt tokens, direct-only retry-same with a patience rule, gates after keep-alive
+- Red-team r2 — request-scoped faults keep held conversations, refusal reroute after keep-alive, first-real-byte heartbeat
+- Retry a rejected transcript only when a foreign tool block was converted
+- Delete the unreachable post-rejection repair branch
+- Red-team r3 — request-scoped body stall, link idle bound, echo-hold cap, soft-cooled home
+- Red-team r4 — revert link header deferral, honest post-headers link stall, echo-hold anchor
+- Red-team r5 — refusal cap shares the first-held-byte anchor; dedupe comment
+
+## [1.24.80] - 2026-11-08
+
+### Added
+
+- Hold a conversation on its account until it cannot serve; why= on move log
+
+### Changed
+
+- Hold-until-cannot-serve affinity + anti-dogpile cap (4fdc70b, 25f52f7)
+
+### Fixed
+
+- Cap the depth a cache-affinity hold can buy (anti-dogpile) + production-size spread tests
+
+## [1.24.79] - 2026-11-08
+
+### Fixed
+
+- Never black-hole connections the supervisor's acceptor wins
+
+## [1.24.78] - 2026-11-08
+
+### Added
+
+- Self-healing guard for conversation identity — detects all-new-ids traffic (proved on today's broken window: 100% vs 24% healthy), falls back to per-terminal affinity, recovers with hysteresis, one log line per transition, status.affinityIdentity
+
+## [1.24.77] - 2026-11-08
+
+### Fixed
+
+- Conversation hash also ignores Claude Code's per-request billing header (cause #2 found on live traffic — identical systems differing only in cch/cc_prev_req checksums)
+
+## [1.24.76] - 2026-11-08
+
+### Fixed
+
+- Conversation hash was unstable across turns (cache_control marker moves per turn) — affinity was inert on ALL real traffic; 1,360/1,360 tagged turns had unique ids. Strip positioning markers before hashing.
+
+## [1.24.75] - 2026-11-08
+
+### Added
+
+- Every request log line tags [cv <conversation> <terminal>] — exact transcript↔account join for cache analysis (peer audit 2026-11-08; timestamp windows confused switches with expiry)
+
+## [1.24.74] - 2026-11-08
+
+### Added
+
+- Size-scaled cache affinity (bigger conversations hold harder, 1x→3x by 450KB) + a per-move evidence log; flat 400 only cut re-writes 18.9%→14.8%
+
+### Changed
+
+- Pin the conversation-move evidence log
+
+## [1.24.73] - 2026-11-08
+
+### Added
+
+- Cache affinity in balance mode — a conversation stays on its last healthy Anthropic account unless load/quota/exclusion says move (default for all users)
+- Per-conversation cache affinity (terminal + prefix hash) so subagent fan-out no longer drags the main thread; bonus scaled to each row's per-unit price; no affinity without a quota signal (Kimi); bounded LRU (red-team r1)
+
+### Changed
+
+- Affinity uniform across account types per owner (GLM included, gated by its own 5h reading)
+- GLM 5h release pinned (low weekly + high session window)
+- Reload-oauth waitFor names the stalled step and keeps the child's log tail (flaked twice on 2026-11-08 with no evidence)
+
+### Fixed
+
+- Affinity gates ordered (5h/failure before unknown-weekly neutral); sticky excluded; prefer-* covered; tests for every release condition + 6 mutants killed
+- Affinity holds through the soft weekly tier (releases at reserve 85%, as designed)
+
+## [1.24.72] - 2026-11-08
+
+### Added
+
+- Add Maxbar menu-bar app + whole-repo gitleaks secret scan
+
+### Changed
+
+- Fix 5 no-unused-vars in tests (pre-existing on main, blocking CI)
+- Close two mutation gaps (mirror-first failover, apikey never takes the shape path)
+
+### Fixed
+
+- Request-shape 429s no longer bench healthy accounts; z.ai reset parsing (UTC+8, bracketed id); 'no coding plan' named
+- Red-team round 1 — fail shape refusals over to non-subscription routes; confirm (not fail) the recovery probe; narrow noPlan; z.ai millis + bracket-tolerant next_flush_time; skip Haiku
+- Red-team r2 — mirror-entry shape refusals fail over to local routes; probe relinquished (ambiguous evidence); oauth-only + canQueueBufferedBody arg
+
+## [1.24.71] - 2026-11-07
+
+### Added
+
+- One fixed client identity per upstream account; per-account concurrency cap 3
+
+### Changed
+
+- Adapt to the per-account cap of 3 (load markers stay below the cap; rebalance tests keep their intent)
+
+### Fixed
+
+- Untrack an accidentally committed node_modules symlink; ignore node_modules as file or dir
+
+### Removed
+
+- Per-account concurrency cap back to 50 (measured against real traffic first)
+
+## [1.24.70] - 2026-11-07
+
+### Changed
+
+- Rc-gate route-switch behaviour test skips without the local MITM key
+
+### Fixed
+
+- Flaky Wi-Fi no longer paints every cloud account red; SIGHUP from another program no longer kills the terminal pool
+
+## [1.24.69] - 2026-11-06
+
+### Changed
+
+- Provider-thinking scrub (flag OFF) — streaming+buffered lanes, renumbering, placeholder, allowlist
+- Log every request-side pre-strip, not just the first latch
+- Decode each stream chunk once — shared-decoder double-decode garbled the accounting lane
+- Log every fired scrub (V1 evidence gap)
+- Convert provider tool blocks to text (not drop) — red-team fixes on the v1.24.68 base
+
+## [1.24.68] - 2026-11-06
+
+### Changed
+
+- Repair GLM mcp_tool_use/mcp_tool_result blocks on Claude replay — no more GLM-only pin when the repair cures it
+- Honest per-account tank — no clamp, multi-sample medians, all-token axis, one row per account
+- Red-team fixes — tested SSE accrual seam, rollback-safe state, Med column, merged-cycle marker, real z.ai usage fixture
+- Provision NEW Claude accounts straight into the linked cloud team pool (TUI + CLI)
+- Med-3 and Med-all columns — recent-3-cycle median beside the all-time median
+- Raise the test-stage ceiling to 40 min (env-overridable) — the suite outgrew 15 min
+- De-flake the capacity-window timing bound (order-of-magnitude, not hard 500ms)
+- Retry the pool-link first poll under load (de-flake)
+- Drop unused planLabel params (release lint gate)
+- Load-aware concurrency + one retry of failed files (release-stage de-flake)
+
 ## [1.24.67] - 2026-11-05
 
 ### Changed
