@@ -230,6 +230,13 @@ const DEFAULT_SCHEDULER = {
   // its whole prompt cache). Edited live from the TUI routing screen (`b`); env
   // MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it when set. 0 = never wait.
   stickyBusyBudgetMs: 60_000,
+  // REPEAT COLD-HOP HOLD (owner 2026-11-17): a long conversation that already paid one
+  // cold Claude re-write after a GLM turn, and is back on GLM, waits up to this long for
+  // a GLM row instead of paying a second cold re-write on Claude (audit 2026-11-16: 55-58
+  // conversations paid a >50k write more than once, 36M tokens in ~5h). Streaming only
+  // (the SSE heartbeat keeps the client alive); off when no GLM row can serve soon.
+  // 0 = never hold.
+  coldClaudeRepeatHoldMs: 120_000,
   concurrencyWeight: 2,           // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
@@ -415,15 +422,19 @@ const EDGE_EFFICIENCY_FIELDS = ['bounced', 'refused', 'waited', 'waitMs', 'waitT
 const efficiencyWindowMs = (windowKey) => (windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000);
 
 function emptyEfficiency() {
-  return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0,
+  return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0, movedSame: 0, movedCross: 0,
     movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
     newConversation: 0, bounced: 0, refused: 0, waited: 0, waitMs: 0, waitThenMoved: 0, e2e: [] };
 }
-/** Add one exported/summarized efficiency block into an accumulator (missing fields = 0). */
+/** Add one exported/summarized efficiency block into an accumulator (missing fields = 0).
+ *  Old blocks without movedSame/movedCross keep their moved total (shown as same-family
+ *  — the cheap side, so a mixed fleet under-reports cross moves rather than inventing them). */
 function addEfficiency(acc, e) {
-  for (const k of ['served', 'in', 'out', 'cr', 'cc', 'moved', 'newConversation', 'bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved']) {
+  const hasSplit = Number.isFinite(Number(e.movedSame)) || Number.isFinite(Number(e.movedCross));
+  for (const k of ['served', 'in', 'out', 'cr', 'cc', 'moved', 'movedSame', 'movedCross', 'newConversation', 'bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved']) {
     acc[k] += Number(e[k]) || 0;
   }
+  if (!hasSplit) acc.movedSame += Number(e.moved) || 0;
   for (const c of Object.keys(acc.movedByCause)) acc.movedByCause[c] += Number(e.movedByCause?.[c]) || 0;
   // Latency samples exist for this pool's own rows only (percentiles do not add).
   if (Array.isArray(e.e2e)) acc.e2e.push(...e.e2e);
@@ -433,14 +444,21 @@ const pct = (arr, p) => {
   const s = [...arr].sort((x, y) => x - y);
   return s[Math.min(s.length - 1, Math.floor(p * s.length))];
 };
-/** Derived figures: hit = cr/(cr+cc+in) (GLM has no cc → r/(r+in)); missTokens = in+cc. */
+/** Derived figures: hit = cr/(cr+cc+in) (GLM has no cc → r/(r+in)); missTokens = in+cc;
+ *  writeShare = 1.25·cc / (0.1·cr + 1.25·cc + in) — the price-weighted share of
+ *  cost-equivalent spend the cache WRITES carry (reads 0.1x, writes 1.25x, uncached
+ *  input 1x). hit% alone read green while writes carried 55% of Claude spend
+ *  (2026-11-17 audit, finding 2). Cost-equivalent = quota-burn proxy (OAuth
+ *  subscriptions), not dollars. */
 function finishEfficiency(acc, provider) {
   const prompt = acc.cr + acc.cc + acc.in;
+  const cost = 0.1 * acc.cr + 1.25 * acc.cc + acc.in;
   const { e2e, ...sums } = acc;
   return {
     ...sums,
     provider,
     hit: prompt > 0 ? acc.cr / prompt : null,
+    writeShare: cost > 0 ? (1.25 * acc.cc) / cost : null,
     missTokens: acc.in + acc.cc,
     promptTokens: prompt,
     lowVolume: acc.served < 20 || prompt < 100_000,
@@ -467,6 +485,27 @@ function lruSet(map, key, value) {
 /** An Anthropic account with its own prompt cache (allow-list: a provider or legacy
  *  pool row can forward to GLM, so "not a provider" is not proof of a Claude cache). */
 const isClaudeAccount = (a) => a?.type === 'oauth' || a?.type === 'apikey';
+// Providers whose prompt cache is shared by every account of that provider, so a
+// conversation warm on one row is warm on all of them. Measured 2026-11-16 (Mac pool,
+// 4.9h): z.ai GLM->GLM hops re-wrote ~150-2.6k tokens vs ~190k per GLM->Claude hop.
+// Kimi is unmeasured, so it stays per account.
+const SHARED_CACHE_PROVIDERS = new Set(['zai']);
+const sharesProviderCache = (a, b) => Boolean(a && b && a.type === 'provider' && b.type === 'provider'
+  && a.provider === b.provider && SHARED_CACHE_PROVIDERS.has(a.provider));
+// A Claude copy of a conversation that went to GLM is treated as dead after this long:
+// audit 2026-11-16 — returns <5 min after the last Claude turn stayed cheap (32 hops,
+// 0.5M), later ones re-wrote nearly in full (median dead-copy age 519 s; a detour pushes
+// the prefix past the cache lookback, so the 1-hour copy does not survive it).
+const COLD_CLAUDE_AFTER_MS = 300_000;
+// How long a paid cold GLM->Claude hop marks the conversation as a repeat offender.
+const COLD_HOP_MEMORY_MS = 6 * 3_600_000;
+// Only conversations big enough that a re-write matters (~40k+ tokens).
+const COLD_HOLD_MIN_BYTES = 150_000;
+/** ROUTING FAMILY for the moved split (2026-11-17 audit, finding 4): every Claude
+ *  account shares one cache-per-account world; each provider (zai, kimi) is its own
+ *  family — z.ai's cache is shared across that provider's accounts, so a zai→zai hop
+ *  re-writes ~nothing while a Claude↔provider hop re-writes the whole prompt. */
+const accountFamily = (a) => (isClaudeAccount(a) ? 'claude' : String(a?.provider || 'provider'));
 const IDENTITY_WINDOW_MS = 15 * 60_000;
 const IDENTITY_MAX_SAMPLES = 4000;
 const IDENTITY_MIN_PER_SESSION = 8;
@@ -742,6 +781,7 @@ export class AccountManager {
       usage: {
         totalInputTokens: 0,
         totalOutputTokens: 0,
+        totalPaidTokens: 0,
         totalRequests: 0,
         lastUsed: null,
       },
@@ -783,6 +823,9 @@ export class AccountManager {
     // account only (a GLM/Kimi turn never overwrites the name; it sets `detoured`), so a
     // conversation returning from a provider detour can go home.
     this.conversationLastClaudeAccount = new Map();
+    // _homeKey → time of the last SERVED GLM->Claude hop that landed on a cold Claude copy
+    // (repeat cold-hop hold, see _coldClaudeHold).
+    this.conversationColdClaudeHops = new Map();
     // Conversation-identity HEALTH (owner 2026-11-08: "make sure this cannot degrade
     // silently"). Twice in one day a Claude Code request-shape detail (a moving
     // cache_control marker, then a per-request billing checksum) made every turn hash
@@ -1115,23 +1158,45 @@ export class AccountManager {
     this._bumpCaller(callerName, 1, 0);
   }
 
-  /** Attribute response TOKENS to the caller (SC22: tokens + requests). */
+  /** Attribute response TOKENS to the caller (SC22: tokens + requests).
+   *  Counting callers are callers with no full-prompt booking (tests, legacy paths);
+   *  full-prompt accounting books the SAME buckets once per request via
+   *  noteCallerPrompt (the running-max capacity figures), so the two never mix on a
+   *  request — releaseAccount books `caller` only when _callerPromptBooked is unset. */
   countCallerTokens(callerName, tokens) {
     if (!callerName || !tokens) return;
-    this._bumpCaller(callerName, 0, tokens);
+    this._bumpCaller(callerName, 0, tokens, 0);
   }
 
-  _bumpCaller(callerName, req, tok) {
+  /** Book one request's FULL token figures for the caller (audit 2026-11-17, finding 3):
+   *  prompt = input + cache_read + cache_creation (provider-native), plus output; paid =
+   *  cache write + uncached input — the part that actually consumes quota/money.
+   *  Called ONCE per request, at the terminal release, off the request's running-max
+   *  capacity book (per-request max ⇒ a rerouted request books once, not per hop).
+   *  Legacy SSE/non-stream per-event countCallerTokens calls are dropped for requests
+   *  that route through this — this supersedes them (they booked message_start input
+   *  + output only: a 908k-token cache-write MISS booked 2 tokens). */
+  noteCallerPrompt(callerName, { input = 0, cacheRead = 0, cacheCreation = 0, output = 0 }) {
+    if (!callerName) return 0;
+    const prompt = (input || 0) + (cacheRead || 0) + (cacheCreation || 0);
+    const paid = (input || 0) + (cacheCreation || 0);
+    if (!(prompt + (output || 0) > 0)) return 0;
+    this._bumpCaller(callerName, 0, prompt + (output || 0), paid);
+    return prompt;
+  }
+
+  _bumpCaller(callerName, req, tok, paid = 0) {
     const now = new Date();
     const hourKey = now.toISOString().slice(0, 13);        // 'YYYY-MM-DDTHH' UTC
     const dayKey = now.toISOString().slice(0, 10);         // 'YYYY-MM-DD' UTC
     let st = this.callerStats.get(callerName);
-    if (!st) { st = { hours: {}, days: {}, total: { req: 0, tok: 0 } }; this.callerStats.set(callerName, st); }
+    if (!st) { st = { hours: {}, days: {}, total: { req: 0, tok: 0, paid: 0 } }; this.callerStats.set(callerName, st); }
     for (const [bucket, key] of [[st.hours, hourKey], [st.days, dayKey]]) {
-      bucket[key] = bucket[key] || { req: 0, tok: 0 };
-      bucket[key].req += req; bucket[key].tok += tok;
+      bucket[key] = bucket[key] || { req: 0, tok: 0, paid: 0 };
+      bucket[key].req += req; bucket[key].tok += tok; bucket[key].paid += paid;
     }
     st.total.req += req; st.total.tok += tok;
+    st.total.paid = (st.total.paid || 0) + paid;
     this._pruneCallerBuckets(st);
   }
 
@@ -1174,22 +1239,22 @@ export class AccountManager {
     const now = Date.now();
     const out = new Map();
     const win = (st, ms, hourly) => {
-      let req = 0, tok = 0;
+      let req = 0, tok = 0, paid = 0;
       const src = hourly ? st.hours : st.days;
       for (const [k, v] of Object.entries(src)) {
         const t = Date.parse(hourly ? k + ':00:00Z' : k + 'T00:00:00Z');
-        if (t <= now && now - t < ms) { req += v.req; tok += v.tok; }
+        if (t <= now && now - t < ms) { req += v.req; tok += v.tok; paid += v.paid || 0; }
       }
-      return { req, tok };
+      return { req, tok, paid };
     };
     const winPrior = (st, fromMs, toMs) => {
-      let req = 0, tok = 0;
+      let req = 0, tok = 0, paid = 0;
       for (const [k, v] of Object.entries(st.days)) {
         const t = Date.parse(k + 'T00:00:00Z');
         const age = now - t;
-        if (t <= now && age >= fromMs && age < toMs) { req += v.req; tok += v.tok; }
+        if (t <= now && age >= fromMs && age < toMs) { req += v.req; tok += v.tok; paid += v.paid || 0; }
       }
-      return { req, tok };
+      return { req, tok, paid };
     };
     for (const [name, st] of this.callerStats) {
       out.set(name, {
@@ -1231,6 +1296,13 @@ export class AccountManager {
       const scope = outcome.upstreamThrottled ? ' pool-wide' : '';
       console.log(`[Maxpool] return-home lease throttled (${outcome.status} ${outcome.error || '-'}${scope}, ${lease.returnedHomeSwitched ? 'switched' : 'natural'}): ${account.name} depth=${depthBefore}`);
     }
+
+    // Per-account + per-caller token totals, booked ONCE per request at its terminal
+    // release off the running-max capacity book (finding 3, 2026-11-17): a stream that
+    // died mid-flight still delivered its tokens, so this runs for every non-neutral
+    // outcome, success or not. A request with no capacity figures (a refusal, a bounce)
+    // books nothing.
+    if (!outcome.neutral) this._bookRequestTokens(lease, account, outcome);
 
     if (lease.upstreamThrottleProbe) {
       if (outcome.success) {
@@ -1294,7 +1366,7 @@ export class AccountManager {
       }
       // Backstop for callers that never saw a first byte (unit callers): a 2xx served
       // the conversation. Idempotent — the first-byte note already ran on the real paths.
-      if (lease.requestInfo && !(outcome.status >= 300)) this.noteConversationServed(lease.requestInfo, account);
+      if (lease.requestInfo && !(outcome.status >= 300)) { this.stampMovedFrom(lease.requestInfo); this.noteConversationServed(lease.requestInfo, account); }
       // Efficiency fields derived from the served request; a field the caller passed
       // explicitly on the outcome wins.
       const tel = this._servedTelemetry(lease.requestInfo, account);
@@ -1335,6 +1407,17 @@ export class AccountManager {
       repeatBounce: Boolean(outcome.repeatBounce),
       usage: outcome.usage || null,
       moved: Boolean(outcome.moved),
+      // Moved split by routing family (finding 4): same = within one family (a zai→zai
+      // hop, near-free — z.ai's cache is shared across its accounts); cross = the
+      // prompt re-wrote wholesale on the new family (e.g. Claude↔provider). A caller
+      // passing `moved` without a family gets it classified HERE (off the lease's
+      // request when it exists, else off the serving account alone).
+      movedSame: Boolean(outcome.movedSame)
+        || (Boolean(outcome.moved) && outcome.movedCross !== true
+          && !this._outcomeMoveCross(outcome, lease, account)),
+      movedCross: Boolean(outcome.movedCross)
+        || (Boolean(outcome.moved) && outcome.movedSame !== true
+          && this._outcomeMoveCross(outcome, lease, account)),
       newConversation: Boolean(outcome.newConversation),
       moveCause: outcome.moveCause || null,
       busyWaitMs: outcome.busyWaitMs || 0,
@@ -1346,6 +1429,58 @@ export class AccountManager {
     this._pruneLoadEvents(account, now);
   }
 
+  /** Book one request's FULL token figures (input + cache read + cache write, provider-
+   *  native, plus output) on the account's usage and the named caller — once per
+   *  request (`_tokensBooked`), at the terminal release (finding 3, 2026-11-17: the
+   *  old per-event booking counted message_start input + output only, so a 908k-token
+   *  cache-write miss booked 2 tokens, and GLM input — which rides message_delta —
+   *  never landed). Unit callers that pass `outcome.usage` instead of filling the
+   *  request's capacity book are honoured when the request carries no figures. */
+  _bookRequestTokens(lease, account, outcome) {
+    const ri = lease.requestInfo;
+    if (ri?.isCountTokens || ri?._tokensBooked) return;
+    // A cloud MIRROR row is served by the linked pool, which books its own tokens (the
+    // People page counts each request once, at the pool that served it); the edge only
+    // taps the usage for efficiency figures.
+    if (account.remote) return;
+    const has = ri && (ri._capacityInput != null || ri._capacityCacheRead != null
+      || ri._capacityCacheCreation != null || ri._capacityOutput != null);
+    const u = has
+      ? { input: ri._capacityInput || 0, cacheRead: ri._capacityCacheRead || 0, cacheCreation: ri._capacityCacheCreation || 0, output: ri._capacityOutput || 0 }
+      : (outcome.success && outcome.usage
+        ? { input: outcome.usage.in || 0, cacheRead: outcome.usage.cr || 0, cacheCreation: outcome.usage.cc || 0, output: outcome.usage.out || 0 }
+        : null);
+    if (!u || !(u.input + u.cacheRead + u.cacheCreation + u.output > 0)) return;
+    if (ri) ri._tokensBooked = true;
+    const idx = Number.isInteger(account.index) ? account.index : this.accounts.indexOf(account);
+    this.updateUsage(idx, { input: u.input, cacheRead: u.cacheRead, cacheCreation: u.cacheCreation }, u.output);
+    this.noteCallerPrompt(ri?.caller ?? outcome.caller, u);
+  }
+
+  /** Classify an outcome-passed move (no family on the outcome): cross unless the
+   *  request's remembered previous holder is a same-family account. No previous holder
+   *  known (no request identity, unit callers) → a Claude serve is cross (unknown prev
+   *  could have re-written the whole prompt — over-report the costly side), a provider
+   *  serve same (its family's shared cache makes the rewrite assumption weak). */
+  _outcomeMoveCross(outcome, lease, account) {
+    const ri = lease?.requestInfo;
+    const fromName = ri ? (ri._servedMovedFrom ?? ri._prevServedName ?? null) : null;
+    const fromAccount = fromName != null ? this.accounts.find(a => a.name === fromName) : null;
+    if (fromAccount == null) return isClaudeAccount(account);
+    return accountFamily(fromAccount) !== accountFamily(account);
+  }
+
+  /** Remember which account served this conversation's PREVIOUS turn, on the request,
+   *  BEFORE noteConversationServed overwrites the memory (finding 4: the move's family
+   *  split needs the previous holder). Idempotent per request; a request that already
+   *  carries `_servedMovedFrom` (set by noteConversationServed itself) is left alone.
+   *  Never touches the conversation maps — display/telemetry only. */
+  stampMovedFrom(requestInfo) {
+    if (!requestInfo || requestInfo._notedServed || requestInfo.isCountTokens || '_prevServedName' in requestInfo) return;
+    const key = this._affinityKey(requestInfo);
+    requestInfo._prevServedName = key ? (this.conversationLastAccount.get(key) ?? null) : null;
+  }
+
   /** Efficiency fields of a SERVED event, read off the request that was served. */
   _servedTelemetry(ri, account) {
     if (!ri) return {};
@@ -1355,6 +1490,19 @@ export class AccountManager {
     // add a latency sample that starts AFTER the edge's wait. Served + tokens stay here.
     const pinned = ri.pinAccount != null;
     const moved = !pinned && Boolean(ri._servedMoved) && ri._notedServed === account.name;
+    // Family split of the move (finding 4): prev family read off the request — the
+    // other engineer's noteConversationServed will soon stamp `ri._servedMovedFrom`;
+    // until then the name is derived here (same key, same map, no edit there).
+    let movedSame = null, movedCross = null;
+    if (moved) {
+      const fromName = ri._servedMovedFrom ?? ri._prevServedName ?? null;
+      const fromAccount = fromName != null ? this.accounts.find(a => a.name === fromName) : null;
+      // No prev row found (renamed/offline) → CROSS: unknown prev family could have
+      // re-written the whole prompt, and over-reporting the costly side is the honest
+      // failure direction for an alarm.
+      const cross = fromAccount == null || accountFamily(fromAccount) !== accountFamily(account);
+      if (cross) movedCross = true; else movedSame = true;
+    }
     return {
       countTokens: Boolean(ri.isCountTokens),
       usage: ri.isCountTokens ? null : {
@@ -1362,6 +1510,7 @@ export class AccountManager {
         cr: ri._capacityCacheRead || 0, cc: ri._capacityCacheCreation || 0,
       },
       moved,
+      movedSame, movedCross,
       moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
       newConversation: !pinned && Boolean(ri._newConversation) && ri._notedServed === account.name,
 
@@ -1393,6 +1542,8 @@ export class AccountManager {
       if (e.usage) { out.in += e.usage.in; out.out += e.usage.out; out.cr += e.usage.cr; out.cc += e.usage.cc; }
       if (e.moved) {
         out.moved++;
+        if (e.movedCross) out.movedCross++;
+        else out.movedSame++;   // legacy events (no split) default to the cheap side
         const c = Object.hasOwn(out.movedByCause, e.moveCause) ? e.moveCause : 'other';
         out.movedByCause[c]++;
         if (e.busyWaitMs > 0) out.waitThenMoved++;
@@ -1420,6 +1571,11 @@ export class AccountManager {
     if (!exp) return edge;
     const acc = emptyEfficiency();
     for (const k of ['served', 'in', 'out', 'cr', 'cc']) acc[k] = Number(exp[k]) || 0;
+    // Family split (finding 4): an export that carries it adds both halves; an older
+    // export keeps its moved total on the cheap side (same) — never invents cross moves.
+    const expSplit = Number.isFinite(Number(exp.movedSame)) || Number.isFinite(Number(exp.movedCross));
+    acc.movedSame = (expSplit ? Number(exp.movedSame) || 0 : Number(exp.moved) || 0) + edge.movedSame;
+    acc.movedCross = (expSplit ? Number(exp.movedCross) || 0 : 0) + edge.movedCross;
     for (const k of EDGE_EFFICIENCY_FIELDS) acc[k] = (Number(exp[k]) || 0) + edge[k];
     for (const c of Object.keys(acc.movedByCause)) {
       acc.movedByCause[c] = (Number(exp.movedByCause?.[c]) || 0) + edge.movedByCause[c];
@@ -1869,7 +2025,12 @@ export class AccountManager {
     // Fairness stays: the skip only fires after a real wait, and the head's own
     // window (queueAndRetry's ceiling) still bounds IT.
     const HEAD_SKIP_MS = 60_000;
-    if (this.queueState.waiting[0]?.id === ticket.id) {
+    // A cold-held ticket (waiting for a GLM row only) is no head for anyone else to
+    // queue behind (red-team 2026-11-17 f1); it keeps its own FIFO place for GLM rows.
+    const head = this._coldHeldTicket(ticket)
+      ? this.queueState.waiting[0]
+      : this.queueState.waiting.find(t => !this._coldHeldTicket(t));
+    if (!head || head.id === ticket.id) {
       // fast path: unchanged FIFO
     } else {
       const waited = Date.now() - (ticket.queuedAt ?? Date.now());
@@ -3324,14 +3485,93 @@ export class AccountManager {
     // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
     // and local queue fairness don't describe them.
     const providerLike = account.type === 'provider' || Boolean(account.remote);
+    // A request parked by the repeat cold-hop hold (red-team 2026-11-17 f1) still
+    // registers a queue ticket like any queued request, but its ticket must not count
+    // as a WAITER for anyone else: a queued waiter makes local Claude rows refuse every
+    // NEW request without a ticket, and a ticket-holder queues behind it — so one held
+    // conversation stalled unrelated traffic on an idle Claude row for up to
+    // HEAD_SKIP_MS (60 s). Held tickets are therefore skipped by the fairness gate
+    // below and by the head pick in canAdmitQueuedRequest (_coldHeldTicket).
+    const coldHeld = isClaudeAccount(account) && this._coldClaudeHold(requestInfo);
     if (
       !providerLike
-      && this.queueState.waiting.length
+      && this.queueState.waiting.some(t => !this._coldHeldTicket(t))
       && !requestInfo.queueTicket
       && !requestInfo.queueAdmitted
     ) return false;
     if (!providerLike && this._isUpstreamThrottleBlocking()) return false;
+    if (coldHeld) return false;
     return true;
+  }
+
+  /**
+   * REPEAT COLD-HOP HOLD (owner 2026-11-17, "yes"): true while Claude rows must NOT take
+   * this request, so it waits (queue + SSE heartbeat) for a GLM row instead of paying a
+   * second cold Claude re-write. All of: the knob is on; a big streaming /v1/messages
+   * turn; the conversation is warm on z.ai (served there last); it already paid a cold
+   * GLM->Claude hop in the last COLD_HOP_MEMORY_MS; its Claude copy is dead; some z.ai
+   * row can serve before the cap ends; and the cap (from the first time the hold
+   * engaged for this request) has not run out.
+   */
+  _coldClaudeHold(requestInfo = {}, now = Date.now()) {
+    const capMs = Number(this.scheduler.coldClaudeRepeatHoldMs);
+    if (!(capMs > 0) || requestInfo.isCountTokens || !requestInfo.stream) return false;
+    if ((requestInfo.bodyBytes || 0) < COLD_HOLD_MIN_BYTES) return false;
+    const homeKey = this._homeKey(requestInfo);
+    const key = this._affinityKey(requestInfo);
+    if (!homeKey || !key) return false;
+    const last = this.accounts.find(a => a.name === this.conversationLastAccount.get(key));
+    // A non-z.ai holder (Claude, Kimi) ends at _sharedCacheRowSoon: no row shares its cache.
+    if (!last) return false;
+    const hopAt = this.conversationColdClaudeHops.get(homeKey);
+    if (hopAt == null || now - hopAt > COLD_HOP_MEMORY_MS) return false;
+    const home = this.conversationLastClaudeAccount.get(homeKey);
+    if (home && now - home.at <= COLD_CLAUDE_AFTER_MS) return false;
+    const started = requestInfo._coldHoldStartedAt ?? now;
+    const until = started + capMs;
+    if (now >= until) return false;
+    if (!this._sharedCacheRowSoon(last, requestInfo, until, now)) return false;
+    if (requestInfo._coldHoldStartedAt == null) {
+      requestInfo._coldHoldStartedAt = now;
+      console.log(`[Maxpool] holding a ${requestInfo.bodyBytes}B conversation for GLM up to ${Math.round(capMs / 1000)}s: it already paid one cold Claude re-write and its Claude copy is ${home ? `${Math.round((now - home.at) / 1000)}s old` : 'absent'}`);
+    }
+    return true;
+  }
+
+  /** Is this queue ticket's request inside a LIVE repeat cold-hop hold? The stamp
+   *  alone is not enough (red-team r2): when the hold releases early — every GLM row
+   *  went dead mid-wait — the ticket becomes an ordinary fair waiter again at once,
+   *  instead of staying invisible to the head pick until the cap expires. */
+  _coldHeldTicket(t, now = Date.now()) {
+    const started = t?.requestInfo?._coldHoldStartedAt;
+    if (started == null) return false;
+    const capMs = Number(this.scheduler.coldClaudeRepeatHoldMs);
+    return capMs > 0 && now < started + capMs && this._coldClaudeHold(t.requestInfo, now);
+  }
+
+  /** Could a z.ai row sharing `holder`'s cache serve this request before `until`?
+   *  (Enabled, eligible, not weekly-out, not benched or 5h-walled past `until`.) */
+  _sharedCacheRowSoon(holder, requestInfo, until, now) {
+    const profile = requestInfo.profile || 'claude';
+    return this.accounts.some(a => {
+      if (a.enabled === false || !sharesProviderCache(holder, a)) return false;
+      // Permanent outs (red-team 2026-11-17 f2): auth-dead, subscription gone,
+      // terminal statuses, a dead cloud mirror — no wait can end in a serve, so the
+      // hold must release at once instead of idling to the cap.
+      if (a.status === 'error' || a.status === 'exhausted' || a.subscriptionGone) return false;
+      if (a.remote && (a.refreshDead || a.status === 'error')) return false;
+      if (!this._matchesRequest(a, profile, requestInfo)) return false;
+      if ((a.rateLimitedUntil || 0) > until && a.status === 'throttled') return false;
+      if ((a.cooldownUntil || 0) > until) return false;
+      if ((a.provisionalUpstreamUntil || 0) > until) return false;
+      // Peak-hour hard bar (red-team r2 f3): peakCap 0 = never during the window, so
+      // waiting cannot end in a serve. Judged at the END of the cap: a window that
+      // closes before then still counts as soon.
+      if (this._peakHardBarred(a, until)) return false;
+      if (this._isSessionQuotaUnavailable(a, now)) return false;
+      const w = this._weeklyRawState(a, now);
+      return w !== 'exhausted' && w !== 'capped';
+    });
   }
 
   _crossProviderFallbackPolicy() {
@@ -4114,23 +4354,32 @@ export class AccountManager {
    * there but costs nothing either, and one rule is simpler to reason about.
    * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
    */
-  _noteConversationAccount(requestInfo, account) {
-    // conversationLastAccount is written at the first real upstream byte
-    // (noteConversationServed), never here: a refused/failed hop must not re-point the
-    // conversation (2026-11-15).
-    // Home memory: ONE key per conversation, independent of identity health, so the
-    // degraded <-> ok flip of _affinityKey can neither hide a home nor lend it to the
-    // sibling conversations that share the terminal key. The entry carries its own
-    // detour state: a Claude turn clears it, a provider turn sets it (same name and
-    // `at`, only the LRU position moves so other traffic cannot evict a long detour).
+  _noteConversationAccount(_requestInfo, _account) {
+    // Both conversation memories are written at the first real upstream byte
+    // (noteConversationServed), never here: a refused/failed attempt must not re-point
+    // the conversation (last account: 2026-11-15; Claude home + detour flag: 2026-11-17).
+  }
+
+  /** Home memory: ONE key per conversation, independent of identity health, so the
+   *  degraded <-> ok flip of _affinityKey can neither hide a home nor lend it to the
+   *  sibling conversations that share the terminal key. The entry carries its own detour
+   *  state: a served Claude turn clears it, a served provider turn sets it (same name and
+   *  `at`, only the LRU position moves so other traffic cannot evict a long detour).
+   *  Also remembers a served GLM->Claude hop that landed on a dead Claude copy. */
+  _noteHomeServed(requestInfo, account, prevName) {
     const homeKey = this._homeKey(requestInfo);
     if (!homeKey) return;
+    const now = requestInfo.now ?? Date.now();
+    const home = this.conversationLastClaudeAccount.get(homeKey);
     if (isClaudeAccount(account)) {
-      lruSet(this.conversationLastClaudeAccount, homeKey,
-        { name: account.name, at: requestInfo.now ?? Date.now(), detoured: false });
-    } else {
-      const home = this.conversationLastClaudeAccount.get(homeKey);
-      if (home) lruSet(this.conversationLastClaudeAccount, homeKey, { ...home, detoured: true });
+      const prev = prevName != null ? this.accounts.find(a => a.name === prevName) : null;
+      const copyDead = !home || home.name !== account.name || now - home.at > COLD_CLAUDE_AFTER_MS;
+      if (prev && SHARED_CACHE_PROVIDERS.has(prev.provider) && prev.type === 'provider' && copyDead) {
+        lruSet(this.conversationColdClaudeHops, homeKey, now);
+      }
+      lruSet(this.conversationLastClaudeAccount, homeKey, { name: account.name, at: now, detoured: false });
+    } else if (home) {
+      lruSet(this.conversationLastClaudeAccount, homeKey, { ...home, detoured: true });
     }
   }
 
@@ -4144,10 +4393,12 @@ export class AccountManager {
     requestInfo._notedServed = account.name;
     requestInfo._servedAt = Date.now();
     const key = this._affinityKey(requestInfo);
+    const prev = key ? this.conversationLastAccount.get(key) : undefined;
+    this._noteHomeServed(requestInfo, account, prev);
     if (!key) return;
-    const prev = this.conversationLastAccount.get(key);
     requestInfo._newConversation = prev == null;
     requestInfo._servedMoved = prev != null && prev !== account.name;
+    requestInfo._servedMovedFrom = requestInfo._servedMoved ? prev : null;
     lruSet(this.conversationLastAccount, key, account.name);
     lruSet(this.conversationLastServedAt, key, Date.now());
   }
@@ -4284,7 +4535,12 @@ export class AccountManager {
     if (base <= 0 || (this.scheduler.routingMode === 'sticky' && !retrySame)) return 0;
     if (!retrySame) {
       const key = this._affinityKey(requestInfo);
-      if (!key || (holderName ?? this.conversationLastAccount.get(key)) !== account.name) return 0;
+      const holder = key ? (holderName ?? this.conversationLastAccount.get(key)) : null;
+      // FAMILY AFFINITY (owner 2026-11-17): a z.ai holder makes every z.ai row warm (the
+      // cache is shared), so when the holder is excluded/busy a GLM sibling — not a cold
+      // Claude row — inherits the hold. Same bonus, release gates and anti-dogpile cap.
+      if (!holder || (holder !== account.name
+        && !sharesProviderCache(this.accounts.find(a => a.name === holder), account))) return 0;
     }
     // Scale with the CONVERSATION'S SIZE too: losing the cache costs the prefix a
     // hop re-writes, and requestInfo.bodyBytes ≈ prefix + this turn. Checkpoint
@@ -5631,12 +5887,24 @@ export class AccountManager {
 
   /**
    * Update cumulative token usage from response body data.
+   * `inputTokens` may be a number (legacy: uncached input only) or a usage object
+   * {input, cacheRead, cacheCreation} — the object books FULL prompt tokens
+   * (input + cache read + cache write, provider-native; finding 3, 2026-11-17), and
+   * paid (write + uncached) into totalPaidTokens beside it.
    */
   updateUsage(accountIndex, inputTokens, outputTokens) {
     const account = this.accounts[accountIndex];
     if (!account) return;
-    if (inputTokens) account.usage.totalInputTokens += inputTokens;
+    let input = inputTokens, paid = null;
+    if (inputTokens && typeof inputTokens === 'object') {
+      input = (inputTokens.input || 0) + (inputTokens.cacheRead || 0) + (inputTokens.cacheCreation || 0);
+      paid = (inputTokens.input || 0) + (inputTokens.cacheCreation || 0);
+    }
+    if (input) account.usage.totalInputTokens += input;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+    // Legacy two-arg calls carry uncached input → it counts as paid too.
+    const paidAdd = paid != null ? paid : (typeof inputTokens === 'number' ? inputTokens : 0);
+    if (paidAdd) account.usage.totalPaidTokens = (account.usage.totalPaidTokens || 0) + paidAdd;
   }
 
   /**
@@ -6023,7 +6291,7 @@ export class AccountManager {
       // Unknown quota until the first response — probe it like startup accounts.
       probing: true,
       quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
+      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalPaidTokens: 0, totalRequests: 0, lastUsed: null },
       inFlight: 0,
       activeWeight: 0,
       completedRequests: 0,
