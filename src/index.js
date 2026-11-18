@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
+import { join } from 'node:path';
 
 // DUAL-STACK TUNING (2026-10-08). Node ≥20 enables happy-eyeballs with a 250ms
 // per-family attempt timeout. On networks where IPv6 is degraded-but-not-dead and the
@@ -1457,12 +1458,23 @@ async function serverWorkerCommand() {
   };
 
   const clientRoute = new ClientRoute();
+  // Runs scripts/sync-upstream.sh (merge + validate + push) detached from the
+  // request; the script self-locks against the launchd schedule and writes its
+  // own status file, which getUpstreamSyncStatus exposes to the UI.
+  const runUpstreamSync = () => new Promise((resolve, reject) => {
+    const script = join(process.cwd(), 'scripts', 'sync-upstream.sh');
+    const child = spawn(script, [], { detached: true, stdio: 'ignore' });
+    child.unref();
+    child.on('error', reject);
+    child.on('spawn', () => resolve());
+  });
   const controlService = new ControlService({
     accountManager,
     config,
     persistConfig: persistLiveConfig,
     syncAccounts: syncAccountsNow,
     checkForUpdates: () => checkForUpdatesNow(),
+    syncUpstream: () => runUpstreamSync(),
     getUpstreamSyncStatus: () => readUpstreamSyncStatus(),
     getSelfUpdateStatus: () => readSelfUpdateStatus(),
     getActivity: () => activityFeed.snapshot(),

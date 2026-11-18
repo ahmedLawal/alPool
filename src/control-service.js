@@ -24,6 +24,7 @@ export class ControlService {
     persistConfig,
     syncAccounts,
     checkForUpdates,
+    syncUpstream = null,
     getUpstreamSyncStatus = () => null,
     getSelfUpdateStatus = () => null,
     getClientRouting = () => null,
@@ -38,6 +39,7 @@ export class ControlService {
     this.persistConfig = persistConfig;
     this.syncAccounts = syncAccounts;
     this.checkForUpdates = checkForUpdates;
+    this.syncUpstream = syncUpstream;
     this.getUpstreamSyncStatus = getUpstreamSyncStatus;
     this.getSelfUpdateStatus = getSelfUpdateStatus;
     this.getActivity = getActivity;
@@ -140,6 +142,8 @@ export class ControlService {
         return this._syncAccounts();
       case 'check-update':
         return this._checkUpdate();
+      case 'sync-upstream':
+        return this._syncUpstream();
       case 'restart':
         return this._deferLifecycle('Restart requested', this.requestRestart);
       case 'stop':
@@ -347,6 +351,13 @@ export class ControlService {
     if (!this.checkForUpdates) throw new ControlError('Update checks are unavailable.', 503, 'unavailable');
     await this.checkForUpdates();
     return this._success('Update check started');
+  }
+
+  async _syncUpstream() {
+    if (!this.syncUpstream) throw new ControlError('Upstream sync is unavailable.', 503, 'unavailable');
+    // Don't block the control socket on a merge+test that can take minutes.
+    this.syncUpstream().catch(error => this.log(`Upstream sync failed: ${error?.message ?? error}`));
+    return this._success('Upstream sync started');
   }
 
   _deferLifecycle(message, callback) {

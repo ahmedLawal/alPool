@@ -739,6 +739,7 @@ private struct UpdatesView: View {
                     Label(upstreamStatusLabel, systemImage: upstreamStatusSymbol)
                         .foregroundStyle(upstreamStatusColor)
                 }
+                Button("Pull from Max's upstream now") { Task { await model.send(.init(type: "sync-upstream")) } }
                 if snapshot.upstreamSync?.state == "failed" {
                     Text(snapshot.upstreamSync?.error ?? "The upstream update failed. The installed version is still active.")
                         .foregroundStyle(.red)
