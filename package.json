@@ -1,6 +1,6 @@
 {
   "name": "alpool",
-  "version": "1.24.104",
+  "version": "1.24.108",
   "description": "alPool multi-account Claude Code proxy with adaptive, rate-aware load balancing",
   "type": "module",
   "main": "src/index.js",

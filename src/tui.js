@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
+import { sendProviderToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
 import { normalizeRemoteResets, resolveStickyBusyBudget } from './account-manager.js';
 import { appliesTo } from './claude-reset-grants.js';
@@ -487,6 +488,28 @@ function pricePerMTokens(monthlyPrice, weeklyTankTokens) {
   if (perM >= 0.1) return '$' + perM.toFixed(2);
   // 2 significant digits below 10 cents: $0.015 (not $0.02), $0.0029 (not $0.003).
   return '$' + Number(perM.toPrecision(2)).toString();
+}
+
+/** Why a row has no finished, admitted cycle (audit D16, 2026-11-18): a plain '--'
+ *  collapsed several distinct causes. Returns a short word for the Prev cell:
+ *   '1st wk MM-DD' — no finished cycle yet; the first one closes on that date
+ *   'old count'    — finished cycles exist but all predate the 2026-11-06 token count
+ *   'too short'    — finished cycles exist but none was long/strong enough to measure
+ *  null when the row HAS admitted history (the numbers render instead). */
+function historyReason(am, a, win, nowOpen) {
+  const hist = am?.capacityHistory ? am.capacityHistory(a, win) : (am?.capacity?.closedCycles?.(a.name, win) || []);
+  if (!hist.length) {
+    const ws = nowOpen?.windowStartedAt ?? a?.remoteOpen?.[win]?.windowStartedAt ?? null;
+    const span = win === 'wk' ? 7 * 86400_000 : 5 * 3600_000;
+    if (Number.isFinite(ws)) {
+      const end = new Date(ws + span);
+      const mm = String(end.getUTCMonth() + 1).padStart(2, '0'), dd = String(end.getUTCDate()).padStart(2, '0');
+      return win === 'wk' ? `1st wk ${mm}-${dd}` : 'first 5h';
+    }
+    return 'no week yet';
+  }
+  if (hist.every(c => (c.axis ?? 'io') !== 'all')) return 'old count';
+  return 'too short';
 }
 
 function sessionFull(am, a) {
@@ -1462,7 +1485,7 @@ export class TUI {
     this._addLog(`Resolving GCP secret "${input}"…`);
     this.forceRender();
     try {
-      const { resolveSecret } = await import('../secret-resolver.js');
+      const { resolveSecret } = await import('./secret-resolver.js');
       const v = await resolveSecret(input);
       if (!v) {
         this._addLog(`✗ GCP secret "${input}" not found (or gcloud is not authenticated). ` +
@@ -1558,7 +1581,7 @@ export class TUI {
     }
   }
 
-  async _doAddProvider({ name, provider, secretName, apiKey }) {
+  async _doAddProvider({ name, provider, secretName, apiKey }, { toTeam = null } = {}) {
     this.mode = 'accounts';
     if (secretName) this._addLog(`Resolving secret "${secretName}" from GCP…`);
     else this._addLog(`Adding "${name}" with direct API key…`);
@@ -1566,7 +1589,7 @@ export class TUI {
     try {
       let token = null;
       if (secretName) {
-        const { resolveSecret } = await import('../secret-resolver.js');
+        const { resolveSecret } = await import('./secret-resolver.js');
         token = await resolveSecret(secretName);
         if (!token) {
           this._addLog(`✗ Secret "${secretName}" not found in GCP — create it first: gcloud secrets create ${secretName} --data-file=-`);
@@ -1575,8 +1598,29 @@ export class TUI {
       } else {
         token = apiKey;
       }
+      // TEAM-POOL CHOICE (2026-11-18, parity with the Claude login flow): when a linked
+      // pool exists and the caller did not already decide, ask once — cloud recommended
+      // (the key serves the whole team there), laptop on 'l'. A chosen team target sends
+      // the key over the link's authenticated channel and saves NOTHING locally.
+      const link = this.am.poolLinks?.[0] || null;
+      let team = toTeam;
+      if (team == null && link && !this.am.accounts.some(a => a.type === 'provider' && a.credential === token)) {
+        const where = String(await this._ask(`\nAdd "${name}" to the team pool "${link.name}" (recommended) or this laptop only? [T/l]: `) || '').trim().toLowerCase();
+        team = where !== 'l';
+      }
+      if (team && link) {
+        this._addLog(`Sending "${name}" to the team pool (${link.name})…`);
+        this.forceRender();
+        const r = await sendProviderToPool({ url: link.url, key: link.key, name, provider, apiKey: token, secretName });
+        if (r.ok) {
+          this._addLog(`✓ ${r.result === 'exists' ? `"${r.name}" already in` : `Added "${r.name}" to`} the team pool (${link.name}). Nothing saved on this laptop.`);
+        } else {
+          this._addLog(`✗ Team pool failed — ${r.error}. NOTHING saved locally; try again.`);
+        }
+        return;
+      }
       // Add to config (persistence) and activate immediately.
-      const { atomicConfigUpdate } = await import('../config.js');
+      const { atomicConfigUpdate } = await import('./config.js');
       await atomicConfigUpdate(cfg => {
         if (!Array.isArray(cfg.providers)) cfg.providers = [];
         const entry = { name, provider };
@@ -3043,7 +3087,7 @@ export class TUI {
     // A mirror row whose link is down/stale is benched by syncRemoteMirrors with
     // enabled=false — show it as cloud-unreachable, never as "disabled" (which reads
     // as "I switched this off"). _cloud/_cloudOk were never set; key on a.remote.
-    const linkDown = a.remote && (a.remote.link?.lastError || a.remote.link?.lastOkAt == null);
+    const linkDown = a.remote && (a.remote.link?.lastError || a.remote.link?.probeDown || a.remote.link?.lastOkAt == null);
     let effectiveStatus = a.remote && (linkDown || a.enabled === false)
       ? (linkDown ? 'cloud-down' : 'disabled')
       : (a.poolBenchedBy ? 'pool-benched' : (a.enabled === false ? 'disabled' : a.status));
@@ -3698,7 +3742,7 @@ export class TUI {
         // Prev = the newest FINISHED cycle (audit D4) — once Current is live, the
         // reader wants "what did last week hold", which is `last`, not the
         // second-newest (that comparison is Med-3's job).
-        Prev: (tank?.source === 'cycles' && tank.last != null ? formatTokens(tank.last) : '--'),
+        Prev: (tank?.source === 'cycles' && tank.last != null ? formatTokens(tank.last) : (historyReason(this.am, a, win, nowOpen) || '--')),
         'Med-3': (tank?.source === 'cycles' && tank.recent != null ? formatTokens(tank.recent) : '--'),
         'Med-all': (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
         // `n*` = at least one contributing cycle is a two-pool merge (no per-reading
@@ -3741,6 +3785,7 @@ export class TUI {
     out.push(' ' + dim('Tokens = processed tokens (provider-native): input + cached + output, counted in each provider\'s own tokenizer.'));
     out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise. Cycles before 2026-11-06 used a different token count and are never admitted (old count).'));
     out.push(' ' + dim('Current @% = the LIVE window, % full now. Prev = the newest finished cycle.'));
+    out.push(' ' + dim('No finished week yet? Prev says why: "1st wk MM-DD" = first week ends then · "old count" = only weeks counted before 2026-11-06 · "too short" = finished weeks too short to measure.'));
     out.push(' ' + dim('$/1M = monthly plan price ÷ (weekly tank × 4.35), so it is the price a month of subscription actually buys per 1M tokens.'));
     return out;
   }

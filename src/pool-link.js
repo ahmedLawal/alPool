@@ -19,6 +19,8 @@
  *    so a downstream pool can refuse a loop (A→B→A) instead of hanging.
  */
 import { createHash } from 'node:crypto';
+import http from 'node:http';
+import https from 'node:https';
 
 export const HOP_HEADER = 'x-maxpool-hops';
 export const MAX_HOPS = 2;
@@ -142,7 +144,11 @@ export function nextHopCount(headerValue) {
 /** Fetch a remote pool's status. Returns { ok, status, json, error, at }.
  *  Never throws; a network failure is a normal condition (remote down),
  *  surfaced via ok:false so the caller can bench the link account. */
-export async function fetchRemoteStatus(url, key, { fetchFn = fetch, timeoutMs = 10_000, now = Date.now } = {}) {
+/** Status-poll timeout. The poll is NOT the liveness signal (the 5 s probe is) and it
+ *  carries 0.5-1 MB from a busy cloud, so it gets a generous budget (was 10 s). */
+export const STATUS_TIMEOUT_MS = 20_000;
+
+export async function fetchRemoteStatus(url, key, { fetchFn = fetch, timeoutMs = STATUS_TIMEOUT_MS, now = Date.now } = {}) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
@@ -165,6 +171,44 @@ export async function fetchRemoteStatus(url, key, { fetchFn = fetch, timeoutMs =
     clearTimeout(t);
   }
 }
+
+/** Dead-link probe (2026-11-18): GET <url>/maxpool/ping on a FRESH connection
+ *  (agent:false — a pooled socket can be half-dead behind a silently-dropped tunnel)
+ *  with a hard timeout. ANY HTTP status proves the tunnel and the cloud's event loop
+ *  (an older cloud's 404/401 included); only a timeout / socket error is a miss.
+ *  Resolves { status, error } — status null = miss. Never throws. */
+export function probeLink(url, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let req = null;
+    const done = (status, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { req?.destroy(); } catch { /* already gone */ }
+      resolve({ status, error });
+    };
+    const timer = setTimeout(() => done(null, 'timeout'), timeoutMs);
+    timer.unref?.();
+    try {
+      const target = new URL(`${String(url).replace(/\/+$/, '')}/maxpool/ping`);
+      const mod = target.protocol === 'https:' ? https : http;
+      req = mod.request(target, { method: 'GET', agent: false, headers: { connection: 'close' } }, (res) => {
+        res.resume();
+        done(res.statusCode, null);
+      });
+      req.on('error', (err) => done(null, err?.code || err?.message || 'network error'));
+      req.end();
+    } catch (err) {
+      done(null, err?.message || 'bad url');
+    }
+  });
+}
+
+export const PROBE_TIMEOUT_MS = 3_000;
+export const PROBE_INTERVAL_MS = 5_000;
+export const PROBE_MISSES_BEFORE_DOWN = 3;
+export const PROBE_HITS_BEFORE_UP = 2;
 
 /** Aggregate a remote status into link health + capacity, for scoring.
  *  conservative: counts an account as spent when its weekly window is ≥95%,
@@ -247,6 +291,7 @@ export class PoolLink {
     this.keySecret = def.keySecret || null;
     this.intervalMs = Math.max(5_000, Number(def.intervalMs) || 30_000);
     this._fetchRemoteStatus = deps.fetchRemoteStatus || fetchRemoteStatus;
+    this._probeFn = deps.probeFn || probeLink;
     this._now = deps.now || Date.now;
     this._timer = null;
     this._polling = false;
@@ -258,6 +303,26 @@ export class PoolLink {
     this.downSince = null;     // when lastError was first set (the outage start)
     this.identities = new Map();
     this.summary = null;
+    // Dead-link probe state (see probe()). probeDown takes the link's mirrors out of
+    // routing exactly like lastError, but within ~15 s instead of 40-70 s.
+    this._probeTimer = null;
+    this._probing = null;      // the in-flight probe promise (never stacked)
+    this._probeOnChange = null;
+    this._downListeners = new Set();
+    this._upListeners = new Set();
+    this.probeMisses = 0;
+    this.probeHits = 0;
+    this.probeDown = false;
+    this.probeFirstMissAt = null;
+    this.probeDownAt = null;
+    this.lastProbeOkAt = null; // last time the probe got ANY answer (liveness authority)
+  }
+
+  /** True while the dead-link probe vouches for the link: it has run, is not down,
+   *  and answered within the last two probe intervals. */
+  probeSaysAlive() {
+    return !this.probeDown && this.lastProbeOkAt != null
+      && this._now() - this.lastProbeOkAt <= 2 * PROBE_INTERVAL_MS;
   }
 
   /** Seed identities persisted from a previous run (state.json). Used until the
@@ -289,6 +354,7 @@ export class PoolLink {
         this.lastOkAt = r.at;
         this.lastError = null;
         this.failStreak = 0;
+        this._softFailLogged = false;
         this.downSince = null;
         this.identities = remoteIdentities(r.json);
         this.summary = summarizeRemote(r.json);
@@ -300,6 +366,19 @@ export class PoolLink {
         // status for display; down → routing benches it and the UI names the cause.
         this.failStreak = (this.failStreak || 0) + 1;
         this.lastPollError = r.error;
+        // Liveness authority (2026-11-18 false-outage fix): the ~1 MB status body can
+        // be slow through a busy tunnel while the link is fine. A timeout / network
+        // error (no HTTP answer) never marks the link down while the 5 s probe says it
+        // is alive — keep the last good status (stale-but-usable). A rejected key or
+        // an HTTP error from the cloud is a real answer and still marks down below.
+        const softFail = r.status == null && r.error !== 'key rejected';
+        if (softFail && this.lastOkAt != null && !this.lastError && this.probeSaysAlive()) {
+          if (!this._softFailLogged) {
+            this._softFailLogged = true;
+            console.log(`[Maxpool] link "${this.name}" status poll slow/failed (${r.error}) — link alive per probe; keeping last status`);
+          }
+          return r;
+        }
         if (this.failStreak >= FAILS_BEFORE_DOWN || r.error === 'key rejected' || this.lastOkAt == null) {
           if (!this.lastError) this.downSince = r.at;
           this.lastError = r.error;
@@ -310,6 +389,95 @@ export class PoolLink {
     } finally {
       this._polling = false;
     }
+  }
+
+  /** One probe. PROBE_MISSES_BEFORE_DOWN misses in a row → probeDown (onChange, then
+   *  the onDown listeners, once); while down, PROBE_HITS_BEFORE_UP answers in a row →
+   *  up (onChange, then the onUp listeners, once). A single answer resets the miss streak. Never stacks: a call
+   *  while a probe is in flight joins it. Resolves true when the cloud answered. */
+  probe() {
+    if (this._probing) return this._probing;
+    this._probing = (async () => {
+      let r;
+      try { r = await this._probeFn(this.url, { timeoutMs: PROBE_TIMEOUT_MS }); } catch (err) { r = { status: null, error: err?.message || 'probe failed' }; }
+      const alive = Number.isFinite(r?.status);
+      const now = this._now();
+      let changed = false;
+      if (alive) {
+        this.lastProbeOkAt = now;
+        this.probeMisses = 0;
+        this.probeFirstMissAt = null;
+        if (this.probeDown) {
+          this.probeHits += 1;
+          if (this.probeHits >= PROBE_HITS_BEFORE_UP) {
+            const downS = this.probeDownAt != null ? Math.round((now - this.probeDownAt) / 1000) : 0;
+            this.probeDown = false;
+            this.probeDownAt = null;
+            this.probeHits = 0;
+            changed = true;
+            console.log(`[Maxpool] link "${this.name}" back UP after ${downS}s`);
+          }
+        }
+      } else {
+        this.probeHits = 0;
+        if (this.probeMisses === 0) this.probeFirstMissAt = now;
+        this.probeMisses += 1;
+        // Red team F3: a near-miss streak is logged so the false-alarm rate is measurable.
+        if (this.probeMisses === PROBE_MISSES_BEFORE_DOWN - 1) {
+          console.log(`[Maxpool] link "${this.name}" ${this.probeMisses} probes unanswered (first miss ${new Date(this.probeFirstMissAt).toISOString()})`);
+        }
+        // Red team F3: VETO — bytes flowed on this link within one probe interval, so the
+        // tunnel is alive (a ping can miss on an event-loop stall or a new-connection limit
+        // while live streams keep flowing). Cutting those hops would re-bill their prefill.
+        const recentBytes = [...(this._inflight || [])].some(e => e?.lastByteAt != null && now - e.lastByteAt < PROBE_INTERVAL_MS);
+        if (!this.probeDown && this.probeMisses >= PROBE_MISSES_BEFORE_DOWN && recentBytes) {
+          console.log(`[Maxpool] link "${this.name}" — ${this.probeMisses} probes unanswered but replies are still flowing; NOT declaring down`);
+        } else if (!this.probeDown && this.probeMisses >= PROBE_MISSES_BEFORE_DOWN) {
+          this.probeDown = true;
+          this.probeDownAt = now;
+          changed = true;
+          console.log(`[Maxpool] link "${this.name}" DOWN — no answer to ${this.probeMisses} probes (first miss ${new Date(this.probeFirstMissAt).toISOString()}, declared ${new Date(now).toISOString()})`);
+        }
+      }
+      if (changed) {
+        // Re-sync routing FIRST (mirrors leave), then cut in-flight waits — so a cut
+        // request's failover already sees the link's rows out of routing.
+        try { this._probeOnChange?.(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" probe onChange failed: ${err?.message || err}`); }
+        for (const fn of this.probeDown ? this._downListeners : this._upListeners) {
+          try { fn(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" ${this.probeDown ? 'down' : 'up'} listener failed: ${err?.message || err}`); }
+        }
+      }
+      return alive;
+    })().finally(() => { this._probing = null; });
+    return this._probing;
+  }
+
+  /** Fire one probe now (a request just hit a link fault). Non-blocking; joins an
+   *  in-flight probe instead of stacking. */
+  probeNow() {
+    return this.probe().catch(() => false);
+  }
+
+  /** Register a callback run once per DOWN transition (the server cuts in-flight
+   *  link waits). Returns an unsubscribe function. */
+  onDown(fn) {
+    this._downListeners.add(fn);
+    return () => this._downListeners.delete(fn);
+  }
+
+  /** Register a callback run once per UP transition, after onChange revived the
+   *  mirrors (the account manager lifts any link-fault bench on them). Returns an
+   *  unsubscribe function. */
+  onUp(fn) {
+    this._upListeners.add(fn);
+    return () => this._upListeners.delete(fn);
+  }
+
+  startProbe(onChange, intervalMs = PROBE_INTERVAL_MS) {
+    if (this._probeTimer) { clearInterval(this._probeTimer); this._probeTimer = null; }
+    this._probeOnChange = onChange || null;
+    this._probeTimer = setInterval(() => this.probeNow(), Math.max(1, Number(intervalMs) || PROBE_INTERVAL_MS));
+    this._probeTimer.unref?.();
   }
 
   start(onPoll) {
@@ -325,5 +493,6 @@ export class PoolLink {
 
   stop() {
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._probeTimer) { clearInterval(this._probeTimer); this._probeTimer = null; }
   }
 }
