@@ -4937,8 +4937,15 @@ export class AccountManager {
   }
 
   _weeklyRawState(account, now = Date.now()) {
-    const q = account.quota;
     this._clearExpiredQuotas(account);
+    return this._weeklyTier(account, now);
+  }
+
+  /** The weekly tier from the readings AS THEY STAND — no expiry clearing, so the
+   *  account table can ask the router's exact question without mutating the quota
+   *  mid-render (the "exhausted" status word must never disagree with routing). */
+  _weeklyTier(account, now = Date.now()) {
+    const q = account.quota;
     if (this._isAccountWideRejected(account)) return 'exhausted';
 
     // Provider accounts (GLM/Kimi) carry their quota in providerSes/providerWk, NOT
@@ -5615,6 +5622,14 @@ export class AccountManager {
       const t = tankStatsFromCycles(merged, window, {
         readFloor: this.capacity._readFloorOverride, ignoreCeiling: this.capacity._readFloorOverride != null });
       if (t) return { ...t, source: 'cycles' };
+      // D3 (audit 2026-11-18): no admitted history — fall back to the exported OPEN
+      // cycle's live estimate so the row shows the running week instead of '--'.
+      const op = a.remoteOpen?.[window];
+      if (op && Number.isFinite(op.est) && op.est > 0) {
+        return { avg: Math.round(op.est), last: Math.round(op.est), prev: null, recent: Math.round(op.est),
+          recentN: 1, n: 0, exact: 1, bounded: 0, lowerBound: false,
+          source: 'live', utilization: op.peakUtilization ?? null, method: 'exported-open', fresh: true };
+      }
       // An older cloud's exported aggregate (remoteTank) is on the legacy input+output
       // axis: never shown, never blended.
       return null;
@@ -5709,17 +5724,28 @@ export class AccountManager {
    *  present, else the local row). Rows with no resolvable identity stay separate and
    *  are marked `unresolved` (never merged by name alone). */
   capacityRows(order, { hideDisabled = false } = {}) {
-    const rows = [];
-    const seen = new Set();
+    // Pass 1: group by identity; the PRIMARY (live authority) anchors the row.
+    const groups = new Map();   // primary.index -> { primary, group, id }
+    const byMember = new Map(); // member.index -> primary.index
     for (const i of order) {
       const a = this.accounts[i];
-      if (!a || seen.has(a.index)) continue;
+      if (!a || byMember.has(a.index)) continue;
       const id = this.capacityIdentity(a);
       const group = id ? this.capacityGroupOf(a) : [a];
-      for (const x of group) seen.add(x.index);
-      const visible = group.filter(x => !(hideDisabled && x.enabled === false));
-      if (!visible.length) continue;
-      const primary = visible.find(x => x.remote && x.enabled !== false) || visible.find(x => !x.remote) || visible[0];
+      const visible = group.filter(x => !this.hiddenOnMainScreen(x, hideDisabled));
+      const primary = visible.length
+        ? (visible.find(x => x.remote && x.enabled !== false) || visible.find(x => !x.remote) || visible[0])
+        : null;
+      for (const x of group) byMember.set(x.index, primary ? primary.index : -1);
+      if (primary) groups.set(primary.index, { primary, group, id });
+    }
+    // Pass 2: emit each identity at its PRIMARY's position in the display order — the
+    // row the main screen shows — never at a hidden (benched) local copy's position.
+    const rows = [];
+    for (const i of order) {
+      const g = groups.get(i);
+      if (!g) continue;
+      const { primary, group, id } = g;
       const localRow = group.find(x => !x.remote);
       const withPrice = [primary, ...group].find(x => x && this.monthlyPriceFor(x) != null) || primary;
       const withPlan = [primary, ...group].find(x => x && (x.plan || x.remotePlan)) || null;
@@ -5769,6 +5795,13 @@ export class AccountManager {
       fresh: live ? Boolean(live.fresh) : null,
       derived: false,
     };
+  }
+
+  /** The ONE visibility predicate shared by the main account table and the Capacity
+   *  page: with "hide disabled" on, disabled rows and local copies benched by the
+   *  duplicate guard (they live in the team pool) are hidden. */
+  hiddenOnMainScreen(a, hideDisabled) {
+    return Boolean(hideDisabled && a && (a.enabled === false || a.poolBenchedBy));
   }
 
   accrueCapacity(accountIndex, { input = 0, output = 0, cacheRead = 0, cacheCreation = 0, model = null } = {}) {
@@ -6788,6 +6821,7 @@ export class AccountManager {
       a.remoteTank = ra.tank || null;
       a.remoteKeyFp = ra.keyFingerprint || null;
       a.remoteCycles = ra.cycles || null;
+      a.remoteOpen = ra.open || null;
       a.remotePlan = sanitizePlan(ra.plan);
       // Other teammates' live load on this cloud account (remote inFlight minus our
       // own leases) — so the balancer sees the account as busy as it really is.
@@ -7102,6 +7136,13 @@ export class AccountManager {
         cycles: a.remote ? null : {
           wk: this.capacity?.exportCycles(a.name, 'wk', 12) || [],
           ses: this.capacity?.exportCycles(a.name, 'ses', 60) || [],
+        },
+        // D3 (audit 2026-11-18): the OPEN window rides beside the closed ones so a
+        // linked pool can show a LIVE Current for mirror rows — closed-only export
+        // meant every cloud row could never show the running week.
+        open: a.remote ? null : {
+          wk: this.capacity?.exportOpenCycle(a.name, 'wk') || null,
+          ses: this.capacity?.exportOpenCycle(a.name, 'ses') || null,
         },
         upstream: a.upstream,
         profiles: a.profiles,

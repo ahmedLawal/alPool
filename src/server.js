@@ -4,7 +4,7 @@ import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-ident
 import { appendEventLog } from './event-log.js';
 import { atomicConfigUpdate } from './config.js';
 import { HOP_HEADER, nextHopCount, safeText } from './pool-link.js';
-import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
+import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount, isThreadedIntent } from './thread-gate.js';
 import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor, foreignToolBlockText, describeScrub } from './provider-thinking-scrub.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
@@ -696,6 +696,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const queueConfig = { ...DEFAULT_QUEUE, ...(config.queue || {}) };
         const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
         requestInfo = describeRequest(req, body);
+        // THREAD REPLY SINK: one object per client request, shared BY REFERENCE through
+        // every `{ ...requestInfo }` copy the repair/retry paths make, so the reply id the
+        // serving attempt captures reaches this handler's finally (a field written on a
+        // copy never would — every turn of an effort-latched session is served on one).
+        requestInfo._threadSink = { attemptAccount: null, replyId: null, account: null };
         // Request clock: the direct client-gone line ("Client left after Xs" — request
         // age) and the retry-same patience rule read it. (The link path reports time on
         // THIS account, from lease.startedAt.) Was never set, so every direct-path
@@ -773,6 +778,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         }
       } finally {
         clearInterval(reaperTimer);
+        // THREAD OWNERSHIP, recorded at terminal release: the reply id captured during
+        // the response (message_start for streaming, body id for non-streaming) belongs
+        // to the account that SERVED the turn — pin it so the next continue is judged
+        // by thread identity. Only a served (2xx-5xx upstream answer) turn reaches here
+        // with _threadReplyId set; refusals return before the fetch.
+        const sink = requestInfo?._threadSink;
+        if (sink?.replyId && sink.account) {
+          threadOwners.noteThreadId(sink.replyId, sink.account);
+        }
         accountManager.noteClientOutcome?.(requestInfo, ctx.status);
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
@@ -1620,7 +1634,15 @@ async function forwardRequest(
   }
   // This account is about to serve the turn, so it holds the thread from here on.
   // Recorded optimistically: if the turn fails, the next one is refused anyway.
+  // The reply's own message id is captured during the response (message_start / body
+  // head — see parseSSEEvent and the non-streaming read) and recorded at release, so
+  // the next continue is judged by THREAD identity rather than by terminal.
   threadOwners.noteServed(requestInfo.sessionKey, account.name, threadIntent);
+  // Arm reply capture for THIS attempt only when the turn is threaded: a plain turn's
+  // id names no thread, and recording it would push live thread holders out of the map.
+  if (requestInfo._threadSink) {
+    requestInfo._threadSink.attemptAccount = isThreadedIntent(threadIntent) ? account.name : null;
+  }
 
   // Build log sections
   const logSections = [];
@@ -3349,7 +3371,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { nextStickyBusyWaitMs, readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { nextStickyBusyWaitMs, readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, parseSSEEvent, extractUsageFromBody, threadOwners: () => threadOwners, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -5376,12 +5398,28 @@ function tapLinkUsage(chunk, requestInfo) {
   }
 }
 
+/** Record a threaded reply's id against the account serving THIS attempt (armed at the
+ *  gate). Id and account are stored together, so a retry that moves accounts after an
+ *  earlier attempt captured an id can never pin that id to the wrong account. */
+function captureThreadReply(requestInfo, id) {
+  const sink = requestInfo?._threadSink;
+  if (!sink?.attemptAccount) return;
+  sink.replyId = id;
+  sink.account = sink.attemptAccount;
+}
+
 function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
+    // THREAD OWNERSHIP: message_start carries the reply's own id — the id the client
+    // will continue from (previous_message_id). Capture it on the SERVING account so
+    // the gate can judge the next continue by thread identity instead of by terminal.
+    if (data?.type === 'message_start' && typeof data.message?.id === 'string') {
+      captureThreadReply(requestInfo, data.message.id);
+    }
     // CAPACITY LEDGER (2026-08-22): stream-level usage feeds the per-cycle ledger.
     // M3: Anthropic interim message_delta usage is CUMULATIVE — add-semantics inflates
     // output on long generations. Track a per-stream RUNNING MAX, accrue once at end.
@@ -5441,6 +5479,8 @@ function classifyHeldStreamPrefix(prefix) {
 function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo = {}) {
   try {
     const json = JSON.parse(buffer.toString());
+    // THREAD OWNERSHIP: a non-streaming reply's own id is the next continue's anchor.
+    if (typeof json.id === 'string') captureThreadReply(requestInfo, json.id);
     if (json.usage) {
       // Per-account / per-caller totals book once per request at the terminal release
       // (finding 3, 2026-11-17) — off the running-max capacity figures booked here.

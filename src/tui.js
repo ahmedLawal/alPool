@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { TANK_MIN_UTIL } from './capacity-ledger.js';
 import { spawn } from 'node:child_process';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
@@ -472,6 +473,22 @@ function settingsTags(am, a) {
  *  the Claude 5h reading and the API-key limits when their reset passes, but NEVER
  *  a provider's (GLM/Kimi) providerSes — that stays until the next usage probe, so a
  *  provider past its reset stamp is still refused and must not read "active". */
+/** $ per 1M processed tokens, monthly-normalized (audit D8, 2026-11-18): a monthly
+ *  price buys 30.44/7 = 4.3486 weekly tanks per month, so the per-token price is
+ *  price ÷ (weeklyTank × 4.3486) — the old code divided by ONE week's tank, making
+ *  every price on the screen 4.35x too high (\$0.07 shown where the truth is \$0.0155).
+ *  3 significant digits so small true prices never round to \$0.00 (D10). */
+function pricePerMTokens(monthlyPrice, weeklyTankTokens) {
+  if (!(monthlyPrice > 0) || !(weeklyTankTokens > 0)) return null;
+  const perM = monthlyPrice / (weeklyTankTokens * (30.44 / 7) / 1e6);
+  if (!(perM > 0)) return null;
+  // Significant digits (red team F5): toFixed(3) still printed $0.000 for a $30/mo
+  // plan over a 21.8B tank. Show 2 significant figures below 10 cents.
+  if (perM >= 0.1) return '$' + perM.toFixed(2);
+  // 2 significant digits below 10 cents: $0.015 (not $0.02), $0.0029 (not $0.003).
+  return '$' + Number(perM.toPrecision(2)).toString();
+}
+
 function sessionFull(am, a) {
   const q = a?.quota || {};
   const now = Date.now();
@@ -486,6 +503,18 @@ function sessionFull(am, a) {
       && 1 - q.requestsRemaining / q.requestsLimit >= bench) return true;
   if (q.providerSes != null && q.providerSes >= bench) return true;
   return false;
+}
+
+/** True when the WEEKLY window is what keeps traffic off this account — the router's
+ *  own tier (_weeklyTier, the non-clearing half of _weeklyRawState) says 'exhausted'.
+ *  Claude weekly readings are cleared at their reset by the manager, so a passed reset
+ *  reads as free here without clearing anything; GLM readings are kept until the next
+ *  usage check and the router keeps refusing until then, so they are judged as they
+ *  stand. (Max 2026-11-18: four GLM rows read "active" next to "Wk 100%".) */
+function weekFull(am, a, now = Date.now()) {
+  if (typeof am?._weeklyTier !== 'function' || !a?.quota) return false;
+  if (a.type !== 'provider' && a.quota.unified7dReset != null && now >= a.quota.unified7dReset) return false;
+  return am._weeklyTier(a, now) === 'exhausted';
 }
 
 /** True when the reservation is what is currently keeping traffic off this account
@@ -649,9 +678,17 @@ function timestamp() {
 
 // ── TUI class ────────────────────────────────────────────────
 
-/** Compact plan cell: "Max Q $134/mo". '--' when no plan is configured (no guessing). */
-function planLabel(plan) {
-  if (!plan) return '--';
+/** Compact plan cell: "Max Q $134/mo". '--' when no plan is configured (no guessing).
+ *  D13 (audit 2026-11-18): when no plan OBJECT exists but the pool knows a live
+ *  monthly price (the z.ai prober's subscription reading), show the price so the
+ *  Plan cell and the row's $/1M agree — a '--' Plan next to a priced $/1M was a
+ *  contradiction on all 13 GLM rows. */
+function planLabel(plan, priceAccount = null, am = null) {
+  if (!plan) {
+    const p = am?.monthlyPriceFor?.(priceAccount);
+    if (p != null) return `--  $${Math.round(p)}/mo`;
+    return '--';
+  }
   const cad = { monthly: 'M', quarterly: 'Q', annual: 'A', annually: 'A', yearly: 'A' }[plan.cadence] || '';
   const tier = (plan.tier || '').replace(/^(claude|glm coding)\s+/i, '');
   const monthly = plan.priceUsd != null && plan.billingMonths ? plan.priceUsd / plan.billingMonths : null;
@@ -2806,11 +2843,11 @@ export class TUI {
       // SAME order via _selectableIndexes → _displayOrder.
       let hidden = 0;
       for (const i of this._displayOrder()) {
-        if (this.hideDisabled && this.am.accounts[i]?.enabled === false) { hidden++; continue; }
         // Same key also hides local copies guarded by the duplicate guard — they are
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
-        if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
+        // One predicate shared with the Capacity page so the two row orders cannot drift.
+        if (this.am.hiddenOnMainScreen(this.am.accounts[i], this.hideDisabled)) { hidden++; continue; }
         lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession));
       }
       if (hidden > 0) {
@@ -3044,6 +3081,8 @@ export class TUI {
     // manager's expiry refresh once per frame, before any row is drawn.)
     if (a.enabled !== false && effectiveStatus === 'active') {
       if (capBenched(this.am, a)) effectiveStatus = 'capped';
+      // The weekly wait outlasts the 5h one, so it names the account's state first.
+      else if (weekFull(this.am, a)) effectiveStatus = 'exhausted';
       else if (sessionFull(this.am, a)) effectiveStatus = '5h full';
     }
     if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
@@ -3595,17 +3634,22 @@ export class TUI {
       // N is the count of session cycles it rests on.
       if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
         const sesTank = this.am.capacityTank?.(i, 'ses');
+        // D11/D12 (audit 2026-11-18): the ×33.6 ceiling assumes every 5h window holds
+        // the off-peak median, but z.ai peak windows (Mon-Fri 06:00-10:00 UTC, 20h of
+        // 168h) hold ~1/3 of that (measured 218.6M vs 648.2M). Label the figure as a
+        // ceiling ("max") so it reads as an upper bound, and mark N as 5h cycles —
+        // the footer's "N = cycles in Med-all" is false on this row by construction.
         const approx = sesTank && sesTank.n > 0
           ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
-        const cellsByName = { Current: cyan(approx), Prev: '--', 'Med-3': '--', 'Med-all': '--', N: sesTank?.n ? String(sesTank.n) : '--' };
+        const cellsByName = { Current: cyan((approx === '--' ? '--' : approx + ' max')), Prev: '--', 'Med-3': '--', 'Med-all': '--', N: sesTank?.n ? `${sesTank.n} (5h)` : '--' };
         // Same price cell as the main path: this account's weekly capacity IS the
         // derived tank (avg 5h × 33.6) — the price column must not go blank here.
         const p2 = this.am.monthlyPriceFor?.(cr.priceAccount);
-        cellsByName['$/1M'] = gray((sesTank?.avg && p2)
-          ? ('$' + (p2 / (Math.round(sesTank.avg * (7 * 24) / 5) / 1e6)).toFixed(2)).padStart(CW) : '--'.padStart(CW));
+        const weeklyDerived = sesTank?.avg ? Math.round(sesTank.avg * (7 * 24) / 5) : null;
+        cellsByName['$/1M'] = gray((pricePerMTokens(p2, weeklyDerived) ?? '--').padStart(CW));
         out.push('  ' + lead
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
-          + dim('  no weekly limit · avg 5h × 33.6'));
+          + dim('  no weekly limit · avg 5h × 33.6 · peak hours hold less'));
         continue;
       }
 
@@ -3616,13 +3660,34 @@ export class TUI {
       const util = this.am._windowUtilization?.(a, win);
       const nowOpen = ledger.openCycle(a.name, win);
 
-      // Current = the live window: capacity estimate so far, tagged with how full the
-      // vendor says it is. `~` estimate-from-open-window, `≥` lower bound (joined late).
+      // Current = the LIVE window (audit D2, 2026-11-18): the open cycle's own
+      // estimate — its slope median when it has segments, else the whole-window
+      // absolute (tokens÷util) when the ledger provably watched from the window
+      // start. The closed median is what Med-all shows; repeating it in Current hid
+      // the running week (kira showed 1.1B while its live week held 3.5B).
+      // RED-TEAM F1 (2026-11-18): the same floors the ledger applies — a low-fullness
+      // window (tokens÷1% = 100x rounding noise) and a late-joined window (an
+      // understating lower bound) must NOT render; history shows instead. Mirrors
+      // (no local ledger entry) read the exported OPEN cycle from the cloud (F2).
       let cur = '--';
-      if (tank && !(tank.source === 'live' && unprovenLive)) {
-        cur = formatTokens(tank.avg);
-      } else if (nowOpen?.tokensSoFar > 0 && util > 0) {
-        cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
+      const localOpen = nowOpen;
+      const remoteOpenCycle = a.remote ? (a.remoteOpen?.[win] || null) : null;
+      const openSrc = localOpen
+        ? { ...this.am.capacity?.exportOpenCycle?.(a.name, win), tokensSoFar: localOpen.tokensSoFar }
+        : remoteOpenCycle;
+      if (openSrc && openSrc.est) {
+        cur = formatTokens(openSrc.est);
+      } else if (openSrc
+        && Number.isFinite(openSrc.peakUtilization) && openSrc.peakUtilization >= TANK_MIN_UTIL && openSrc.peakUtilization < 1
+        && openSrc.tokensSoFar > 0
+        && (openSrc.windowStartedAt == null || openSrc.startedAt == null
+          || openSrc.startedAt <= openSrc.windowStartedAt + 60_000)) {
+        // Whole-window absolute only (a late join divides a partial numerator by a
+        // full-window denominator — a lower bound, and usually a bad one).
+        cur = formatTokens(Math.round(openSrc.tokensSoFar / openSrc.peakUtilization));
+      }
+      if (cur === '--' && tank && !(tank.source === 'live' && unprovenLive)) {
+        cur = formatTokens(tank.avg);   // no proven live reading — history as the fallback
       }
       const curPct = util != null && cur !== '--' ? dim(`@${Math.round(util * 100)}%`) : '';
       // Every history column is a TANK number (tokens ÷ closing %). Prev/N used to
@@ -3630,7 +3695,10 @@ export class TUI {
       // row mixed units (2026-10-13 owner report; see tankStats' reading-set note).
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
-        Prev: (tank?.source === 'cycles' && tank.prev != null ? formatTokens(tank.prev) : '--'),
+        // Prev = the newest FINISHED cycle (audit D4) — once Current is live, the
+        // reader wants "what did last week hold", which is `last`, not the
+        // second-newest (that comparison is Med-3's job).
+        Prev: (tank?.source === 'cycles' && tank.last != null ? formatTokens(tank.last) : '--'),
         'Med-3': (tank?.source === 'cycles' && tank.recent != null ? formatTokens(tank.recent) : '--'),
         'Med-all': (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
         // `n*` = at least one contributing cycle is a two-pool merge (no per-reading
@@ -3653,9 +3721,7 @@ export class TUI {
         : (this.am.capacityTank?.(i, 'wk')?.avg
           ?? (a.type === 'provider' && sesTankObj?.avg ? Math.round(sesTankObj.avg * WK_PER_SES) : null));
       const price = this.am.monthlyPriceFor?.(cr.priceAccount);
-      const priceCell = (wkTank && price)
-        ? '$' + (price / (wkTank / 1e6)).toFixed(2)
-        : '--';
+      const priceCell = pricePerMTokens(price, wkTank) ?? '--';
       cellsByName['$/1M'] = gray(priceCell.padStart(CW));
       const row = '  ' + lead
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');
@@ -3663,16 +3729,19 @@ export class TUI {
     }
 
     out.push('');
-    out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle. Med-3 = median of last 3 cycles, Med-all = every cycle.'));
+    // Legend rewritten for truthfulness (audit D14/D15/D16, 2026-11-18): every line
+    // states what the code ACTUALLY does — the old "median of tokens ÷ % full across
+    // readings" described a formula the code never ran, and no line explained a dash.
+    out.push(' ' + dim('Capacity = tokens a FULL window holds. Per cycle: median of (tokens used ÷ rise in % full) over steps of ≥5 points. Med-3 = newest 3 cycles, Med-all = all admitted cycles.'));
     out.push(' ' + dim('One row per account. Where = which side holds its history: cloud, laptop or both. ? = identity unknown.'));
     // Axis honesty (audit 2026-11-17, finding 5): the figure counts processed tokens in
     // EACH provider's own tokenizer (GLM ≈ 0.6x Anthropic for the same prompt), and a
     // cache read (0.1x) weighs the same as a cache write (1.25x). So $/1M across a
     // Claude and a GLM row is not a like-for-like price per Claude-equivalent token.
     out.push(' ' + dim('Tokens = processed tokens (provider-native): input + cached + output, counted in each provider\'s own tokenizer.'));
-    out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise.'));
-    out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
-    out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized), per processed tokens (provider-native). -- = no price or tank yet.'));
+    out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise. Cycles before 2026-11-06 used a different token count and are never admitted (old count).'));
+    out.push(' ' + dim('Current @% = the LIVE window, % full now. Prev = the newest finished cycle.'));
+    out.push(' ' + dim('$/1M = monthly plan price ÷ (weekly tank × 4.35), so it is the price a month of subscription actually buys per 1M tokens.'));
     return out;
   }
 

@@ -5,6 +5,41 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.104] - 2026-11-18
+
+### Changed
+
+- Admit refill-safe cycles, prefer exact whole-window estimates, export the open week (audit D1 D3 D5 D6 D7)
+- Capacity screen: Current = live window, Prev = newest finished, monthly-normalized price (audit D2 D4 D8 D10)
+- V11 price expectation moves to the monthly-normalized value
+- Capacity page: anchor each identity row at its primary's display position (audit D17)
+- Capacity screen: no-weekly row labelled as a peak-aware ceiling, N marked 5h (audit D11 D12)
+- Capacity screen: Plan cell shows the live z.ai price (D13); legend states what the code does (D14-D16)
+- Cross-pool live-tank test + golden test on both pools' snapshots (audit D3)
+- Price pins move to the monthly-normalized values (pool-link suite)
+- Red-team fixes F1-F6: Current respects ledger floors + mirrors read the cloud's live week; exported est preferred; sample-only util span; significant-digit prices; honest test pins
+
+## [1.24.103] - 2026-11-17
+
+### Fixed
+
+- One state, one word — GLM weekly-full reads "exhausted" too
+
+## [1.24.102] - 2026-11-17
+
+### Fixed
+
+- A weekly-full account reads "wk full", not "active"
+
+## [1.24.101] - 2026-11-17
+
+### Changed
+
+- Thread gate: judge a continue by its thread id, not the terminal
+- Pin the three thread-id capture seams (stream, body, link tap)
+- Thread gate: drop the inert link-path capture; pin the direct path end to end
+- Thread gate: red-team fixes — capture survives repairs, threaded-only, own bound
+
 ## [1.24.100] - 2026-11-17
 
 ### Changed
