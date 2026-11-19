@@ -272,6 +272,13 @@ function sanitizeRemoteStatus(json) {
  */
 const BOOT_IDS_TTL_MS = 14 * 24 * 3600 * 1000;  // stale beyond this → trust a fresh boot instead
 export const FAILS_BEFORE_DOWN = 2;
+/** A status poll that keeps failing softly (timeout / network error, no HTTP answer) while the
+ *  5 s probe answers is a slow poll, not an outage — until it persists: a tunnel that passes the
+ *  tiny ping but blackholes large bodies (MTU) looks exactly like that, and mirrored quota /
+ *  in-flight data would stay stale forever. Down after this many consecutive soft failures
+ *  (6 x the 30 s poll = ~3 min) OR when the last good status is older than the age cap. */
+export const SOFT_FAILS_BEFORE_DOWN = 6;
+export const STATUS_STALE_DOWN_MS = 5 * 60_000;
 
 /** Plain-English cause of a link failure, for the one-line cloud banner. */
 export function describeLinkError(err) {
@@ -310,8 +317,10 @@ export class PoolLink {
     this._probeOnChange = null;
     this._downListeners = new Set();
     this._upListeners = new Set();
+    this._aliveListeners = new Set();
     this.probeMisses = 0;
     this.probeHits = 0;
+    this.aliveStreak = 0;
     this.probeDown = false;
     this.probeFirstMissAt = null;
     this.probeDownAt = null;
@@ -371,8 +380,13 @@ export class PoolLink {
         // error (no HTTP answer) never marks the link down while the 5 s probe says it
         // is alive — keep the last good status (stale-but-usable). A rejected key or
         // an HTTP error from the cloud is a real answer and still marks down below.
+        // ...but not forever: the tiny ping can pass while large bodies blackhole (MTU), so
+        // SOFT_FAILS_BEFORE_DOWN consecutive soft failures, or a last good status older than
+        // STATUS_STALE_DOWN_MS, stop vouching and fall through to the down branch below.
         const softFail = r.status == null && r.error !== 'key rejected';
-        if (softFail && this.lastOkAt != null && !this.lastError && this.probeSaysAlive()) {
+        const persistent = this.failStreak >= SOFT_FAILS_BEFORE_DOWN
+          || (this.lastOkAt != null && this._now() - this.lastOkAt > STATUS_STALE_DOWN_MS);
+        if (softFail && !persistent && this.lastOkAt != null && !this.lastError && this.probeSaysAlive()) {
           if (!this._softFailLogged) {
             this._softFailLogged = true;
             console.log(`[Maxpool] link "${this.name}" status poll slow/failed (${r.error}) — link alive per probe; keeping last status`);
@@ -405,6 +419,7 @@ export class PoolLink {
       let changed = false;
       if (alive) {
         this.lastProbeOkAt = now;
+        this.aliveStreak += 1;
         this.probeMisses = 0;
         this.probeFirstMissAt = null;
         if (this.probeDown) {
@@ -420,6 +435,7 @@ export class PoolLink {
         }
       } else {
         this.probeHits = 0;
+        this.aliveStreak = 0;
         if (this.probeMisses === 0) this.probeFirstMissAt = now;
         this.probeMisses += 1;
         // Red team F3: a near-miss streak is logged so the false-alarm rate is measurable.
@@ -447,6 +463,15 @@ export class PoolLink {
           try { fn(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" ${this.probeDown ? 'down' : 'up'} listener failed: ${err?.message || err}`); }
         }
       }
+      // A blip that never reached DOWN has no UP event, so answers while the link is not
+      // down are announced on their own (the account manager lifts any link-fault bench) —
+      // with the same hysteresis as UP: PROBE_HITS_BEFORE_UP answers in a row, so a lossy
+      // link (miss, answer, miss, answer) never lifts its bench on a single lucky ping.
+      if (alive && !this.probeDown && this.aliveStreak >= PROBE_HITS_BEFORE_UP) {
+        for (const fn of this._aliveListeners) {
+          try { fn(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" alive listener failed: ${err?.message || err}`); }
+        }
+      }
       return alive;
     })().finally(() => { this._probing = null; });
     return this._probing;
@@ -471,6 +496,14 @@ export class PoolLink {
   onUp(fn) {
     this._upListeners.add(fn);
     return () => this._upListeners.delete(fn);
+  }
+
+  /** Register a callback run on each probe answer while the link is not down, once
+   *  PROBE_HITS_BEFORE_UP answers came in a row (not only on the DOWN->UP transition).
+   *  Returns an unsubscribe function. */
+  onAlive(fn) {
+    this._aliveListeners.add(fn);
+    return () => this._aliveListeners.delete(fn);
   }
 
   startProbe(onChange, intervalMs = PROBE_INTERVAL_MS) {

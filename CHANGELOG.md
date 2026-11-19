@@ -5,6 +5,35 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.111] - 2026-11-19
+
+### Changed
+
+- Provider add: an unsaved row matched by KEY (not only name) is dropped before the dedupe, never a false exists
+
+## [1.24.110] - 2026-11-18
+
+### Changed
+
+- Share reserve tightening between cache affinity and warm-hold ceiling
+- Provider add: plain wording on the busy and not-saved replies
+
+## [1.24.109] - 2026-11-18
+
+### Changed
+
+- Warm hold: red-team round 1 — no hold on a degraded identity; depth ceiling (target + 2x allowance, reserve-scaled)
+- Warm hold: the depth ceiling counts this turn's weight
+- Add-provider flow: keep other providers, hand off the screen for [T/l], refuse a taken name, save the resolved key
+- Provider add: a rollback that meets an in-flight request disables + marks the row; the next add replaces it (503 while busy)
+- Header comment matches the two-answer lift
+
+### Fixed
+
+- Hold warm conversations on their Claude account (claudeWarmHold)
+- Lift link-fault bench on any probe answer; down on persistent soft poll failures; poll at once on UP
+- Lift the link-fault bench only after two probe answers in a row (lossy link must not re-open every 5 s)
+
 ## [1.24.108] - 2026-11-18
 
 ### Fixed
