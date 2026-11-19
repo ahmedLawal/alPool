@@ -143,15 +143,21 @@ final class NotificationCoordinator: NSObject, ObservableObject, UNUserNotificat
         let content = UNMutableNotificationContent()
         content.sound = .default
 
+        let percentage = Int((event.usage * 100).rounded())
+        let window = event.window.displayName.lowercased()
         switch event.kind {
-        case .threshold(let level):
-            let percentage = Int((event.usage * 100).rounded())
-            content.title = "\(event.window.displayName) quota at \(percentage)%"
-            content.body = "\(event.accountName) crossed the \(level.thresholdPercent ?? percentage)% threshold\(resetSuffix(event.resetAt))."
+        case .threshold(.maximum):
+            content.title = "🔴 Limit hit: \(event.accountName)"
+            content.body = "Used up its \(window) limit. Paused until it resets\(resetPhrase(event.resetAt))."
+        case .threshold(.critical):
+            content.title = "🟠 Running low: \(event.accountName)"
+            content.body = "\(percentage)% of its \(window) limit used. Resets\(resetPhrase(event.resetAt))."
+        case .threshold:
+            content.title = "🟡 Heads up: \(event.accountName)"
+            content.body = "\(percentage)% of its \(window) limit used. Still fine. Resets\(resetPhrase(event.resetAt))."
         case .reset:
-            let percentage = Int((event.usage * 100).rounded())
-            content.title = "\(event.window.displayName) quota reset"
-            content.body = "\(event.accountName)'s \(event.window.displayName.lowercased()) usage is now \(percentage)%."
+            content.title = "✅ Back to full: \(event.accountName)"
+            content.body = "Its \(window) limit reset, now at \(percentage)% used. Ready to use."
         }
 
         let identifier = "alpool.quota.\(event.accountName).\(event.window.rawValue).\(Date().timeIntervalSince1970)"
@@ -167,12 +173,12 @@ final class NotificationCoordinator: NSObject, ObservableObject, UNUserNotificat
         }
     }
 
-    private func resetSuffix(_ resetAt: Double?) -> String {
-        guard let resetAt else { return "" }
+    private func resetPhrase(_ resetAt: Double?) -> String {
+        guard let resetAt else { return " soon" }
         let remaining = max(0, resetAt / 1_000 - Date().timeIntervalSince1970)
-        if remaining < 60 { return "; resets in less than a minute" }
-        if remaining < 3_600 { return "; resets in \(Int(remaining / 60))m" }
-        if remaining < 86_400 { return "; resets in \(Int(remaining / 3_600))h" }
-        return "; resets in \(Int(remaining / 86_400))d"
+        if remaining < 60 { return " in under a minute" }
+        if remaining < 3_600 { return " in \(Int(remaining / 60))m" }
+        if remaining < 86_400 { return " in \(Int(remaining / 3_600))h" }
+        return " in \(Int(remaining / 86_400))d"
     }
 }
